@@ -502,6 +502,7 @@ private:
     QCompleter *m_settingsCompleter = nullptr;
     QToolButton *m_connectionButton;
     QLabel *m_timeLabel;
+    QLabel *m_buildLabel = nullptr;
     QHash<QString, QColor> m_accountColors;
     QHash<QString, SymbolSource> m_accountSources;
     QVector<QPointer<SymbolPickerDialog>> m_symbolPickers;

@@ -2115,6 +2115,25 @@ void MainWindow::buildUi()
     m_timeLabel->setCursor(Qt::PointingHandCursor);
     right->addWidget(m_timeLabel);
 
+    m_buildLabel = new QLabel(top);
+    QString buildVersion = QCoreApplication::applicationVersion().trimmed();
+    if (buildVersion.startsWith(QLatin1Char('v'), Qt::CaseInsensitive)) {
+        buildVersion = buildVersion.mid(1);
+    }
+    if (buildVersion.isEmpty()) {
+        buildVersion = QStringLiteral("0.0.0");
+    }
+    m_buildLabel->setText(buildVersion);
+    m_buildLabel->setObjectName(QStringLiteral("TitleBuildLabel"));
+    m_buildLabel->setStyleSheet(
+        "QLabel#TitleBuildLabel {"
+        "  color: #cfcfcf;"
+        "  padding: 0 6px;"
+        "  font-size: 12px;"
+        "}"
+    );
+    right->addWidget(m_buildLabel);
+
     auto makeWinButton = [top](const QString &text, const char *objectName) {
         auto *btn = new QToolButton(top);
         btn->setText(text);

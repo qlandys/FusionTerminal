@@ -1,0 +1,12 @@
+{
+  "version": "0.1.2-a1",
+  "build": 1,
+  "mandatory": false,
+  "url": "https://github.com/qlandys/FusionTerminal/releases/download/0.1.2-a1/FusionTerminal-0.1.2-a1.exe",
+  "sha256": "",
+  "backend_url": "https://github.com/qlandys/FusionTerminal/releases/download/0.1.2-a1/orderbook_backend.exe",
+  "backend_sha256": "",
+  "notes": [
+    "Initial prerelease manifest."
+  ]
+}

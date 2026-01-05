@@ -1,0 +1,21 @@
+<RCC>
+    <qresource prefix="/">
+        <file>qml/GpuDomView.qml</file>
+        <file>qml/GpuPrintsView.qml</file>
+        <file>qml/GpuClustersView.qml</file>
+        <file>qml/SettingsAppearance.qml</file>
+        <file alias="icons/outline/x-danger.svg">../assets/img/icons/outline/x-danger.svg</file>
+        <file alias="icons/outline/x-white.svg">../assets/img/icons/outline/x-white.svg</file>
+        <file alias="icons/logos/binance.png">../assets/img/icons/logos/binance.png</file>
+        <file alias="icons/logos/lighter.png">../assets/img/icons/logos/lighter.png</file>
+        <file alias="icons/logos/mexc.png">../assets/img/icons/logos/mexc.png</file>
+        <file alias="icons/logos/UZX.png">../assets/img/icons/logos/UZX.png</file>
+        <!-- audio (embedded to avoid external file dependency) -->
+        <file alias="sounds/notification.wav">../assets/sounds/notification.wav</file>
+        <file alias="sounds/success.wav">../assets/sounds/success.wav</file>
+        <file alias="font/Inter_18pt-Regular.ttf">../assets/font/Inter_18pt-Regular.ttf</file>
+        <file alias="font/Inter-Regular.ttf">../assets/font/Inter_18pt-Regular.ttf</file>
+        <file alias="font/JetBrainsMono-Regular.ttf">../assets/font/JetBrainsMono-Regular.ttf</file>
+        <file alias="font/JetBrainsMono-Bold.ttf">../assets/font/JetBrainsMono-Bold.ttf</file>
+    </qresource>
+</RCC>

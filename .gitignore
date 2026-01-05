@@ -1,0 +1,59 @@
+# Build artifacts
+build/
+**/CMakeFiles/
+**/*.obj
+**/*.pdb
+**/*.ilk
+**/*.tlog
+**/*.idb
+**/*.log
+**/*.cache
+
+# IDE
+.vscode/
+.continue/
+**/*.user
+**/*.suo
+
+# Local / downloaded stuff
+_tmp/
+
+# Secrets / local configs (MUST NOT be committed)
+api_keys
+lighter_endpoints.md
+**/lighter_api_key_config.json
+**/lighter_api_key_config.enc
+.env
+*.env
+config/local/
+config/*.local.*
+secrets/
+*.key
+*.pem
+*.p12
+*.crt
+*.kdbx
+**/fusion_terminal.ini
+**/ghost_terminal.ini
+**/shah_terminal.ini
+**/plasma_terminal.ini
+
+# Packaging / release outputs
+dist/
+releases/
+**/*.exe
+**/*.dll
+**/*.zip
+**/*.7z
+
+# Local dumps / scratch files (MUST NOT be committed)
+out.txt
+err.txt
+uzx_out.txt
+uzx_err.txt
+screenshot.png
+wsproto.zip
+
+# Python cache
+**/__pycache__/
+**/*.pyc

@@ -221,7 +221,7 @@ int main(int argc, char **argv)
 
     QWidget window;
     window.setWindowTitle(QStringLiteral("Updating Fusion Terminal"));
-    window.setFixedSize(320, 130);
+    window.setFixedSize(420, 160);
 
     auto *layout = new QVBoxLayout(&window);
     layout->setContentsMargins(12, 12, 12, 12);
@@ -236,6 +236,7 @@ int main(int argc, char **argv)
     layout->addWidget(progress);
 
     auto *status = new QLabel(QStringLiteral("Starting..."), &window);
+    status->setWordWrap(true);
     layout->addWidget(status);
 
     window.show();

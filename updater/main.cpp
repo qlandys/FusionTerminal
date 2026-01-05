@@ -46,10 +46,11 @@ class UpdateWorker : public QObject
     Q_OBJECT
 
 public:
-    UpdateWorker(const QList<CopyJob> &jobs, const QString &launchPath, qint64 pid)
+    UpdateWorker(const QList<CopyJob> &jobs, const QString &launchPath, qint64 pid, const QString &backendName)
         : m_jobs(jobs)
         , m_launchPath(launchPath)
         , m_pid(pid)
+        , m_backendName(backendName)
     {}
 
 signals:
@@ -65,6 +66,11 @@ public slots:
         if (!waitForPid(m_pid)) {
             emit failed(QStringLiteral("Failed to wait for app."));
             return;
+        }
+
+        if (!m_backendName.isEmpty()) {
+            emit statusChanged(QStringLiteral("Stopping backend..."));
+            tryTerminateBackend(m_backendName);
         }
 
         emit statusChanged(QStringLiteral("Installing update..."));
@@ -90,6 +96,23 @@ public slots:
     }
 
 private:
+#ifdef Q_OS_WIN
+    void tryTerminateBackend(const QString &exeName)
+    {
+        const QString name = QFileInfo(exeName).fileName();
+        if (name.isEmpty()) {
+            return;
+        }
+        QProcess::execute(QStringLiteral("taskkill"),
+                          {QStringLiteral("/IM"), name, QStringLiteral("/F"), QStringLiteral("/T")});
+        QThread::msleep(300);
+    }
+#else
+    void tryTerminateBackend(const QString &)
+    {
+    }
+#endif
+
 #ifdef Q_OS_WIN
     bool replaceFile(const QString &src, const QString &dst, QString &err)
     {
@@ -181,6 +204,7 @@ private:
     QList<CopyJob> m_jobs;
     QString m_launchPath;
     qint64 m_pid = 0;
+    QString m_backendName;
 };
 
 int main(int argc, char **argv)
@@ -241,7 +265,7 @@ int main(int argc, char **argv)
 
     window.show();
 
-    auto *worker = new UpdateWorker(jobs, launchPath, ok ? pid : 0);
+    auto *worker = new UpdateWorker(jobs, launchPath, ok ? pid : 0, backendDst);
     auto *thread = new QThread(&app);
     worker->moveToThread(thread);
 

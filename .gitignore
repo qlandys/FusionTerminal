@@ -46,6 +46,11 @@ releases/
 **/*.zip
 **/*.7z
 
+# Commit win64 release bundle
+!releases/
+!releases/win64/
+!releases/win64/**
+
 # Local dumps / scratch files (MUST NOT be committed)
 out.txt
 err.txt

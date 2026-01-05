@@ -920,9 +920,9 @@ ConnectionsWindow::ConnectionsWindow(ConnectionStore *store, TradeManager *manag
     auto *closeBtn = new QToolButton(titleBar);
     closeBtn->setObjectName(QStringLiteral("WindowCloseButton"));
     closeBtn->setToolTip(tr("Close"));
-    closeBtn->setIcon(loadTintedSvgIcon(QStringLiteral("icons/outline/x-white.svg"), QColor("#e6ecf4"), 14));
-    closeBtn->setIconSize(QSize(14, 14));
-    closeBtn->setFixedSize(26, 26);
+    closeBtn->setIcon(loadTintedSvgIcon(QStringLiteral("icons/outline/x-white.svg"), QColor("#e6ecf4"), 16));
+    closeBtn->setIconSize(QSize(16, 16));
+    closeBtn->setFixedSize(28, 28);
     connect(closeBtn, &QToolButton::clicked, this, &QDialog::close);
     header->addWidget(closeBtn);
 

@@ -508,6 +508,7 @@ private:
     QToolButton *m_updateButton = nullptr;
     UpdateState m_updateState = UpdateState::NotChecked;
     UpdateInfo m_updateInfo;
+    QString m_updateStatusText;
     QNetworkAccessManager *m_updateNetwork = nullptr;
     QPointer<QNetworkReply> m_updateReply;
     QFile *m_updateFile = nullptr;

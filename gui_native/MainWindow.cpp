@@ -6534,6 +6534,7 @@ void MainWindow::applyDownloadedUpdate()
 void MainWindow::setUpdateState(UpdateState state, const QString &tooltip)
 {
     m_updateState = state;
+    m_updateStatusText = tooltip.isEmpty() ? updateTooltip(state) : tooltip;
     if (!m_updateButton) {
         return;
     }
@@ -6541,7 +6542,7 @@ void MainWindow::setUpdateState(UpdateState state, const QString &tooltip)
     const QString iconName = updateIconName(state);
     m_updateButton->setIcon(loadIconTinted(iconName, QColor("#c0c0c0"), iconSize));
     m_updateButton->setProperty("iconName", iconName);
-    m_updateButton->setToolTip(tooltip.isEmpty() ? updateTooltip(state) : tooltip);
+    m_updateButton->setToolTip(m_updateStatusText);
     refreshUpdatePanel();
 }
 
@@ -6563,7 +6564,7 @@ QString MainWindow::updateIconName(UpdateState state) const
     case UpdateState::Installed:
         return QStringLiteral("cloud-check");
     case UpdateState::UpToDate:
-        return QStringLiteral("cloud-question");
+        return QStringLiteral("cloud-check");
     }
     return QStringLiteral("cloud-question");
 }
@@ -6712,7 +6713,7 @@ void MainWindow::refreshUpdatePanel()
         body = tr("You are on the latest version.");
         break;
     case UpdateState::Failed:
-        body = tr("Update check failed. Try again later.");
+        body = m_updateStatusText.isEmpty() ? tr("Update check failed. Try again later.") : m_updateStatusText;
         break;
     case UpdateState::UpdateAvailable: {
         title = tr("Update available");

@@ -7,6 +7,9 @@ Set-Location .. | Out-Null
 $buildDir = "build"
 $releaseDir = "releases/win64"
 
+Write-Host "[0/4] Bump version (main.cpp)..." -ForegroundColor Cyan
+& "$PSScriptRoot/make_latest_json.ps1" -BumpVersion -NoWrite | Out-Host
+
 Write-Host "[1/4] Configure (CMake)..." -ForegroundColor Cyan
 cmake -S . -B $buildDir | Out-Host
 

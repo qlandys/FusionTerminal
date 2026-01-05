@@ -20,6 +20,7 @@ _tmp/
 
 # Secrets / local configs (MUST NOT be committed)
 api_keys
+.fusion_token
 lighter_endpoints.md
 **/lighter_api_key_config.json
 **/lighter_api_key_config.enc

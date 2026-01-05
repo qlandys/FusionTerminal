@@ -7,7 +7,12 @@ param(
   [string]$Tag = "",
   [string]$AssetName = "",
   [string]$BackendAssetName = "orderbook_backend.exe",
+  [string]$ReleaseName = "",
+  [string]$ReleaseNotes = "",
   [switch]$BumpVersion,
+  [switch]$UploadRelease,
+  [switch]$ReplaceAssets,
+  [switch]$PushGit,
   [switch]$NoWrite
 )
 
@@ -60,6 +65,13 @@ function Normalize-Version([string]$ver) {
 }
 
 function Bump-Version([string]$ver) {
+  $suffix = ""
+  if ($ver) {
+    $dash = $ver.IndexOf("-")
+    if ($dash -ge 0) {
+      $suffix = $ver.Substring($dash)
+    }
+  }
   $clean = Normalize-Version $ver
   $m = [regex]::Match($clean, '^(?<maj>\d+)\.(?<min>\d+)\.(?<patch>\d+)$')
   if ($m.Success) {
@@ -67,9 +79,91 @@ function Bump-Version([string]$ver) {
     $min = [int]$m.Groups["min"].Value
     $patch = [int]$m.Groups["patch"].Value
     $patch = $patch + 1
-    return "$maj.$min.$patch"
+    return "$maj.$min.$patch$suffix"
   }
   return $ver
+}
+
+function Get-GitHubToken() {
+  if ($env:GITHUB_TOKEN) {
+    return $env:GITHUB_TOKEN
+  }
+  if ($env:GH_TOKEN) {
+    return $env:GH_TOKEN
+  }
+  $tokenPaths = @(
+    (Join-Path $PSScriptRoot "..\\..\\.fusion_token"),
+    (Join-Path (Get-Location) ".fusion_token")
+  )
+  foreach ($tokenPath in $tokenPaths) {
+    if (Test-Path $tokenPath) {
+      $content = Get-Content -Path $tokenPath -Raw -ErrorAction SilentlyContinue
+      if ($null -ne $content) {
+        $token = $content.Trim()
+        if ($token) {
+          return $token
+        }
+      }
+    }
+  }
+  return ""
+}
+
+function Get-ReleaseByTag([string]$repo, [string]$tag, [string]$token) {
+  $headers = @{
+    "Accept" = "application/vnd.github+json"
+    "User-Agent" = "FusionTerminal-Release"
+    "Authorization" = "Bearer $token"
+  }
+  $url = "https://api.github.com/repos/$repo/releases/tags/$tag"
+  try {
+    return Invoke-RestMethod -Headers $headers -Uri $url -Method Get
+  } catch {
+    return $null
+  }
+}
+
+function Create-Release([string]$repo, [string]$tag, [string]$name, [string]$notes, [string]$token) {
+  $headers = @{
+    "Accept" = "application/vnd.github+json"
+    "User-Agent" = "FusionTerminal-Release"
+    "Authorization" = "Bearer $token"
+  }
+  $payload = @{
+    tag_name = $tag
+    name = $name
+    body = $notes
+    draft = $false
+    prerelease = $false
+  } | ConvertTo-Json -Depth 3
+
+  $url = "https://api.github.com/repos/$repo/releases"
+  return Invoke-RestMethod -Headers $headers -Uri $url -Method Post -Body $payload
+}
+
+function Upload-ReleaseAsset([int]$releaseId, [string]$repo, [string]$path, [string]$name, [string]$token, [switch]$ReplaceAssets) {
+  if (-not (Test-Path $path)) {
+    throw "Asset not found: $path"
+  }
+  $headers = @{
+    "Accept" = "application/vnd.github+json"
+    "User-Agent" = "FusionTerminal-Release"
+    "Authorization" = "Bearer $token"
+  }
+  if ($ReplaceAssets) {
+    $assetsUrl = "https://api.github.com/repos/$repo/releases/$releaseId/assets"
+    $assets = Invoke-RestMethod -Headers $headers -Uri $assetsUrl -Method Get
+    foreach ($asset in $assets) {
+      if ($asset.name -eq $name) {
+        Invoke-RestMethod -Headers $headers -Uri $asset.url -Method Delete
+        break
+      }
+    }
+  }
+
+  $uploadUrl = "https://uploads.github.com/repos/$repo/releases/$releaseId/assets?name=$name"
+  $headers["Content-Type"] = "application/octet-stream"
+  return Invoke-RestMethod -Headers $headers -Uri $uploadUrl -Method Post -InFile $path
 }
 
 $mainCpp = "gui_native/main.cpp"
@@ -149,3 +243,40 @@ $json = $payload | ConvertTo-Json -Depth 4
 Set-Content -Path $OutPath -Value $json -Encoding UTF8
 
 Write-Host "Wrote $OutPath (version=$Version, sha256=$hash)" -ForegroundColor Green
+
+if ($UploadRelease) {
+  $token = Get-GitHubToken
+  if (-not $token) {
+    throw "GITHUB_TOKEN or GH_TOKEN is required for -UploadRelease."
+  }
+  if (-not $ReleaseName) {
+    $ReleaseName = $Tag
+  }
+
+  $release = Get-ReleaseByTag $Repo $Tag $token
+  if (-not $release) {
+    $release = Create-Release $Repo $Tag $ReleaseName $ReleaseNotes $token
+  }
+
+  Upload-ReleaseAsset $release.id $Repo $ExePath $AssetName $token -ReplaceAssets:$ReplaceAssets | Out-Null
+  if ($BackendExePath -and (Test-Path $BackendExePath)) {
+    Upload-ReleaseAsset $release.id $Repo $BackendExePath $BackendAssetName $token -ReplaceAssets:$ReplaceAssets | Out-Null
+  }
+  Write-Host "Release uploaded: $Tag" -ForegroundColor Green
+}
+
+if ($PushGit) {
+  & git add -A
+  if ($LASTEXITCODE -ne 0) {
+    throw "git add failed."
+  }
+  & git commit -m $Version
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "git commit skipped (no changes)." -ForegroundColor Yellow
+  }
+  & git push
+  if ($LASTEXITCODE -ne 0) {
+    throw "git push failed."
+  }
+  Write-Host "Git pushed (commit: $Version)." -ForegroundColor Green
+}

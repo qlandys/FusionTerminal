@@ -6,7 +6,6 @@
 #include <QFileInfo>
 #include <QLabel>
 #include <QProgressBar>
-#include <QSaveFile>
 #include <QThread>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -91,6 +90,34 @@ public slots:
     }
 
 private:
+#ifdef Q_OS_WIN
+    bool replaceFile(const QString &src, const QString &dst, QString &err)
+    {
+        const std::wstring wsrc = QDir::toNativeSeparators(src).toStdWString();
+        const std::wstring wdst = QDir::toNativeSeparators(dst).toStdWString();
+        if (MoveFileExW(wsrc.c_str(), wdst.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
+            return true;
+        }
+        const DWORD code = GetLastError();
+        err = QStringLiteral("Replace failed (%1)").arg(static_cast<qulonglong>(code));
+        return false;
+    }
+#else
+    bool replaceFile(const QString &src, const QString &dst, QString &err)
+    {
+        if (QFile::exists(dst) && !QFile::remove(dst)) {
+            err = QStringLiteral("Cannot remove %1").arg(dst);
+            return false;
+        }
+        if (!QFile::rename(src, dst)) {
+            err = QStringLiteral("Cannot rename to %1").arg(dst);
+            return false;
+        }
+        return true;
+    }
+#endif
+
     bool copyFile(const QString &src, const QString &dst, qint64 &doneBytes, qint64 totalBytes)
     {
         QFile in(src);
@@ -102,10 +129,14 @@ private:
         QFileInfo dstInfo(dst);
         QDir().mkpath(dstInfo.dir().absolutePath());
 
-        QSaveFile out(dst);
-        out.setDirectWriteFallback(true);
+        const QString tmpPath = dst + QStringLiteral(".new");
+        if (QFile::exists(tmpPath)) {
+            QFile::remove(tmpPath);
+        }
+
+        QFile out(tmpPath);
         if (!out.open(QIODevice::WriteOnly)) {
-            emit failed(QStringLiteral("Cannot write %1").arg(dst));
+            emit failed(QStringLiteral("Cannot write %1").arg(tmpPath));
             return false;
         }
 
@@ -124,10 +155,26 @@ private:
             emit progressChanged(pct);
         }
 
-        if (!out.commit()) {
-            emit failed(QStringLiteral("Commit failed for %1").arg(dst));
-            return false;
+        out.flush();
+        out.close();
+        in.close();
+
+        if (QFile::exists(dst)) {
+            QFile::setPermissions(dst, QFile::ReadOwner | QFile::WriteOwner | QFile::ReadUser
+                                           | QFile::WriteUser | QFile::ReadGroup | QFile::WriteGroup
+                                           | QFile::ReadOther | QFile::WriteOther);
         }
+
+        QString err;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            if (replaceFile(tmpPath, dst, err)) {
+                return true;
+            }
+            QThread::msleep(400);
+        }
+
+        emit failed(QStringLiteral("Commit failed for %1: %2").arg(dst, err));
+        return false;
         return true;
     }
 

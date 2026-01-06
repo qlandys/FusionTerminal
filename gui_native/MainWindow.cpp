@@ -92,6 +92,9 @@
 #include <QPair>
 #include <QPainterPath>
 #include <QRandomGenerator>
+#include <QDesktopServices>
+#include <QTabWidget>
+#include <QQuickWidget>
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -1093,63 +1096,39 @@ static QString rectToString(const QRect &r)
     return QString("%1,%2 %3x%4").arg(r.x()).arg(r.y()).arg(r.width()).arg(r.height());
 }
 
-#ifdef Q_OS_WIN
-static void applyNativeSnapStyleForHwnd(HWND hwnd)
+static bool geometrySeemsOff(const QRect &geom, const QRect &work, const QSize &minSize)
 {
-    if (!hwnd) return;
-    LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
-    style &= ~WS_CAPTION;
-    style |= WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
-    SetWindowLongPtr(hwnd, GWL_STYLE, style);
-    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-}
-#endif
-
-// Smoothly animate window opacity from slightly transparent to fully opaque.
-// Used to mask small visual jumps when we programmatically change geometry
-// / window flags during restore.
-static void animateWindowFadeIn(QWidget *w)
-{
-    if (!w) return;
-    // Ensure starting opacity is slightly less than 1 so animation is visible
-    w->setWindowOpacity(0.96);
-    auto *anim = new QPropertyAnimation(w, "windowOpacity");
-    anim->setDuration(180);
-    anim->setStartValue(0.96);
-    anim->setEndValue(1.0);
-    anim->setEasingCurve(QEasingCurve::InOutCubic);
-    QObject::connect(anim, &QPropertyAnimation::finished, anim, &QObject::deleteLater);
-    anim->start(QAbstractAnimation::DeleteWhenStopped);
+    if (!geom.isValid()) {
+        return true;
+    }
+    if (geom.width() < minSize.width() || geom.height() < minSize.height()) {
+        return true;
+    }
+    if (!work.isValid()) {
+        return false;
+    }
+    const QRect inter = work.intersected(geom);
+    if (inter.isEmpty()) {
+        return true;
+    }
+    if (inter.width() < geom.width() / 2 || inter.height() < geom.height() / 2) {
+        return true;
+    }
+    return false;
 }
 
-// Ensure native window bounds match widget geometry; on some broken restore
-// sequences the native HWND rect can diverge from QWidget geometry causing
-// the visible area to be clipped. This helper forces the native bounds to
-// the provided geometry when on Windows.
-static void ensureNativeBounds(QWidget *w, const QRect &desired)
+static QScreen *screenByName(const QString &name)
 {
-#ifdef Q_OS_WIN
-    if (!w) return;
-    HWND hwnd = reinterpret_cast<HWND>(w->winId());
-    if (!hwnd) return;
-    RECT r;
-    if (GetWindowRect(hwnd, &r)) {
-        QRect nativeRect(r.left, r.top, r.right - r.left, r.bottom - r.top);
-        // If native rect and desired geometry differ significantly, force it.
-        const int dx = std::abs(nativeRect.x() - desired.x());
-        const int dy = std::abs(nativeRect.y() - desired.y());
-        const int dw = std::abs(nativeRect.width() - desired.width());
-        const int dh = std::abs(nativeRect.height() - desired.height());
-        if (dx > 4 || dy > 4 || dw > 8 || dh > 8) {
-            // Log and set native bounds using SetWindowPos to avoid weird clipping.
-            QString s = QStringLiteral("[MainWindow] Forcing native bounds to %1 (native was %2)").arg(rectToString(desired)).arg(rectToString(nativeRect));
-            qDebug() << s;
-            logToFile(s);
-            SetWindowPos(hwnd, NULL, desired.x(), desired.y(), desired.width(), desired.height(), SWP_NOZORDER | SWP_NOACTIVATE);
+    if (name.isEmpty()) {
+        return nullptr;
+    }
+    const auto screens = QGuiApplication::screens();
+    for (QScreen *scr : screens) {
+        if (scr && scr->name() == name) {
+            return scr;
         }
     }
-#endif
+    return nullptr;
 }
 
 MainWindow::MainWindow(const QString &backendPath,
@@ -2115,25 +2094,6 @@ void MainWindow::buildUi()
     m_timeLabel->setCursor(Qt::PointingHandCursor);
     right->addWidget(m_timeLabel);
 
-    m_buildLabel = new QLabel(top);
-    QString buildVersion = QCoreApplication::applicationVersion().trimmed();
-    if (buildVersion.startsWith(QLatin1Char('v'), Qt::CaseInsensitive)) {
-        buildVersion = buildVersion.mid(1);
-    }
-    if (buildVersion.isEmpty()) {
-        buildVersion = QStringLiteral("0.0.0");
-    }
-    m_buildLabel->setText(buildVersion);
-    m_buildLabel->setObjectName(QStringLiteral("TitleBuildLabel"));
-    m_buildLabel->setStyleSheet(
-        "QLabel#TitleBuildLabel {"
-        "  color: #cfcfcf;"
-        "  padding: 0 6px;"
-        "  font-size: 12px;"
-        "}"
-    );
-    right->addWidget(m_buildLabel);
-
     auto makeWinButton = [top](const QString &text, const char *objectName) {
         auto *btn = new QToolButton(top);
         btn->setText(text);
@@ -2188,122 +2148,32 @@ void MainWindow::buildUi()
         qDebug() << "[MainWindow] Min button clicked. windowState=" << windowState();
         logToFile(QStringLiteral("Min button clicked. state=%1 geometry=%2").arg(QString::number((int)windowState())).arg(rectToString(geometry())));
         showMinimized();
-        // schedule a delayed check when window is restored later
-        QTimer::singleShot(200, this, [this]() {
-            // If we have a saved normal geometry, ensure it's valid after restore
-            if (m_haveLastNormalGeometry && !isMaximized()) {
-                setGeometry(m_lastNormalGeometry);
-                ensureNativeBounds(this, m_lastNormalGeometry);
-                logToFile(QStringLiteral("Applied saved normal geometry after minimize-restore: %1").arg(rectToString(m_lastNormalGeometry)));
-            } else if (!isMaximized()) {
-                // fallback correction
-                QRect geom = geometry();
-                QScreen *scr = QGuiApplication::screenAt(geom.center());
-                if (!scr) scr = QGuiApplication::primaryScreen();
-                if (scr) {
-                    const QRect work = scr->availableGeometry();
-                    const QRect inter = work.intersected(geom);
-                    if (inter.width() < geom.width() / 2 || inter.height() < geom.height() / 2 || !work.contains(geom)) {
-                        int w = std::min(geom.width(), work.width());
-                        int h = std::min(geom.height(), work.height());
-                        int x = work.x() + (work.width() - w) / 2;
-                        int y = work.y() + (work.height() - h) / 2;
-                        QRect desired(x, y, w, h);
-                        setGeometry(desired);
-                        ensureNativeBounds(this, desired);
-                        logToFile(QStringLiteral("Fallback geometry correction after minimize-restore: %1").arg(rectToString(desired)));
-                        raise();
-                        activateWindow();
-                    }
-                }
-            }
-        });
     });
 
     QObject::connect(maxButton, &QToolButton::clicked, this, [this]() {
         const bool maximized = isMaximized();
         qDebug() << "[MainWindow] Max button clicked. before isMaximized=" << maximized
                  << " geometry=" << geometry() << " windowState=" << windowState();
-        const QString s = QStringLiteral("[MainWindow] Max clicked before: isMaximized=%1").arg(maximized ? QStringLiteral("1") : QStringLiteral("0"));
+        const QString s =
+            QStringLiteral("[MainWindow] Max clicked before: isMaximized=%1")
+                .arg(maximized ? QStringLiteral("1") : QStringLiteral("0"));
         {
             const std::wstring ws = s.toStdWString();
             OutputDebugStringW(ws.c_str());
         }
 
         if (!maximized) {
-            // About to maximize: save current normal geometry so we can restore it later
-            m_lastNormalGeometry = geometry();
-            m_haveLastNormalGeometry = true;
-                logToFile(QStringLiteral("Saving normal geometry before maximize: %1").arg(rectToString(m_lastNormalGeometry)));
             showMaximized();
         } else {
-            // Restore from maximized: use saved normal geometry if available
-            // To avoid native geometry/desync issues with frameless windows,
-            // temporarily disable the frameless flag so the system applies
-            // normal window decoration and bounds, then re-enable our
-            // frameless UI and apply the saved geometry.
-            if (m_haveLastNormalGeometry) {
-                // Hide heavy content to mask visual jumps during restore
-                QWidget *central = centralWidget();
-                if (central) central->setVisible(false);
-
-                logToFile(QStringLiteral("Restoring from maximized: temporarily disabling FramelessWindowHint"));
-                // disable frameless so Windows will restore native bounds
-                setWindowFlag(Qt::FramelessWindowHint, false);
-                showNormal();
-                // allow the windowing system to settle, then reapply our geometry
-                QTimer::singleShot(180, this, [this, central]() {
-                    setGeometry(m_lastNormalGeometry);
-                    ensureNativeBounds(this, m_lastNormalGeometry);
-                    // re-enable frameless and show again to apply our custom titlebar
-                    setWindowFlag(Qt::FramelessWindowHint, true);
-                    // Calling show() will update flags; ensure the window is active
-                    show();
-                    // Reapply native snap style bits in case they were changed
-#ifdef Q_OS_WIN
-                    applyNativeSnapStyleForHwnd(reinterpret_cast<HWND>(winId()));
-#endif
-                    raise();
-                    activateWindow();
-                    logToFile(QStringLiteral("Restored saved normal geometry after un-maximize (frameless-toggle): %1").arg(rectToString(m_lastNormalGeometry)));
-
-                    // Reveal content with a quick fade to mask remaining jumps
-                    if (central) {
-                        animateWindowFadeIn(this);
-                        central->setVisible(true);
-                    } else {
-                        animateWindowFadeIn(this);
-                    }
-                });
-            } else {
-                // fallback small correction after restore
-                QTimer::singleShot(50, this, [this]() {
-                    QRect geom = geometry();
-                    QScreen *scr = QGuiApplication::screenAt(geom.center());
-                    if (!scr) scr = QGuiApplication::primaryScreen();
-                    if (!scr) return;
-                    const QRect work = scr->availableGeometry();
-                    const QRect inter = work.intersected(geom);
-                    if (inter.width() < geom.width() / 2 || inter.height() < geom.height() / 2 || !work.contains(geom)) {
-                        int w = std::min(geom.width(), work.width());
-                        int h = std::min(geom.height(), work.height());
-                        int x = work.x() + (work.width() - w) / 2;
-                        int y = work.y() + (work.height() - h) / 2;
-                        QRect correctedDesired(x, y, w, h); // ????????? desired ?????
-                        setGeometry(correctedDesired);
-                        ensureNativeBounds(this, correctedDesired);
-                        logToFile(QStringLiteral("Fallback geometry correction after minimize-restore: %1").arg(rectToString(correctedDesired)));
-                        raise();
-                        activateWindow();
-                    }
-                });
-            }
+            showNormal();
         }
 
         updateMaximizeIcon();
         QTimer::singleShot(100, this, [this]() {
             qDebug() << "[MainWindow] geometry after action:" << geometry() << " state=" << windowState();
-            logToFile(QStringLiteral("Post-max action geometry: %1 state=%2").arg(rectToString(geometry())).arg((int)windowState()));
+            logToFile(QStringLiteral("Post-max action geometry: %1 state=%2")
+                          .arg(rectToString(geometry()))
+                          .arg((int)windowState()));
         });
     });
     QObject::connect(closeButton, &QToolButton::clicked, this, &QWidget::close);
@@ -2651,67 +2521,94 @@ void MainWindow::keyReleaseEvent(QKeyEvent *event)
 void MainWindow::changeEvent(QEvent *event)
 {
     if (event && event->type() == QEvent::WindowStateChange) {
-        // Handle transitions between Minimized / Maximized / Normal reliably.
         const Qt::WindowStates cur = windowState();
-        // If we just became maximized (possibly via system/Aero Snap), save
-        // the normal geometry reported by the window system so we can restore
-        // it later.
-        if (cur.testFlag(Qt::WindowMaximized)) {
-            // QWidget::normalGeometry() is available on the widget and is
-            // preferred here (some Qt versions don't expose normalGeometry()
-            // on QWindow).
-            const QRect normal = normalGeometry();
-            if (normal.isValid()) {
-                m_lastNormalGeometry = normal;
-                m_haveLastNormalGeometry = true;
-                qDebug() << "[MainWindow] saved normalGeometry from widget() :" << normal;
-                logToFile(QStringLiteral("changeEvent: saved normalGeometry: %1").arg(rectToString(normal)));
-            }
-        }
-
-        // If we transitioned from Minimized -> Normal, restore previous
-        // maximized/normal behaviour depending on what we had before.
-        if (m_prevWindowState.testFlag(Qt::WindowMinimized) && !cur.testFlag(Qt::WindowMinimized)) {
-            // We are restoring from minimize.
-            if (m_prevWindowState.testFlag(Qt::WindowMaximized)) {
-                // If previously maximized, restore maximized but hide content briefly
-                QWidget *central = centralWidget();
-                if (central) central->setVisible(false);
-                QTimer::singleShot(0, this, [this, central]() {
-                    showMaximized();
-                    QTimer::singleShot(160, this, [this, central]() {
-                        if (central) {
-                            animateWindowFadeIn(this);
-                            central->setVisible(true);
-                        } else {
-                            animateWindowFadeIn(this);
-                        }
-                    });
-                });
-            } else if (m_haveLastNormalGeometry) {
-                // If previously normal, restore saved normal geometry with content hidden
-                QWidget *central = centralWidget();
-                if (central) central->setVisible(false);
-                QTimer::singleShot(120, this, [this, central]() {
-                    setGeometry(m_lastNormalGeometry);
-                    ensureNativeBounds(this, m_lastNormalGeometry);
-                    logToFile(QStringLiteral("changeEvent: restored saved geometry after un-minimize: %1").arg(rectToString(m_lastNormalGeometry)));
-                    raise();
-                    activateWindow();
-                    if (central) {
-                        animateWindowFadeIn(this);
-                        central->setVisible(true);
-                    } else {
-                        animateWindowFadeIn(this);
-                    }
-                });
-            }
-        }
-
+        const bool wasMinimized = m_prevWindowState.testFlag(Qt::WindowMinimized);
         updateMaximizeIcon();
         m_prevWindowState = cur;
+        if (wasMinimized && !cur.testFlag(Qt::WindowMinimized)) {
+            if (m_restoreRefreshQueued) {
+                QMainWindow::changeEvent(event);
+                return;
+            }
+            m_restoreRefreshQueued = true;
+            QTimer::singleShot(0, this, [this]() {
+                m_restoreRefreshQueued = false;
+                if (isMinimized() || isMaximized()) {
+                    return;
+                }
+                QRect geom = frameGeometry();
+                QScreen *scr = nullptr;
+                if (windowHandle()) {
+                    scr = windowHandle()->screen();
+                }
+                if (!scr) {
+                    scr = screenByName(m_lastNormalScreenName);
+                }
+                if (!scr) {
+                    scr = QGuiApplication::screenAt(geom.center());
+                }
+                if (!scr) {
+                    scr = QGuiApplication::primaryScreen();
+                }
+                const QRect work = scr ? scr->availableGeometry() : QRect();
+                if (geometrySeemsOff(geom, work, minimumSize())) {
+                    if (m_haveLastNormalGeometry) {
+                        setGeometry(m_lastNormalGeometry);
+                    } else if (scr) {
+                        const int w = std::min(geom.width(), work.width());
+                        const int h = std::min(geom.height(), work.height());
+                        const int x = work.x() + (work.width() - w) / 2;
+                        const int y = work.y() + (work.height() - h) / 2;
+                        setGeometry(x, y, w, h);
+                    }
+                }
+                QWidget *central = centralWidget();
+                if (central) {
+                    central->setUpdatesEnabled(false);
+                    central->setVisible(false);
+                }
+                QTimer::singleShot(0, this, [this, central]() {
+                    if (central) {
+                        central->setVisible(true);
+                        central->setUpdatesEnabled(true);
+                        central->update();
+                    }
+                    const auto quicks = findChildren<QQuickWidget *>();
+                    for (QQuickWidget *qw : quicks) {
+                        if (qw) {
+                            qw->update();
+                        }
+                    }
+                    update();
+                });
+            });
+        }
     }
     QMainWindow::changeEvent(event);
+}
+
+void MainWindow::moveEvent(QMoveEvent *event)
+{
+    if (!isMinimized() && !isMaximized()) {
+        m_lastNormalGeometry = geometry();
+        m_haveLastNormalGeometry = m_lastNormalGeometry.isValid();
+        if (windowHandle() && windowHandle()->screen()) {
+            m_lastNormalScreenName = windowHandle()->screen()->name();
+        }
+    }
+    QMainWindow::moveEvent(event);
+}
+
+void MainWindow::resizeEvent(QResizeEvent *event)
+{
+    if (!isMinimized() && !isMaximized()) {
+        m_lastNormalGeometry = geometry();
+        m_haveLastNormalGeometry = m_lastNormalGeometry.isValid();
+        if (windowHandle() && windowHandle()->screen()) {
+            m_lastNormalScreenName = windowHandle()->screen()->name();
+        }
+    }
+    QMainWindow::resizeEvent(event);
 }
 
 void MainWindow::updateMaximizeIcon()
@@ -2765,14 +2662,8 @@ bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr
         return true;
     }
 
-        if (msg->message == WM_NCHITTEST) {
+    if (msg->message == WM_NCHITTEST) {
         HWND hwndHit = msg->hwnd;
-        // When maximized/snapped, treat everything as client to avoid inner gaps.
-        if (hwndHit && IsZoomed(hwndHit)) {
-            *result = HTCLIENT;
-            return true;
-        }
-
         const LONG x = GET_X_LPARAM(msg->lParam);
         const LONG y = GET_Y_LPARAM(msg->lParam);
         const QPoint globalPt(x, y);
@@ -2783,6 +2674,44 @@ bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr
         const int w = g.width();
         const int h = g.height();
         const int bw = m_resizeBorderWidth;
+
+        auto hitTestTopBar = [this, &globalPt]() -> int {
+            if (!m_topBar) {
+                return -1;
+            }
+            const QPoint localInTop = m_topBar->mapFromGlobal(globalPt);
+            if (!m_topBar->rect().contains(localInTop)) {
+                return -1;
+            }
+            QWidget *child = m_topBar->childAt(localInTop);
+            bool interactive = false;
+
+            if (!child) {
+                interactive = false;
+            } else if (child == m_minButton || child == m_maxButton || child == m_closeButton
+                       || child == m_addTabButton || child == m_timeLabel) {
+                interactive = true;
+            } else if (child == m_workspaceTabs) {
+                QPoint inTabs = m_workspaceTabs->mapFrom(m_topBar, localInTop);
+                int tabIndex = m_workspaceTabs->tabAt(inTabs);
+                interactive = (tabIndex != -1);
+            } else {
+                interactive = true;
+            }
+
+            return interactive ? HTCLIENT : HTCAPTION;
+        };
+
+        const bool isZoomed = hwndHit && IsZoomed(hwndHit);
+        if (isZoomed) {
+            const int topHit = hitTestTopBar();
+            if (topHit == HTCAPTION) {
+                *result = HTCAPTION;
+                return true;
+            }
+            *result = HTCLIENT;
+            return true;
+        }
 
         // Corners first
         if (localPt.x() < bw && localPt.y() < bw) { *result = HTTOPLEFT; return true; }
@@ -2797,30 +2726,10 @@ bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr
         if (localPt.y() >= h - bw) { *result = HTBOTTOM; return true; }
 
         // Title bar: empty area => caption drag, interactive widgets => client.
-        if (m_topBar) {
-            const QPoint localInTop = m_topBar->mapFromGlobal(globalPt);
-            if (m_topBar->rect().contains(localInTop)) {
-                QWidget *child = m_topBar->childAt(localInTop);
-                bool interactive = false;
-
-                if (!child) {
-                    interactive = false;
-                 } else if (child == m_minButton || child == m_maxButton || child == m_closeButton ||
-                            child == m_addTabButton || child == m_timeLabel) {
-                     interactive = true;
-                 } else if (child == m_workspaceTabs) {
-                    QPoint inTabs = m_workspaceTabs->mapFrom(m_topBar, localInTop);
-                    int tabIndex = m_workspaceTabs->tabAt(inTabs);
-                    interactive = (tabIndex != -1);
-                } else {
-                    interactive = true;
-                }
-
-                if (!interactive) {
-                    *result = HTCAPTION;
-                    return true;
-                }
-            }
+        const int topHit = hitTestTopBar();
+        if (topHit == HTCAPTION) {
+            *result = HTCAPTION;
+            return true;
         }
 
         *result = HTCLIENT;
@@ -2868,7 +2777,7 @@ QWidget *MainWindow::buildMainArea(QWidget *parent)
     // ???? ????, ??? ? VSCode (????????? ?? 2px ?? ???????)
         sidebar->setFixedWidth(42);
     auto *sideLayout = new QVBoxLayout(sidebar);
-    sideLayout->setContentsMargins(0, 12, 0, 12);
+    sideLayout->setContentsMargins(0, 12, 0, 0);
     sideLayout->setSpacing(12);
 
     const QSize navIconSize(28, 28);
@@ -2952,12 +2861,10 @@ QWidget *MainWindow::buildMainArea(QWidget *parent)
     sideLayout->addStretch(1);
 
     // Updates (above profile)
-    {
-        m_updateButton = makeSideButton(QStringLiteral("cloud-question"), tr("Updates"));
-        sideLayout->addWidget(m_updateButton, 0, Qt::AlignHCenter | Qt::AlignBottom);
-        connect(m_updateButton, &QToolButton::clicked, this, &MainWindow::handleUpdateButtonClicked);
-        setUpdateState(UpdateState::NotChecked);
-    }
+    m_updateButton = makeSideButton(QStringLiteral("cloud-question"), tr("Updates"));
+    sideLayout->addWidget(m_updateButton, 0, Qt::AlignHCenter | Qt::AlignBottom);
+    connect(m_updateButton, &QToolButton::clicked, this, &MainWindow::handleUpdateButtonClicked);
+    setUpdateState(UpdateState::NotChecked);
 
     // Auth / account (above settings)
     auto *authNav = makeSideButton(QStringLiteral("user-circle"), tr("Sign in"));
@@ -2968,6 +2875,28 @@ QWidget *MainWindow::buildMainArea(QWidget *parent)
     auto *settingsNav = makeSideButton(QStringLiteral("settings"), tr("Settings"));
     sideLayout->addWidget(settingsNav, 0, Qt::AlignHCenter | Qt::AlignBottom);
     connect(settingsNav, &QToolButton::clicked, this, &MainWindow::openSettingsWindow);
+
+    QString buildVersion = QCoreApplication::applicationVersion().trimmed();
+    if (buildVersion.startsWith(QLatin1Char('v'), Qt::CaseInsensitive)) {
+        buildVersion = buildVersion.mid(1);
+    }
+    if (buildVersion.isEmpty()) {
+        buildVersion = QStringLiteral("0.0.0");
+    }
+    auto *buildLabel = new QLabel(buildVersion, sidebar);
+    buildLabel->setObjectName(QStringLiteral("SideBuildLabel"));
+    buildLabel->setAlignment(Qt::AlignHCenter | Qt::AlignTop);
+    buildLabel->setStyleSheet(
+        "QLabel#SideBuildLabel {"
+        "  color: #9aa0a6;"
+        "  font-family: \"JetBrains Mono\";"
+        "  font-size: 9px;"
+        "  font-weight: 600;"
+        "  padding: 0;"
+        "}"
+    );
+    sideLayout->addSpacing(0);
+    sideLayout->addWidget(buildLabel, 0, Qt::AlignHCenter | Qt::AlignBottom);
 
     layout->addWidget(sidebar);
 
@@ -3397,7 +3326,7 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     header->setProperty("domContainerPtr",
                         QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(column)));
     auto *hLayout = new QHBoxLayout(header);
-    hLayout->setContentsMargins(7, 2, 0, 2);
+    hLayout->setContentsMargins(7, 1, 0, 1);
     hLayout->setSpacing(5);
     header->setFixedHeight(22);
 
@@ -3465,10 +3394,10 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     auto *closeButton = new QToolButton(header);
     closeButton->setObjectName(QStringLiteral("DomHeaderCloseButton"));
     closeButton->setAutoRaise(true);
-    closeButton->setIconSize(QSize(11, 11));
+    closeButton->setIconSize(QSize(12, 12));
     closeButton->setCursor(Qt::PointingHandCursor);
-    closeButton->setFixedSize(20, 18);
-    hLayout->addWidget(closeButton);
+    closeButton->setFixedSize(20, 20);
+    hLayout->addWidget(closeButton, 0, Qt::AlignVCenter);
     result.closeButton = closeButton;
 
     applyHeaderAccent(result);
@@ -7175,6 +7104,7 @@ void MainWindow::openPluginsWindow()
     if (!m_pluginsWindow) {
         m_pluginsWindow = new PluginsWindow(this);
     }
+    m_pluginsWindow->setAuthContext(m_authBaseUrl, m_authToken, m_authRole, m_authUser);
     m_pluginsWindow->show();
     m_pluginsWindow->raise();
     m_pluginsWindow->activateWindow();
@@ -7262,16 +7192,17 @@ void MainWindow::openAuthWindow()
     dlg->setWindowTitle(tr("Sign in"));
     dlg->setModal(false);
     dlg->setWindowModality(Qt::NonModal);
-    dlg->setMinimumWidth(360);
+    dlg->setMinimumWidth(460);
     dlg->setStyleSheet(QStringLiteral(
         "QDialog { background-color: #1f1f1f; color: #e0e0e0; }"
-        "QLabel#AuthTitle { font-size: 16px; font-weight: 700; color: #ffffff; }"
-        "QLabel#AuthHint { color: #a0a0a0; }"
+        "QLabel#AuthTitle { font-size: 22px; font-weight: 700; color: #ffffff; }"
+        "QLabel#AuthHint { color: #9aa0a6; }"
+        "QLabel#AuthSection { color: #cfd3d7; font-weight: 600; }"
         "QLineEdit {"
         "  background-color: #262626;"
         "  border: 1px solid #3a3a3a;"
         "  border-radius: 4px;"
-        "  padding: 6px 8px;"
+        "  padding: 6px 10px;"
         "  color: #e6e6e6;"
         "}"
         "QLineEdit:focus { border-color: #4aa3ff; }"
@@ -7279,8 +7210,8 @@ void MainWindow::openAuthWindow()
         "  background-color: #2e7bdc;"
         "  color: #ffffff;"
         "  border: none;"
-        "  border-radius: 4px;"
-        "  padding: 6px 12px;"
+        "  border-radius: 6px;"
+        "  padding: 8px 12px;"
         "  font-weight: 600;"
         "}"
         "QPushButton#AuthPrimary:hover { background-color: #3a88e5; }"
@@ -7289,55 +7220,474 @@ void MainWindow::openAuthWindow()
         "  color: #e0e0e0;"
         "  border: 1px solid #3a3a3a;"
         "  border-radius: 4px;"
-        "  padding: 6px 12px;"
+        "  padding: 6px 10px;"
         "}"
         "QPushButton#AuthSecondary:hover { background-color: #333333; }"
+        "QPushButton#AuthGoogle {"
+        "  background-color: #232323;"
+        "  color: #e0e0e0;"
+        "  border: 1px solid #2f2f2f;"
+        "  border-radius: 6px;"
+        "  padding: 8px 12px;"
+        "}"
+        "QPushButton#AuthGoogle:hover { background-color: #2a2a2a; }"
+        "QToolButton#AuthLink {"
+        "  color: #4aa3ff;"
+        "  border: none;"
+        "  padding: 0px;"
+        "}"
+        "QToolButton#AuthLink:hover { color: #6bb6ff; }"
     ));
 
     auto *layout = new QVBoxLayout(dlg);
     layout->setContentsMargins(16, 16, 16, 16);
     layout->setSpacing(12);
 
-    auto *titleRow = new QHBoxLayout();
-    titleRow->setSpacing(10);
+    auto *headerRow = new QHBoxLayout();
+    headerRow->setSpacing(10);
     auto *icon = new QLabel(dlg);
-    icon->setFixedSize(20, 20);
+    icon->setFixedSize(22, 22);
     icon->setPixmap(loadIconTinted(QStringLiteral("user-circle"),
                                    QColor("#e0e0e0"),
-                                   QSize(20, 20)).pixmap(20, 20));
-    auto *title = new QLabel(tr("Sign in to enable extensions"), dlg);
+                                   QSize(22, 22)).pixmap(22, 22));
+    auto *title = new QLabel(tr("Sign in"), dlg);
     title->setObjectName(QStringLiteral("AuthTitle"));
-    titleRow->addWidget(icon);
-    titleRow->addWidget(title, 1);
-    layout->addLayout(titleRow);
+    headerRow->addWidget(icon);
+    headerRow->addWidget(title, 1);
+    layout->addLayout(headerRow);
 
-    auto *hint = new QLabel(tr("Your account unlocks mods and sync (coming soon)."), dlg);
+    auto *hint = new QLabel(tr("Unlock extensions & sync"), dlg);
     hint->setObjectName(QStringLiteral("AuthHint"));
     hint->setWordWrap(true);
     layout->addWidget(hint);
 
-    auto *userEdit = new QLineEdit(dlg);
-    userEdit->setPlaceholderText(tr("Email or username"));
-    layout->addWidget(userEdit);
+    auto *pages = new QStackedWidget(dlg);
+    auto *signInPage = new QWidget(pages);
+    auto *registerPage = new QWidget(pages);
+    pages->addWidget(signInPage);
+    pages->addWidget(registerPage);
+    layout->addWidget(pages);
 
-    auto *tokenEdit = new QLineEdit(dlg);
-    tokenEdit->setPlaceholderText(tr("Access token"));
-    layout->addWidget(tokenEdit);
+    auto *signLayout = new QVBoxLayout(signInPage);
+    signLayout->setContentsMargins(0, 0, 0, 0);
+    signLayout->setSpacing(10);
+
+    auto *signEmailLabel = new QLabel(tr("Email"), signInPage);
+    signEmailLabel->setObjectName(QStringLiteral("AuthSection"));
+    signLayout->addWidget(signEmailLabel);
+    auto *signUserEdit = new QLineEdit(signInPage);
+    signUserEdit->setPlaceholderText(tr("user@example.com"));
+    signLayout->addWidget(signUserEdit);
+
+    auto *signPassLabel = new QLabel(tr("Password"), signInPage);
+    signPassLabel->setObjectName(QStringLiteral("AuthSection"));
+    signLayout->addWidget(signPassLabel);
+    auto *signPassEdit = new QLineEdit(signInPage);
+    signPassEdit->setPlaceholderText(tr("Password"));
+    signPassEdit->setEchoMode(QLineEdit::Password);
+    signLayout->addWidget(signPassEdit);
+
+    auto *signInPasswordBtn = new QPushButton(tr("Sign in"), signInPage);
+    signInPasswordBtn->setObjectName(QStringLiteral("AuthPrimary"));
+    signLayout->addWidget(signInPasswordBtn);
+
+    auto *sepRow = new QHBoxLayout();
+    auto *sepLeft = new QFrame(signInPage);
+    sepLeft->setFrameShape(QFrame::HLine);
+    sepLeft->setFrameShadow(QFrame::Sunken);
+    auto *sepRight = new QFrame(signInPage);
+    sepRight->setFrameShape(QFrame::HLine);
+    sepRight->setFrameShadow(QFrame::Sunken);
+    auto *sepLabel = new QLabel(tr("or"), signInPage);
+    sepLabel->setObjectName(QStringLiteral("AuthHint"));
+    sepRow->addWidget(sepLeft, 1);
+    sepRow->addWidget(sepLabel);
+    sepRow->addWidget(sepRight, 1);
+    signLayout->addLayout(sepRow);
+
+    auto *signGoogleBtn = new QPushButton(tr("Continue with Google"), signInPage);
+    signGoogleBtn->setObjectName(QStringLiteral("AuthGoogle"));
+    {
+        const QString googleIconPath = resolveAssetPath(QStringLiteral("icons/outline/brand-google.svg"));
+        if (!googleIconPath.isEmpty()) {
+            signGoogleBtn->setIcon(QIcon(googleIconPath));
+        }
+        signGoogleBtn->setIconSize(QSize(16, 16));
+    }
+    signLayout->addWidget(signGoogleBtn);
+
+    auto *advancedToggle = new QToolButton(signInPage);
+    advancedToggle->setText(tr("Advanced sign-in"));
+    advancedToggle->setCheckable(true);
+    advancedToggle->setAutoRaise(true);
+    signLayout->addWidget(advancedToggle, 0, Qt::AlignLeft);
+
+    auto *advancedContainer = new QWidget(signInPage);
+    auto *advancedLayout = new QVBoxLayout(advancedContainer);
+    advancedLayout->setContentsMargins(0, 0, 0, 0);
+    advancedLayout->setSpacing(8);
+    advancedContainer->setVisible(false);
+    signLayout->addWidget(advancedContainer);
+
+    auto *signSep = new QLabel(tr("Code login"), signInPage);
+    signSep->setObjectName(QStringLiteral("AuthHint"));
+    advancedLayout->addWidget(signSep);
+
+    auto *signChannelRow = new QHBoxLayout();
+    auto *signChannelBox = new QComboBox(signInPage);
+    signChannelBox->addItem(QStringLiteral("email"));
+    signChannelBox->addItem(QStringLiteral("telegram"));
+    signChannelRow->addWidget(signChannelBox, 0);
+    auto *signCodeEdit = new QLineEdit(signInPage);
+    signCodeEdit->setPlaceholderText(tr("Code"));
+    signChannelRow->addWidget(signCodeEdit, 1);
+    advancedLayout->addLayout(signChannelRow);
+
+    auto *signCodeRow = new QHBoxLayout();
+    auto *sendSignCodeBtn = new QPushButton(tr("Send code"), signInPage);
+    auto *verifySignCodeBtn = new QPushButton(tr("Verify code"), signInPage);
+    sendSignCodeBtn->setObjectName(QStringLiteral("AuthSecondary"));
+    verifySignCodeBtn->setObjectName(QStringLiteral("AuthSecondary"));
+    signCodeRow->addWidget(sendSignCodeBtn);
+    signCodeRow->addWidget(verifySignCodeBtn);
+    advancedLayout->addLayout(signCodeRow);
+
+    auto *signTokenEdit = new QLineEdit(signInPage);
+    signTokenEdit->setPlaceholderText(tr("Paste token (OAuth)"));
+    advancedLayout->addWidget(signTokenEdit);
+    auto *signUseTokenBtn = new QPushButton(tr("Use token"), signInPage);
+    signUseTokenBtn->setObjectName(QStringLiteral("AuthSecondary"));
+    advancedLayout->addWidget(signUseTokenBtn);
+
+    auto *registerRow = new QHBoxLayout();
+    auto *registerText = new QLabel(tr("Don't have an account?"), signInPage);
+    registerText->setObjectName(QStringLiteral("AuthHint"));
+    auto *registerLink = new QToolButton(signInPage);
+    registerLink->setObjectName(QStringLiteral("AuthLink"));
+    registerLink->setText(tr("Register"));
+    registerRow->addWidget(registerText);
+    registerRow->addWidget(registerLink);
+    registerRow->addStretch(1);
+    signLayout->addLayout(registerRow);
+
+    auto *regLayout = new QVBoxLayout(registerPage);
+    regLayout->setContentsMargins(0, 0, 0, 0);
+    regLayout->setSpacing(10);
+
+    auto *regTitle = new QLabel(tr("Register"), registerPage);
+    regTitle->setObjectName(QStringLiteral("AuthTitle"));
+    regLayout->addWidget(regTitle);
+    auto *regHint = new QLabel(tr("Create your account to unlock mods"), registerPage);
+    regHint->setObjectName(QStringLiteral("AuthHint"));
+    regLayout->addWidget(regHint);
+
+    auto *regEmailLabel = new QLabel(tr("Email"), registerPage);
+    regEmailLabel->setObjectName(QStringLiteral("AuthSection"));
+    regLayout->addWidget(regEmailLabel);
+    auto *regUserEdit = new QLineEdit(registerPage);
+    regUserEdit->setPlaceholderText(tr("user@example.com"));
+    regLayout->addWidget(regUserEdit);
+
+    auto *regPassLabel = new QLabel(tr("Password"), registerPage);
+    regPassLabel->setObjectName(QStringLiteral("AuthSection"));
+    regLayout->addWidget(regPassLabel);
+    auto *regPassEdit = new QLineEdit(registerPage);
+    regPassEdit->setPlaceholderText(tr("Password"));
+    regPassEdit->setEchoMode(QLineEdit::Password);
+    regLayout->addWidget(regPassEdit);
+
+    auto *regPassConfirm = new QLineEdit(registerPage);
+    regPassConfirm->setPlaceholderText(tr("Confirm password"));
+    regPassConfirm->setEchoMode(QLineEdit::Password);
+    regLayout->addWidget(regPassConfirm);
+
+    auto *regChannelRow = new QHBoxLayout();
+    auto *regChannelBox = new QComboBox(registerPage);
+    regChannelBox->addItem(QStringLiteral("email"));
+    regChannelBox->addItem(QStringLiteral("telegram"));
+    regChannelRow->addWidget(regChannelBox, 0);
+    auto *regCodeEdit = new QLineEdit(registerPage);
+    regCodeEdit->setPlaceholderText(tr("Code"));
+    regChannelRow->addWidget(regCodeEdit, 1);
+    regLayout->addLayout(regChannelRow);
+
+    auto *regCodeRow = new QHBoxLayout();
+    auto *sendRegCodeBtn = new QPushButton(tr("Send code"), registerPage);
+    auto *verifyRegBtn = new QPushButton(tr("Create account"), registerPage);
+    sendRegCodeBtn->setObjectName(QStringLiteral("AuthSecondary"));
+    verifyRegBtn->setObjectName(QStringLiteral("AuthPrimary"));
+    regCodeRow->addWidget(sendRegCodeBtn);
+    regCodeRow->addWidget(verifyRegBtn);
+    regLayout->addLayout(regCodeRow);
+
+    auto *backRow = new QHBoxLayout();
+    auto *backText = new QLabel(tr("Already have an account?"), registerPage);
+    backText->setObjectName(QStringLiteral("AuthHint"));
+    auto *backLink = new QToolButton(registerPage);
+    backLink->setObjectName(QStringLiteral("AuthLink"));
+    backLink->setText(tr("Sign in"));
+    backRow->addWidget(backText);
+    backRow->addWidget(backLink);
+    backRow->addStretch(1);
+    regLayout->addLayout(backRow);
 
     auto *buttons = new QHBoxLayout();
     buttons->addStretch(1);
-    auto *signIn = new QPushButton(tr("Sign in"), dlg);
-    signIn->setObjectName(QStringLiteral("AuthPrimary"));
     auto *close = new QPushButton(tr("Close"), dlg);
     close->setObjectName(QStringLiteral("AuthSecondary"));
     buttons->addWidget(close);
-    buttons->addWidget(signIn);
     layout->addLayout(buttons);
 
+    auto *net = new QNetworkAccessManager(dlg);
+    auto setStatus = [this](const QString &msg) {
+        statusBar()->showMessage(msg, 3500);
+    };
+    auto resolveBaseUrl = [this]() -> QString {
+        QString base = m_authBaseUrl.trimmed();
+        if (base.isEmpty()) base = QStringLiteral("https://api.fusionterminal.xyz");
+        if (base.endsWith('/')) {
+            base.chop(1);
+        }
+        return base;
+    };
+    auto postJson = [net, resolveBaseUrl](const QString &path, const QJsonObject &obj) -> QNetworkReply * {
+        const QString base = resolveBaseUrl();
+        if (base.isEmpty()) {
+            return nullptr;
+        }
+        QNetworkRequest req(QUrl(base + path));
+        req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+        return net->post(req, QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    };
+    auto applyToken = [this, resolveBaseUrl](const QString &token,
+                                             const QString &role,
+                                             const QString &user) {
+        m_authBaseUrl = resolveBaseUrl();
+        m_authToken = token;
+        m_authRole = role;
+        m_authUser = user;
+        saveUserSettings();
+    };
+
     connect(close, &QPushButton::clicked, dlg, &QDialog::close);
-    connect(signIn, &QPushButton::clicked, this, [this]() {
-        statusBar()->showMessage(tr("Auth backend is not wired yet."), 2500);
+    connect(advancedToggle, &QToolButton::toggled, this, [advancedContainer](bool on) {
+        advancedContainer->setVisible(on);
     });
+    connect(registerLink, &QToolButton::clicked, this, [pages]() {
+        pages->setCurrentIndex(1);
+    });
+    connect(backLink, &QToolButton::clicked, this, [pages]() {
+        pages->setCurrentIndex(0);
+    });
+
+    connect(signInPasswordBtn, &QPushButton::clicked, this, [=]() {
+        const QString base = resolveBaseUrl();
+        if (base.isEmpty()) {
+            setStatus(tr("Server unavailable."));
+            return;
+        }
+        QJsonObject obj;
+        obj.insert(QStringLiteral("email_or_login"), signUserEdit->text().trimmed());
+        obj.insert(QStringLiteral("password"), signPassEdit->text());
+        QNetworkReply *reply = postJson(QStringLiteral("/auth/login"), obj);
+        if (!reply) {
+            setStatus(tr("Auth request failed."));
+            return;
+        }
+        connect(reply, &QNetworkReply::finished, this, [reply, applyToken, setStatus]() {
+            reply->deleteLater();
+            if (reply->error() != QNetworkReply::NoError) {
+                setStatus(tr("Login failed."));
+                return;
+            }
+            const QByteArray raw = reply->readAll();
+            const QJsonDocument doc = QJsonDocument::fromJson(raw);
+            if (!doc.isObject()) {
+                applyToken(QString::fromUtf8(raw).trimmed(), QString(), QString());
+                setStatus(tr("Signed in."));
+                return;
+            }
+            const QJsonObject obj = doc.object();
+            const QString token = obj.value(QStringLiteral("token")).toString();
+            const QString role = obj.value(QStringLiteral("role")).toString();
+            const QString user = obj.value(QStringLiteral("user")).toString();
+            if (token.isEmpty()) {
+                setStatus(tr("Login failed."));
+                return;
+            }
+            applyToken(token, role, user);
+            setStatus(tr("Signed in."));
+        });
+    });
+
+    connect(sendSignCodeBtn, &QPushButton::clicked, this, [=]() {
+        const QString base = resolveBaseUrl();
+        if (base.isEmpty()) {
+            setStatus(tr("Server unavailable."));
+            return;
+        }
+        QJsonObject obj;
+        obj.insert(QStringLiteral("email_or_login"), signUserEdit->text().trimmed());
+        obj.insert(QStringLiteral("channel"), signChannelBox->currentText().trimmed());
+        QNetworkReply *reply = postJson(QStringLiteral("/auth/send_code"), obj);
+        if (!reply) {
+            setStatus(tr("Send code failed."));
+            return;
+        }
+        connect(reply, &QNetworkReply::finished, this, [reply, setStatus]() {
+            reply->deleteLater();
+            if (reply->error() != QNetworkReply::NoError) {
+                setStatus(tr("Send code failed."));
+                return;
+            }
+            setStatus(tr("Code sent."));
+        });
+    });
+
+    connect(verifySignCodeBtn, &QPushButton::clicked, this, [=]() {
+        const QString base = resolveBaseUrl();
+        if (base.isEmpty()) {
+            setStatus(tr("Server unavailable."));
+            return;
+        }
+        QJsonObject obj;
+        obj.insert(QStringLiteral("email_or_login"), signUserEdit->text().trimmed());
+        obj.insert(QStringLiteral("code"), signCodeEdit->text().trimmed());
+        obj.insert(QStringLiteral("flow"), QStringLiteral("login"));
+        QNetworkReply *reply = postJson(QStringLiteral("/auth/verify_code"), obj);
+        if (!reply) {
+            setStatus(tr("Verify failed."));
+            return;
+        }
+        connect(reply, &QNetworkReply::finished, this, [reply, applyToken, setStatus]() {
+            reply->deleteLater();
+            if (reply->error() != QNetworkReply::NoError) {
+                setStatus(tr("Verify failed."));
+                return;
+            }
+            const QByteArray raw = reply->readAll();
+            const QJsonDocument doc = QJsonDocument::fromJson(raw);
+            if (!doc.isObject()) {
+                applyToken(QString::fromUtf8(raw).trimmed(), QString(), QString());
+                setStatus(tr("Signed in."));
+                return;
+            }
+            const QJsonObject obj = doc.object();
+            const QString token = obj.value(QStringLiteral("token")).toString();
+            const QString role = obj.value(QStringLiteral("role")).toString();
+            const QString user = obj.value(QStringLiteral("user")).toString();
+            if (token.isEmpty()) {
+                setStatus(tr("Verify failed."));
+                return;
+            }
+            applyToken(token, role, user);
+            setStatus(tr("Signed in."));
+        });
+    });
+
+    connect(signGoogleBtn, &QPushButton::clicked, this, [=]() {
+        const QString base = resolveBaseUrl();
+        if (base.isEmpty()) {
+            setStatus(tr("Server unavailable."));
+            return;
+        }
+        QDesktopServices::openUrl(QUrl(base + QStringLiteral("/auth/google")));
+    });
+
+    connect(signUseTokenBtn, &QPushButton::clicked, this, [=]() {
+        const QString tok = signTokenEdit->text().trimmed();
+        if (tok.isEmpty()) {
+            setStatus(tr("Token is empty."));
+            return;
+        }
+        applyToken(tok, QString(), signUserEdit->text().trimmed());
+        setStatus(tr("Signed in."));
+    });
+
+    connect(sendRegCodeBtn, &QPushButton::clicked, this, [=]() {
+        const QString base = resolveBaseUrl();
+        if (base.isEmpty()) {
+            setStatus(tr("Server unavailable."));
+            return;
+        }
+        QJsonObject obj;
+        obj.insert(QStringLiteral("email_or_login"), regUserEdit->text().trimmed());
+        obj.insert(QStringLiteral("channel"), regChannelBox->currentText().trimmed());
+        QNetworkReply *reply = postJson(QStringLiteral("/auth/send_code"), obj);
+        if (!reply) {
+            setStatus(tr("Send code failed."));
+            return;
+        }
+        connect(reply, &QNetworkReply::finished, this, [reply, setStatus]() {
+            reply->deleteLater();
+            if (reply->error() != QNetworkReply::NoError) {
+                setStatus(tr("Send code failed."));
+                return;
+            }
+            setStatus(tr("Code sent."));
+        });
+    });
+
+    connect(verifyRegBtn, &QPushButton::clicked, this, [=]() {
+        const QString base = resolveBaseUrl();
+        if (base.isEmpty()) {
+            setStatus(tr("Server unavailable."));
+            return;
+        }
+        if (regPassEdit->text() != regPassConfirm->text()) {
+            setStatus(tr("Passwords do not match."));
+            return;
+        }
+        QJsonObject reg;
+        reg.insert(QStringLiteral("email_or_login"), regUserEdit->text().trimmed());
+        reg.insert(QStringLiteral("password"), regPassEdit->text());
+        QNetworkReply *registerReply = postJson(QStringLiteral("/auth/register"), reg);
+        if (!registerReply) {
+            setStatus(tr("Register failed."));
+            return;
+        }
+        connect(registerReply, &QNetworkReply::finished, this, [=]() {
+            registerReply->deleteLater();
+            if (registerReply->error() != QNetworkReply::NoError) {
+                setStatus(tr("Register failed."));
+                return;
+            }
+            QJsonObject obj;
+            obj.insert(QStringLiteral("email_or_login"), regUserEdit->text().trimmed());
+            obj.insert(QStringLiteral("code"), regCodeEdit->text().trimmed());
+            obj.insert(QStringLiteral("flow"), QStringLiteral("register"));
+            QNetworkReply *reply = postJson(QStringLiteral("/auth/verify_code"), obj);
+            if (!reply) {
+                setStatus(tr("Verify failed."));
+                return;
+            }
+            connect(reply, &QNetworkReply::finished, this, [reply, applyToken, setStatus]() {
+                reply->deleteLater();
+                if (reply->error() != QNetworkReply::NoError) {
+                    setStatus(tr("Verify failed."));
+                    return;
+                }
+                const QByteArray raw = reply->readAll();
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                if (!doc.isObject()) {
+                    applyToken(QString::fromUtf8(raw).trimmed(), QString(), QString());
+                    setStatus(tr("Registered."));
+                    return;
+                }
+                const QJsonObject obj = doc.object();
+                const QString token = obj.value(QStringLiteral("token")).toString();
+                const QString role = obj.value(QStringLiteral("role")).toString();
+                const QString user = obj.value(QStringLiteral("user")).toString();
+                if (token.isEmpty()) {
+                    setStatus(tr("Verify failed."));
+                    return;
+                }
+                applyToken(token, role, user);
+                setStatus(tr("Registered."));
+            });
+        });
+    });
+
     connect(dlg, &QDialog::finished, this, [this]() {
         m_authDialog = nullptr;
     });
@@ -8975,6 +9325,21 @@ void MainWindow::loadUserSettings()
     // Не тянем старый список apiOff из настроек, чтобы не красить все тикеры при ошибочных данных.
     s.endGroup();
 
+    s.beginGroup(QStringLiteral("auth"));
+    m_authBaseUrl = s.value(QStringLiteral("baseUrl"), QString()).toString();
+    m_authToken = s.value(QStringLiteral("token"), QString()).toString();
+    m_authRole = s.value(QStringLiteral("role"), QString()).toString();
+    m_authUser = s.value(QStringLiteral("user"), QString()).toString();
+    s.endGroup();
+    if (m_authBaseUrl.trimmed().isEmpty()) {
+        const QString envBase = qEnvironmentVariable("FUSION_SERVER_URL");
+        if (!envBase.trimmed().isEmpty()) {
+            m_authBaseUrl = envBase.trimmed();
+        } else {
+            m_authBaseUrl = QStringLiteral("https://api.fusionterminal.xyz");
+        }
+    }
+
     m_savedLayout.clear();
     m_savedWorkspaceColumnSizes.clear();
     s.beginGroup(QStringLiteral("workspace"));
@@ -9071,6 +9436,13 @@ void MainWindow::saveUserSettings() const
         s.setValue(keyName, m_notionalPresetKeys[i]);
         s.setValue(modName, int(m_notionalPresetMods[i]));
     }
+    s.endGroup();
+
+    s.beginGroup(QStringLiteral("auth"));
+    s.setValue(QStringLiteral("baseUrl"), m_authBaseUrl);
+    s.setValue(QStringLiteral("token"), m_authToken);
+    s.setValue(QStringLiteral("role"), m_authRole);
+    s.setValue(QStringLiteral("user"), m_authUser);
     s.endGroup();
 
     s.beginGroup(QStringLiteral("clock"));

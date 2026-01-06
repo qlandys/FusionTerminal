@@ -74,6 +74,8 @@ public:
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
     void changeEvent(QEvent *event) override;
+    void moveEvent(QMoveEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
     void updateMaximizeIcon();
     void showEvent(QShowEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
@@ -502,7 +504,6 @@ private:
     QCompleter *m_settingsCompleter = nullptr;
     QToolButton *m_connectionButton;
     QLabel *m_timeLabel;
-    QLabel *m_buildLabel = nullptr;
     QHash<QString, QColor> m_accountColors;
     QHash<QString, SymbolSource> m_accountSources;
     QVector<QPointer<SymbolPickerDialog>> m_symbolPickers;
@@ -610,6 +611,13 @@ private:
     QRect m_lastNormalGeometry;
     bool m_haveLastNormalGeometry = false;
     Qt::WindowStates m_prevWindowState = Qt::WindowNoState;
+    QString m_lastNormalScreenName;
+    bool m_restoreRefreshQueued = false;
+
+    QString m_authBaseUrl;
+    QString m_authToken;
+    QString m_authRole;
+    QString m_authUser;
 
     // Hotkey: ????????????? ???????? ?? ??????.
     int m_centerKey = Qt::Key_Shift;

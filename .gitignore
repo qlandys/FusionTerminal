@@ -9,6 +9,11 @@ build/
 **/*.log
 **/*.cache
 
+# Server
+server/api/fusion.db
+*.env
+*.secret
+
 # IDE
 .vscode/
 .continue/

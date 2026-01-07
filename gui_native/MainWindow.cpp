@@ -2867,9 +2867,42 @@ QWidget *MainWindow::buildMainArea(QWidget *parent)
     setUpdateState(UpdateState::NotChecked);
 
     // Auth / account (above settings)
-    auto *authNav = makeSideButton(QStringLiteral("user-circle"), tr("Sign in"));
-    sideLayout->addWidget(authNav, 0, Qt::AlignHCenter | Qt::AlignBottom);
-    connect(authNav, &QToolButton::clicked, this, &MainWindow::openAuthWindow);
+    m_authNav = makeSideButton(QStringLiteral("user-circle"), tr("Sign in"));
+    sideLayout->addWidget(m_authNav, 0, Qt::AlignHCenter | Qt::AlignBottom);
+    m_authBadge = new QLabel(m_authNav);
+    m_authBadge->setObjectName(QStringLiteral("AuthBadge"));
+    m_authBadge->setFixedSize(8, 8);
+    m_authBadge->setStyleSheet(
+        "QLabel#AuthBadge {"
+        "  background-color: #35c46a;"
+        "  border-radius: 4px;"
+        "  border: 1px solid #0f1f30;"
+        "}"
+    );
+    m_authBadge->setAttribute(Qt::WA_TransparentForMouseEvents);
+    m_authBadge->hide();
+    m_authMenu = new QMenu(m_authNav);
+    QAction *signOut = m_authMenu->addAction(tr("Sign out"));
+    connect(signOut, &QAction::triggered, this, [this]() {
+        m_authToken.clear();
+        m_authRole.clear();
+        m_authUser.clear();
+        saveUserSettings();
+        updateAuthNavUi();
+        if (statusBar()) {
+            statusBar()->showMessage(tr("Signed out."), 2500);
+        }
+    });
+    connect(m_authNav, &QToolButton::clicked, this, [this]() {
+        if (m_authToken.isEmpty()) {
+            openAuthWindow();
+            return;
+        }
+        if (m_authMenu) {
+            m_authMenu->exec(m_authNav->mapToGlobal(QPoint(0, m_authNav->height())));
+        }
+    });
+    updateAuthNavUi();
 
     // ????????? ? ????? ???? (????????? ?????)
     auto *settingsNav = makeSideButton(QStringLiteral("settings"), tr("Settings"));
@@ -7177,6 +7210,27 @@ void MainWindow::openSettingsWindow()
     m_settingsWindow->activateWindow();
 }
 
+void MainWindow::updateAuthNavUi()
+{
+    if (!m_authNav) {
+        return;
+    }
+    if (m_authToken.isEmpty()) {
+        m_authNav->setToolTip(tr("Sign in"));
+        if (m_authBadge) {
+            m_authBadge->hide();
+        }
+    } else {
+        const QString label = m_authUser.isEmpty() ? tr("Account") : tr("Account: %1").arg(m_authUser);
+        m_authNav->setToolTip(label);
+        if (m_authBadge) {
+            const int x = std::max(0, m_authNav->width() - m_authBadge->width() - 2);
+            m_authBadge->move(x, 2);
+            m_authBadge->show();
+        }
+    }
+}
+
 void MainWindow::openAuthWindow()
 {
     if (m_authDialog) {
@@ -7197,6 +7251,9 @@ void MainWindow::openAuthWindow()
         "QDialog { background-color: #1f1f1f; color: #e0e0e0; }"
         "QLabel#AuthTitle { font-size: 22px; font-weight: 700; color: #ffffff; }"
         "QLabel#AuthHint { color: #9aa0a6; }"
+        "QLabel#AuthStatus[status=\"error\"] { color: #f28b82; }"
+        "QLabel#AuthStatus[status=\"ok\"] { color: #9ad29a; }"
+        "QLabel#AuthStatus[status=\"info\"] { color: #9aa0a6; }"
         "QLabel#AuthSection { color: #cfd3d7; font-weight: 600; }"
         "QLineEdit {"
         "  background-color: #262626;"
@@ -7211,7 +7268,7 @@ void MainWindow::openAuthWindow()
         "  color: #ffffff;"
         "  border: none;"
         "  border-radius: 6px;"
-        "  padding: 8px 12px;"
+        "  padding: 6px 10px;"
         "  font-weight: 600;"
         "}"
         "QPushButton#AuthPrimary:hover { background-color: #3a88e5; }"
@@ -7220,7 +7277,7 @@ void MainWindow::openAuthWindow()
         "  color: #e0e0e0;"
         "  border: 1px solid #3a3a3a;"
         "  border-radius: 4px;"
-        "  padding: 6px 10px;"
+        "  padding: 5px 10px;"
         "}"
         "QPushButton#AuthSecondary:hover { background-color: #333333; }"
         "QPushButton#AuthGoogle {"
@@ -7228,7 +7285,7 @@ void MainWindow::openAuthWindow()
         "  color: #e0e0e0;"
         "  border: 1px solid #2f2f2f;"
         "  border-radius: 6px;"
-        "  padding: 8px 12px;"
+        "  padding: 6px 10px;"
         "}"
         "QPushButton#AuthGoogle:hover { background-color: #2a2a2a; }"
         "QToolButton#AuthLink {"
@@ -7261,6 +7318,13 @@ void MainWindow::openAuthWindow()
     hint->setWordWrap(true);
     layout->addWidget(hint);
 
+    auto *statusLabel = new QLabel(dlg);
+    statusLabel->setObjectName(QStringLiteral("AuthStatus"));
+    statusLabel->setWordWrap(true);
+    statusLabel->setText(QString());
+    statusLabel->setProperty("status", QStringLiteral("info"));
+    layout->addWidget(statusLabel);
+
     auto *pages = new QStackedWidget(dlg);
     auto *signInPage = new QWidget(pages);
     auto *registerPage = new QWidget(pages);
@@ -7272,11 +7336,29 @@ void MainWindow::openAuthWindow()
     signLayout->setContentsMargins(0, 0, 0, 0);
     signLayout->setSpacing(10);
 
-    auto *signEmailLabel = new QLabel(tr("Email"), signInPage);
+    const QString eyePath = resolveAssetPath(QStringLiteral("icons/outline/eye.svg"));
+    const QString eyeOffPath = resolveAssetPath(QStringLiteral("icons/outline/eye-off.svg"));
+    const QIcon eyeIcon = eyePath.isEmpty() ? QIcon() : QIcon(eyePath);
+    const QIcon eyeOffIcon = eyeOffPath.isEmpty() ? QIcon() : QIcon(eyeOffPath);
+    auto addEyeToggle = [this, eyeIcon, eyeOffIcon](QLineEdit *edit) {
+        if (!edit || eyeIcon.isNull() || eyeOffIcon.isNull()) {
+            return;
+        }
+        QAction *action = edit->addAction(eyeIcon, QLineEdit::TrailingPosition);
+        action->setCheckable(true);
+        action->setToolTip(tr("Show password"));
+        connect(action, &QAction::toggled, edit, [edit, action, eyeIcon, eyeOffIcon, this](bool on) {
+            edit->setEchoMode(on ? QLineEdit::Normal : QLineEdit::Password);
+            action->setIcon(on ? eyeOffIcon : eyeIcon);
+            action->setToolTip(on ? tr("Hide password") : tr("Show password"));
+        });
+    };
+
+    auto *signEmailLabel = new QLabel(tr("Email or username"), signInPage);
     signEmailLabel->setObjectName(QStringLiteral("AuthSection"));
     signLayout->addWidget(signEmailLabel);
     auto *signUserEdit = new QLineEdit(signInPage);
-    signUserEdit->setPlaceholderText(tr("user@example.com"));
+    signUserEdit->setPlaceholderText(tr("user@example.com or login"));
     signLayout->addWidget(signUserEdit);
 
     auto *signPassLabel = new QLabel(tr("Password"), signInPage);
@@ -7285,6 +7367,7 @@ void MainWindow::openAuthWindow()
     auto *signPassEdit = new QLineEdit(signInPage);
     signPassEdit->setPlaceholderText(tr("Password"));
     signPassEdit->setEchoMode(QLineEdit::Password);
+    addEyeToggle(signPassEdit);
     signLayout->addWidget(signPassEdit);
 
     auto *signInPasswordBtn = new QPushButton(tr("Sign in"), signInPage);
@@ -7336,7 +7419,6 @@ void MainWindow::openAuthWindow()
     auto *signChannelRow = new QHBoxLayout();
     auto *signChannelBox = new QComboBox(signInPage);
     signChannelBox->addItem(QStringLiteral("email"));
-    signChannelBox->addItem(QStringLiteral("telegram"));
     signChannelRow->addWidget(signChannelBox, 0);
     auto *signCodeEdit = new QLineEdit(signInPage);
     signCodeEdit->setPlaceholderText(tr("Code"));
@@ -7374,51 +7456,87 @@ void MainWindow::openAuthWindow()
     regLayout->setContentsMargins(0, 0, 0, 0);
     regLayout->setSpacing(10);
 
-    auto *regTitle = new QLabel(tr("Register"), registerPage);
+    auto *regPages = new QStackedWidget(registerPage);
+    auto *regForm = new QWidget(regPages);
+    auto *regVerify = new QWidget(regPages);
+    regPages->addWidget(regForm);
+    regPages->addWidget(regVerify);
+    regLayout->addWidget(regPages);
+
+    auto *regFormLayout = new QVBoxLayout(regForm);
+    regFormLayout->setContentsMargins(0, 0, 0, 0);
+    regFormLayout->setSpacing(10);
+
+    auto *regTitle = new QLabel(tr("Create account"), regForm);
     regTitle->setObjectName(QStringLiteral("AuthTitle"));
-    regLayout->addWidget(regTitle);
-    auto *regHint = new QLabel(tr("Create your account to unlock mods"), registerPage);
+    regFormLayout->addWidget(regTitle);
+    auto *regHint = new QLabel(tr("Unlock extensions & sync"), regForm);
     regHint->setObjectName(QStringLiteral("AuthHint"));
-    regLayout->addWidget(regHint);
+    regFormLayout->addWidget(regHint);
 
-    auto *regEmailLabel = new QLabel(tr("Email"), registerPage);
+    auto *regEmailLabel = new QLabel(tr("Email"), regForm);
     regEmailLabel->setObjectName(QStringLiteral("AuthSection"));
-    regLayout->addWidget(regEmailLabel);
-    auto *regUserEdit = new QLineEdit(registerPage);
+    regFormLayout->addWidget(regEmailLabel);
+    auto *regUserEdit = new QLineEdit(regForm);
     regUserEdit->setPlaceholderText(tr("user@example.com"));
-    regLayout->addWidget(regUserEdit);
+    regFormLayout->addWidget(regUserEdit);
 
-    auto *regPassLabel = new QLabel(tr("Password"), registerPage);
+    auto *regLoginLabel = new QLabel(tr("Username"), regForm);
+    regLoginLabel->setObjectName(QStringLiteral("AuthSection"));
+    regFormLayout->addWidget(regLoginLabel);
+    auto *regLoginEdit = new QLineEdit(regForm);
+    regLoginEdit->setPlaceholderText(tr("your_login"));
+    regFormLayout->addWidget(regLoginEdit);
+
+    auto *regPassLabel = new QLabel(tr("Password"), regForm);
     regPassLabel->setObjectName(QStringLiteral("AuthSection"));
-    regLayout->addWidget(regPassLabel);
-    auto *regPassEdit = new QLineEdit(registerPage);
+    regFormLayout->addWidget(regPassLabel);
+    auto *regPassEdit = new QLineEdit(regForm);
     regPassEdit->setPlaceholderText(tr("Password"));
     regPassEdit->setEchoMode(QLineEdit::Password);
-    regLayout->addWidget(regPassEdit);
+    addEyeToggle(regPassEdit);
+    regFormLayout->addWidget(regPassEdit);
 
-    auto *regPassConfirm = new QLineEdit(registerPage);
+    auto *regPassConfirmLabel = new QLabel(tr("Confirm password"), regForm);
+    regPassConfirmLabel->setObjectName(QStringLiteral("AuthSection"));
+    regFormLayout->addWidget(regPassConfirmLabel);
+    auto *regPassConfirm = new QLineEdit(regForm);
     regPassConfirm->setPlaceholderText(tr("Confirm password"));
     regPassConfirm->setEchoMode(QLineEdit::Password);
-    regLayout->addWidget(regPassConfirm);
+    addEyeToggle(regPassConfirm);
+    regFormLayout->addWidget(regPassConfirm);
 
-    auto *regChannelRow = new QHBoxLayout();
-    auto *regChannelBox = new QComboBox(registerPage);
-    regChannelBox->addItem(QStringLiteral("email"));
-    regChannelBox->addItem(QStringLiteral("telegram"));
-    regChannelRow->addWidget(regChannelBox, 0);
-    auto *regCodeEdit = new QLineEdit(registerPage);
+    auto *regStartBtn = new QPushButton(tr("Create account"), regForm);
+    regStartBtn->setObjectName(QStringLiteral("AuthPrimary"));
+    regFormLayout->addWidget(regStartBtn);
+    auto *regGoVerifyBtn = new QToolButton(regForm);
+    regGoVerifyBtn->setObjectName(QStringLiteral("AuthLink"));
+    regGoVerifyBtn->setText(tr("Enter code"));
+    regGoVerifyBtn->setAutoRaise(true);
+    regGoVerifyBtn->setVisible(false);
+    regFormLayout->addWidget(regGoVerifyBtn, 0, Qt::AlignLeft);
+
+    auto *regVerifyLayout = new QVBoxLayout(regVerify);
+    regVerifyLayout->setContentsMargins(0, 0, 0, 0);
+    regVerifyLayout->setSpacing(10);
+    auto *verifyTitle = new QLabel(tr("Confirm email"), regVerify);
+    verifyTitle->setObjectName(QStringLiteral("AuthTitle"));
+    regVerifyLayout->addWidget(verifyTitle);
+    auto *verifyHint = new QLabel(tr("Enter the code sent to your email."), regVerify);
+    verifyHint->setObjectName(QStringLiteral("AuthHint"));
+    verifyHint->setWordWrap(true);
+    regVerifyLayout->addWidget(verifyHint);
+    auto *regCodeEdit = new QLineEdit(regVerify);
     regCodeEdit->setPlaceholderText(tr("Code"));
-    regChannelRow->addWidget(regCodeEdit, 1);
-    regLayout->addLayout(regChannelRow);
-
-    auto *regCodeRow = new QHBoxLayout();
-    auto *sendRegCodeBtn = new QPushButton(tr("Send code"), registerPage);
-    auto *verifyRegBtn = new QPushButton(tr("Create account"), registerPage);
-    sendRegCodeBtn->setObjectName(QStringLiteral("AuthSecondary"));
+    regVerifyLayout->addWidget(regCodeEdit);
+    auto *verifyRow = new QHBoxLayout();
+    auto *resendRegCodeBtn = new QPushButton(tr("Resend code"), regVerify);
+    resendRegCodeBtn->setObjectName(QStringLiteral("AuthSecondary"));
+    auto *verifyRegBtn = new QPushButton(tr("Verify email"), regVerify);
     verifyRegBtn->setObjectName(QStringLiteral("AuthPrimary"));
-    regCodeRow->addWidget(sendRegCodeBtn);
-    regCodeRow->addWidget(verifyRegBtn);
-    regLayout->addLayout(regCodeRow);
+    verifyRow->addWidget(resendRegCodeBtn);
+    verifyRow->addWidget(verifyRegBtn);
+    regVerifyLayout->addLayout(verifyRow);
 
     auto *backRow = new QHBoxLayout();
     auto *backText = new QLabel(tr("Already have an account?"), registerPage);
@@ -7439,8 +7557,44 @@ void MainWindow::openAuthWindow()
     layout->addLayout(buttons);
 
     auto *net = new QNetworkAccessManager(dlg);
-    auto setStatus = [this](const QString &msg) {
-        statusBar()->showMessage(msg, 3500);
+    auto normalizeError = [](const QString &msg) -> QString {
+        const QString lower = msg.trimmed().toLower();
+        if (lower == QStringLiteral("email_taken")) return QStringLiteral("Эта почта уже занята.");
+        if (lower == QStringLiteral("login_taken")) return QStringLiteral("Это имя уже занято.");
+        if (lower == QStringLiteral("user_exists")) return QStringLiteral("Пользователь уже существует.");
+        if (lower == QStringLiteral("user exists")) return QStringLiteral("Пользователь уже существует.");
+        if (lower == QStringLiteral("registration_not_found")) return QStringLiteral("Регистрация не найдена. Запросите код заново.");
+        if (lower == QStringLiteral("invalid credentials")) return QStringLiteral("Неверная почта или пароль.");
+        if (lower == QStringLiteral("email not verified")) return QStringLiteral("Почта не подтверждена.");
+        if (lower == QStringLiteral("user not found")) return QStringLiteral("Пользователь не найден.");
+        if (lower == QStringLiteral("send failed")) return QStringLiteral("Не удалось отправить код.");
+        if (lower == QStringLiteral("verify failed")) return QStringLiteral("Проверка кода не удалась.");
+        if (lower == QStringLiteral("register failed")) return QStringLiteral("Не удалось создать аккаунт.");
+        if (lower == QStringLiteral("login failed.")) return QStringLiteral("Не удалось войти.");
+        if (lower == QStringLiteral("invalid code")) return QStringLiteral("Неверный код.");
+        if (lower == QStringLiteral("code expired")) return QStringLiteral("Срок действия кода истек.");
+        if (lower == QStringLiteral("code used")) return QStringLiteral("Код уже использован.");
+        if (lower == QStringLiteral("missing credentials")) return QStringLiteral("Введите логин и пароль.");
+        if (lower == QStringLiteral("missing email or code")) return QStringLiteral("Введите почту и код.");
+        if (lower == QStringLiteral("invalid email")) return QStringLiteral("Неверный формат почты.");
+        if (lower == QStringLiteral("password too short")) return QStringLiteral("Пароль слишком короткий.");
+        if (lower == QStringLiteral("login required")) return QStringLiteral("Введите имя пользователя.");
+        if (lower == QStringLiteral("email required")) return QStringLiteral("Введите почту.");
+        if (lower == QStringLiteral("unsupported channel")) return QStringLiteral("Неподдерживаемый канал.");
+        if (lower == QStringLiteral("invalid json")) return QStringLiteral("Некорректные данные запроса.");
+        return msg.trimmed();
+    };
+    auto setStatus = [this, statusLabel, normalizeError](const QString &msg, const QString &kind) {
+        const QString text = normalizeError(msg);
+        if (statusBar()) {
+            statusBar()->showMessage(text, 3500);
+        }
+        if (statusLabel) {
+            statusLabel->setProperty("status", kind);
+            statusLabel->style()->unpolish(statusLabel);
+            statusLabel->style()->polish(statusLabel);
+            statusLabel->setText(text);
+        }
     };
     auto resolveBaseUrl = [this]() -> QString {
         QString base = m_authBaseUrl.trimmed();
@@ -7467,44 +7621,65 @@ void MainWindow::openAuthWindow()
         m_authRole = role;
         m_authUser = user;
         saveUserSettings();
+        updateAuthNavUi();
     };
 
     connect(close, &QPushButton::clicked, dlg, &QDialog::close);
     connect(advancedToggle, &QToolButton::toggled, this, [advancedContainer](bool on) {
         advancedContainer->setVisible(on);
     });
-    connect(registerLink, &QToolButton::clicked, this, [pages]() {
+    connect(registerLink, &QToolButton::clicked, this, [pages, regPages]() {
+        regPages->setCurrentIndex(0);
         pages->setCurrentIndex(1);
     });
-    connect(backLink, &QToolButton::clicked, this, [pages]() {
+    connect(backLink, &QToolButton::clicked, this, [pages, regPages]() {
+        regPages->setCurrentIndex(0);
         pages->setCurrentIndex(0);
+    });
+    connect(regGoVerifyBtn, &QToolButton::clicked, this, [regPages]() {
+        regPages->setCurrentIndex(1);
     });
 
     connect(signInPasswordBtn, &QPushButton::clicked, this, [=]() {
         const QString base = resolveBaseUrl();
         if (base.isEmpty()) {
-            setStatus(tr("Server unavailable."));
+            setStatus(tr("Сервер недоступен."), QStringLiteral("error"));
             return;
         }
+        const QString loginVal = signUserEdit->text().trimmed();
+        const QString passVal = signPassEdit->text();
+        if (loginVal.isEmpty()) {
+            setStatus(tr("Введите почту или логин."), QStringLiteral("error"));
+            return;
+        }
+        if (passVal.isEmpty()) {
+            setStatus(tr("Введите пароль."), QStringLiteral("error"));
+            return;
+        }
+        setStatus(tr("Входим..."), QStringLiteral("info"));
         QJsonObject obj;
-        obj.insert(QStringLiteral("email_or_login"), signUserEdit->text().trimmed());
-        obj.insert(QStringLiteral("password"), signPassEdit->text());
+        obj.insert(QStringLiteral("email_or_login"), loginVal);
+        obj.insert(QStringLiteral("password"), passVal);
         QNetworkReply *reply = postJson(QStringLiteral("/auth/login"), obj);
         if (!reply) {
-            setStatus(tr("Auth request failed."));
+            setStatus(tr("Ошибка запроса авторизации."), QStringLiteral("error"));
             return;
         }
         connect(reply, &QNetworkReply::finished, this, [reply, applyToken, setStatus]() {
+            const QByteArray raw = reply->readAll();
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
-                setStatus(tr("Login failed."));
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                const QString errMsg = doc.isObject()
+                    ? doc.object().value(QStringLiteral("error")).toString()
+                    : QString::fromUtf8(raw).trimmed();
+                setStatus(errMsg.isEmpty() ? tr("Не удалось войти.") : errMsg, QStringLiteral("error"));
                 return;
             }
-            const QByteArray raw = reply->readAll();
             const QJsonDocument doc = QJsonDocument::fromJson(raw);
             if (!doc.isObject()) {
                 applyToken(QString::fromUtf8(raw).trimmed(), QString(), QString());
-                setStatus(tr("Signed in."));
+                setStatus(tr("Вход выполнен."), QStringLiteral("ok"));
                 return;
             }
             const QJsonObject obj = doc.object();
@@ -7512,64 +7687,90 @@ void MainWindow::openAuthWindow()
             const QString role = obj.value(QStringLiteral("role")).toString();
             const QString user = obj.value(QStringLiteral("user")).toString();
             if (token.isEmpty()) {
-                setStatus(tr("Login failed."));
+                setStatus(tr("Не удалось войти."), QStringLiteral("error"));
                 return;
             }
             applyToken(token, role, user);
-            setStatus(tr("Signed in."));
+            setStatus(tr("Вход выполнен."), QStringLiteral("ok"));
         });
     });
 
     connect(sendSignCodeBtn, &QPushButton::clicked, this, [=]() {
         const QString base = resolveBaseUrl();
         if (base.isEmpty()) {
-            setStatus(tr("Server unavailable."));
+            setStatus(tr("Сервер недоступен."), QStringLiteral("error"));
             return;
         }
+        const QString loginVal = signUserEdit->text().trimmed();
+        if (loginVal.isEmpty()) {
+            setStatus(tr("Введите почту или логин."), QStringLiteral("error"));
+            return;
+        }
+        setStatus(tr("Отправляем код..."), QStringLiteral("info"));
         QJsonObject obj;
-        obj.insert(QStringLiteral("email_or_login"), signUserEdit->text().trimmed());
+        obj.insert(QStringLiteral("email_or_login"), loginVal);
         obj.insert(QStringLiteral("channel"), signChannelBox->currentText().trimmed());
         QNetworkReply *reply = postJson(QStringLiteral("/auth/send_code"), obj);
         if (!reply) {
-            setStatus(tr("Send code failed."));
+            setStatus(tr("Не удалось отправить код."), QStringLiteral("error"));
             return;
         }
         connect(reply, &QNetworkReply::finished, this, [reply, setStatus]() {
+            const QByteArray raw = reply->readAll();
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
-                setStatus(tr("Send code failed."));
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                const QString errMsg = doc.isObject()
+                    ? doc.object().value(QStringLiteral("error")).toString()
+                    : QString::fromUtf8(raw).trimmed();
+                setStatus(errMsg.isEmpty() ? tr("Не удалось отправить код.") : errMsg, QStringLiteral("error"));
                 return;
             }
-            setStatus(tr("Code sent."));
+            setStatus(tr("Код отправлен."), QStringLiteral("ok"));
         });
     });
 
     connect(verifySignCodeBtn, &QPushButton::clicked, this, [=]() {
         const QString base = resolveBaseUrl();
         if (base.isEmpty()) {
-            setStatus(tr("Server unavailable."));
+            setStatus(tr("Сервер недоступен."), QStringLiteral("error"));
             return;
         }
+        const QString loginVal = signUserEdit->text().trimmed();
+        const QString codeVal = signCodeEdit->text().trimmed();
+        if (loginVal.isEmpty()) {
+            setStatus(tr("Введите почту или логин."), QStringLiteral("error"));
+            return;
+        }
+        if (codeVal.isEmpty()) {
+            setStatus(tr("Введите код."), QStringLiteral("error"));
+            return;
+        }
+        setStatus(tr("Проверяем код..."), QStringLiteral("info"));
         QJsonObject obj;
-        obj.insert(QStringLiteral("email_or_login"), signUserEdit->text().trimmed());
-        obj.insert(QStringLiteral("code"), signCodeEdit->text().trimmed());
+        obj.insert(QStringLiteral("email_or_login"), loginVal);
+        obj.insert(QStringLiteral("code"), codeVal);
         obj.insert(QStringLiteral("flow"), QStringLiteral("login"));
         QNetworkReply *reply = postJson(QStringLiteral("/auth/verify_code"), obj);
         if (!reply) {
-            setStatus(tr("Verify failed."));
+            setStatus(tr("Не удалось проверить код."), QStringLiteral("error"));
             return;
         }
         connect(reply, &QNetworkReply::finished, this, [reply, applyToken, setStatus]() {
+            const QByteArray raw = reply->readAll();
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
-                setStatus(tr("Verify failed."));
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                const QString errMsg = doc.isObject()
+                    ? doc.object().value(QStringLiteral("error")).toString()
+                    : QString::fromUtf8(raw).trimmed();
+                setStatus(errMsg.isEmpty() ? tr("Не удалось проверить код.") : errMsg, QStringLiteral("error"));
                 return;
             }
-            const QByteArray raw = reply->readAll();
             const QJsonDocument doc = QJsonDocument::fromJson(raw);
             if (!doc.isObject()) {
                 applyToken(QString::fromUtf8(raw).trimmed(), QString(), QString());
-                setStatus(tr("Signed in."));
+                setStatus(tr("Вход выполнен."), QStringLiteral("ok"));
                 return;
             }
             const QJsonObject obj = doc.object();
@@ -7577,18 +7778,18 @@ void MainWindow::openAuthWindow()
             const QString role = obj.value(QStringLiteral("role")).toString();
             const QString user = obj.value(QStringLiteral("user")).toString();
             if (token.isEmpty()) {
-                setStatus(tr("Verify failed."));
+                setStatus(tr("Не удалось проверить код."), QStringLiteral("error"));
                 return;
             }
             applyToken(token, role, user);
-            setStatus(tr("Signed in."));
+            setStatus(tr("Вход выполнен."), QStringLiteral("ok"));
         });
     });
 
     connect(signGoogleBtn, &QPushButton::clicked, this, [=]() {
         const QString base = resolveBaseUrl();
         if (base.isEmpty()) {
-            setStatus(tr("Server unavailable."));
+            setStatus(tr("Сервер недоступен."), QStringLiteral("error"));
             return;
         }
         QDesktopServices::openUrl(QUrl(base + QStringLiteral("/auth/google")));
@@ -7597,94 +7798,159 @@ void MainWindow::openAuthWindow()
     connect(signUseTokenBtn, &QPushButton::clicked, this, [=]() {
         const QString tok = signTokenEdit->text().trimmed();
         if (tok.isEmpty()) {
-            setStatus(tr("Token is empty."));
+            setStatus(tr("Введите токен."), QStringLiteral("error"));
             return;
         }
         applyToken(tok, QString(), signUserEdit->text().trimmed());
-        setStatus(tr("Signed in."));
+        setStatus(tr("Вход выполнен."), QStringLiteral("ok"));
     });
 
-    connect(sendRegCodeBtn, &QPushButton::clicked, this, [=]() {
+    connect(resendRegCodeBtn, &QPushButton::clicked, this, [=]() {
         const QString base = resolveBaseUrl();
         if (base.isEmpty()) {
-            setStatus(tr("Server unavailable."));
+            setStatus(tr("Сервер недоступен."), QStringLiteral("error"));
             return;
         }
+        const QString regEmail = regUserEdit->text().trimmed();
+        if (regEmail.isEmpty()) {
+            setStatus(tr("Введите почту."), QStringLiteral("error"));
+            return;
+        }
+        setStatus(tr("Отправляем код..."), QStringLiteral("info"));
         QJsonObject obj;
-        obj.insert(QStringLiteral("email_or_login"), regUserEdit->text().trimmed());
-        obj.insert(QStringLiteral("channel"), regChannelBox->currentText().trimmed());
+        obj.insert(QStringLiteral("email_or_login"), regEmail);
+        obj.insert(QStringLiteral("channel"), QStringLiteral("email"));
         QNetworkReply *reply = postJson(QStringLiteral("/auth/send_code"), obj);
         if (!reply) {
-            setStatus(tr("Send code failed."));
+            setStatus(tr("Не удалось отправить код."), QStringLiteral("error"));
             return;
         }
         connect(reply, &QNetworkReply::finished, this, [reply, setStatus]() {
+            const QByteArray raw = reply->readAll();
             reply->deleteLater();
             if (reply->error() != QNetworkReply::NoError) {
-                setStatus(tr("Send code failed."));
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                const QString errMsg = doc.isObject()
+                    ? doc.object().value(QStringLiteral("error")).toString()
+                    : QString::fromUtf8(raw).trimmed();
+                setStatus(errMsg.isEmpty() ? tr("Не удалось отправить код.") : errMsg, QStringLiteral("error"));
                 return;
             }
-            setStatus(tr("Code sent."));
+            setStatus(tr("Код отправлен."), QStringLiteral("ok"));
+        });
+    });
+
+    connect(regStartBtn, &QPushButton::clicked, this, [=]() {
+        const QString base = resolveBaseUrl();
+        if (base.isEmpty()) {
+            setStatus(tr("Сервер недоступен."), QStringLiteral("error"));
+            return;
+        }
+        const QString regEmail = regUserEdit->text().trimmed();
+        const QString regLogin = regLoginEdit->text().trimmed();
+        const QString regPass = regPassEdit->text();
+        const QString regPass2 = regPassConfirm->text();
+        if (regEmail.isEmpty()) {
+            setStatus(tr("Введите почту."), QStringLiteral("error"));
+            return;
+        }
+        if (regLogin.isEmpty()) {
+            setStatus(tr("Введите имя пользователя."), QStringLiteral("error"));
+            return;
+        }
+        if (regPass.isEmpty()) {
+            setStatus(tr("Введите пароль."), QStringLiteral("error"));
+            return;
+        }
+        if (regPass != regPass2) {
+            setStatus(tr("Пароли не совпадают."), QStringLiteral("error"));
+            return;
+        }
+        setStatus(tr("Создаем аккаунт..."), QStringLiteral("info"));
+        QJsonObject reg;
+        reg.insert(QStringLiteral("email"), regEmail);
+        reg.insert(QStringLiteral("login"), regLogin);
+        reg.insert(QStringLiteral("email_or_login"), regEmail);
+        reg.insert(QStringLiteral("password"), regPass);
+        QNetworkReply *registerReply = postJson(QStringLiteral("/auth/register"), reg);
+        if (!registerReply) {
+            setStatus(tr("Не удалось создать аккаунт."), QStringLiteral("error"));
+            return;
+        }
+        connect(registerReply, &QNetworkReply::finished, this, [=]() {
+            const QByteArray raw = registerReply->readAll();
+            registerReply->deleteLater();
+            if (registerReply->error() != QNetworkReply::NoError) {
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                const QString errMsg = doc.isObject()
+                    ? doc.object().value(QStringLiteral("error")).toString()
+                    : QString::fromUtf8(raw).trimmed();
+                setStatus(errMsg.isEmpty() ? tr("Не удалось создать аккаунт.") : errMsg, QStringLiteral("error"));
+                return;
+            }
+            regGoVerifyBtn->setVisible(true);
+            setStatus(tr("Код отправлен. Перейдите к подтверждению."), QStringLiteral("ok"));
         });
     });
 
     connect(verifyRegBtn, &QPushButton::clicked, this, [=]() {
         const QString base = resolveBaseUrl();
         if (base.isEmpty()) {
-            setStatus(tr("Server unavailable."));
+            setStatus(tr("Сервер недоступен."), QStringLiteral("error"));
             return;
         }
-        if (regPassEdit->text() != regPassConfirm->text()) {
-            setStatus(tr("Passwords do not match."));
+        const QString regEmail = regUserEdit->text().trimmed();
+        const QString regLogin = regLoginEdit->text().trimmed();
+        const QString codeVal = regCodeEdit->text().trimmed();
+        if (regEmail.isEmpty()) {
+            setStatus(tr("Введите почту."), QStringLiteral("error"));
             return;
         }
-        QJsonObject reg;
-        reg.insert(QStringLiteral("email_or_login"), regUserEdit->text().trimmed());
-        reg.insert(QStringLiteral("password"), regPassEdit->text());
-        QNetworkReply *registerReply = postJson(QStringLiteral("/auth/register"), reg);
-        if (!registerReply) {
-            setStatus(tr("Register failed."));
+        if (codeVal.isEmpty()) {
+            setStatus(tr("Введите код."), QStringLiteral("error"));
             return;
         }
-        connect(registerReply, &QNetworkReply::finished, this, [=]() {
-            registerReply->deleteLater();
-            if (registerReply->error() != QNetworkReply::NoError) {
-                setStatus(tr("Register failed."));
-                return;
-            }
-            QJsonObject obj;
-            obj.insert(QStringLiteral("email_or_login"), regUserEdit->text().trimmed());
-            obj.insert(QStringLiteral("code"), regCodeEdit->text().trimmed());
-            obj.insert(QStringLiteral("flow"), QStringLiteral("register"));
-            QNetworkReply *reply = postJson(QStringLiteral("/auth/verify_code"), obj);
-            if (!reply) {
-                setStatus(tr("Verify failed."));
-                return;
-            }
-            connect(reply, &QNetworkReply::finished, this, [reply, applyToken, setStatus]() {
-                reply->deleteLater();
-                if (reply->error() != QNetworkReply::NoError) {
-                    setStatus(tr("Verify failed."));
-                    return;
-                }
-                const QByteArray raw = reply->readAll();
+        setStatus(tr("Проверяем код..."), QStringLiteral("info"));
+        QJsonObject obj;
+        obj.insert(QStringLiteral("email_or_login"), regEmail);
+        obj.insert(QStringLiteral("email"), regEmail);
+        obj.insert(QStringLiteral("login"), regLogin);
+        obj.insert(QStringLiteral("code"), codeVal);
+        obj.insert(QStringLiteral("flow"), QStringLiteral("register"));
+        QNetworkReply *reply = postJson(QStringLiteral("/auth/verify_code"), obj);
+        if (!reply) {
+            setStatus(tr("Не удалось проверить код."), QStringLiteral("error"));
+            return;
+        }
+        connect(reply, &QNetworkReply::finished, this, [reply, applyToken, setStatus, dlg]() {
+            const QByteArray raw = reply->readAll();
+            reply->deleteLater();
+            if (reply->error() != QNetworkReply::NoError) {
                 const QJsonDocument doc = QJsonDocument::fromJson(raw);
-                if (!doc.isObject()) {
-                    applyToken(QString::fromUtf8(raw).trimmed(), QString(), QString());
-                    setStatus(tr("Registered."));
-                    return;
-                }
-                const QJsonObject obj = doc.object();
-                const QString token = obj.value(QStringLiteral("token")).toString();
-                const QString role = obj.value(QStringLiteral("role")).toString();
-                const QString user = obj.value(QStringLiteral("user")).toString();
-                if (token.isEmpty()) {
-                    setStatus(tr("Verify failed."));
-                    return;
-                }
-                applyToken(token, role, user);
-                setStatus(tr("Registered."));
-            });
+                const QString errMsg = doc.isObject()
+                    ? doc.object().value(QStringLiteral("error")).toString()
+                    : QString::fromUtf8(raw).trimmed();
+                setStatus(errMsg.isEmpty() ? tr("Не удалось проверить код.") : errMsg, QStringLiteral("error"));
+                return;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(raw);
+            if (!doc.isObject()) {
+                applyToken(QString::fromUtf8(raw).trimmed(), QString(), QString());
+                setStatus(tr("Аккаунт создан."), QStringLiteral("ok"));
+                dlg->close();
+                return;
+            }
+            const QJsonObject obj = doc.object();
+            const QString token = obj.value(QStringLiteral("token")).toString();
+            const QString role = obj.value(QStringLiteral("role")).toString();
+            const QString user = obj.value(QStringLiteral("user")).toString();
+            if (token.isEmpty()) {
+                setStatus(tr("Не удалось проверить код."), QStringLiteral("error"));
+                return;
+            }
+            applyToken(token, role, user);
+            setStatus(tr("Аккаунт создан."), QStringLiteral("ok"));
+            dlg->close();
         });
     });
 

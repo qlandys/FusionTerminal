@@ -115,6 +115,7 @@ private slots:
     void openPluginsWindow();
     void openSettingsWindow();
     void openAuthWindow();
+    void updateAuthNavUi();
     void handleConnectionStateChanged(ConnectionStore::Profile profile,
                                       TradeManager::ConnectionState state,
                                       const QString &message);
@@ -557,6 +558,9 @@ private:
     TradesWindow *m_tradesWindow = nullptr;
     QStringList m_connectionsLogBacklog;
     QPointer<QDialog> m_authDialog;
+    QToolButton *m_authNav = nullptr;
+    QMenu *m_authMenu = nullptr;
+    QLabel *m_authBadge = nullptr;
 
     QVector<WorkspaceTab> m_tabs;
     int m_nextTabId;

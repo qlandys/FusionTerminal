@@ -53,6 +53,8 @@ if (Qt6_FOUND)
         gui_native/TradesWindow.h
         gui_native/FinrezWindow.cpp
         gui_native/FinrezWindow.h
+        gui_native/ChatWindow.cpp
+        gui_native/ChatWindow.h
         gui_native/PluginsWindow.cpp
         gui_native/PluginsWindow.h
         gui_native/SettingsWindow.cpp

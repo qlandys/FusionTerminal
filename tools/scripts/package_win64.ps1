@@ -7,11 +7,19 @@ Set-Location .. | Out-Null
 $buildDir = "build"
 $releaseDir = "releases/win64"
 
+function Assert-LastExitCode([string]$step) {
+  if ($LASTEXITCODE -ne 0) {
+    throw "Step failed: $step (exit code $LASTEXITCODE)."
+  }
+}
+
 Write-Host "[1/4] Configure (CMake)..." -ForegroundColor Cyan
 cmake -S . -B $buildDir | Out-Host
+Assert-LastExitCode "CMake configure"
 
 Write-Host "[2/4] Build (Release)..." -ForegroundColor Cyan
 cmake --build $buildDir --config Release --target FusionTerminal orderbook_backend FusionUpdater | Out-Host
+Assert-LastExitCode "CMake build"
 
 Write-Host "[3/4] Copy EXEs..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
@@ -46,6 +54,7 @@ if (-not $windeployqt) {
 }
 
 & $windeployqt --release --no-translations --no-system-d3d-compiler --dir $releaseDir "$buildDir/Release/FusionTerminal.exe" | Out-Host
+Assert-LastExitCode "windeployqt"
 
 # MSVC runtime DLLs (so it runs on clean Windows without VC++ redist installed)
 $msvcRuntime = @(

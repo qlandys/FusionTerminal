@@ -14,6 +14,7 @@
 #include <QTimer>
 #include <QNetworkAccessManager>
 #include <QSet>
+#include <QSet>
 #include <QHash>
 #include <QPointer>
 #include <QByteArray>
@@ -52,6 +53,7 @@ class SymbolPickerDialog;
 class QSplitter;
 class QNetworkReply;
 class QFile;
+class ChatWindow;
 
 struct SavedColumn {
     QString symbol;
@@ -62,6 +64,7 @@ struct SavedColumn {
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
+    struct DomColumn;
 
 public:
     explicit MainWindow(const QString &backendPath,
@@ -116,6 +119,14 @@ private slots:
     void openSettingsWindow();
     void openAuthWindow();
     void updateAuthNavUi();
+    void openChatForContainer(QWidget *container);
+    QString chatKeyForColumn(const DomColumn &col) const;
+    QString chatTitleForColumn(const DomColumn &col) const;
+    void requestInstalledMods();
+    void updateInstalledMods(const QStringList &installedMods);
+    bool isModInstalled(const QString &modId) const;
+    bool isChatModAvailable() const;
+    void updateChatButtons();
     void handleConnectionStateChanged(ConnectionStore::Profile profile,
                                       TradeManager::ConnectionState state,
                                       const QString &message);
@@ -163,6 +174,7 @@ private:
         bool isFloating = false;
         int lastSplitterIndex = -1;
         QList<int> lastSplitterSizes;
+        QPointer<QSplitter> lastParentSplitter;
         double orderNotional = 10.0;
         int leverage = 20;
         QWidget *notionalOverlay = nullptr;
@@ -203,7 +215,9 @@ private:
         double dragPreviewPrice = 0.0;
         int tickCompression = 1;
         QToolButton *compressionButton = nullptr;
+        QToolButton *chatButton = nullptr;
         QToolButton *closeButton = nullptr;
+        ChatWindow *chatWindow = nullptr;
         QString accountName;
         QColor accountColor;
         qint64 bufferMinTick = 0;
@@ -257,6 +271,14 @@ private:
         QVector<DomColumn> columnsData;
     };
 
+    enum class DockZone {
+        None = 0,
+        Left,
+        Right,
+        Top,
+        Bottom
+    };
+
     void updatePositionOverlay(DomColumn &col, const TradePosition &position);
 
     void buildUi();
@@ -272,7 +294,37 @@ private:
     void floatDomColumn(WorkspaceTab &tab, DomColumn &col, int indexInSplitter, const QPoint &globalPos = QPoint());
     void dockDomColumn(WorkspaceTab &tab, DomColumn &col, int preferredIndex = -1);
     bool locateColumn(QWidget *container, WorkspaceTab *&tabOut, DomColumn *&colOut, int &splitIndex);
+    bool locateColumnEx(QWidget *container,
+                        WorkspaceTab *&tabOut,
+                        DomColumn *&colOut,
+                        QSplitter *&splitterOut,
+                        int &splitIndex);
     void removeDomColumn(QWidget *container);
+    QSplitter *findParentSplitter(QWidget *widget) const;
+    void collapseSplitterIfSingle(QSplitter *splitter);
+    void applyDockDrop(WorkspaceTab &dragTab,
+                       DomColumn &dragCol,
+                       WorkspaceTab &targetTab,
+                       DomColumn &targetCol,
+                       int targetIndex,
+                       QSplitter *targetSplitter,
+                       DockZone dropZone);
+    void applyDockDropWidget(QWidget *dragWidget,
+                             QWidget *targetWidget,
+                             QSplitter *targetSplitter,
+                             int targetIndex,
+                             DockZone dropZone);
+    void dockChatWindow(ChatWindow *chat,
+                        QWidget *targetWidget,
+                        QSplitter *targetSplitter,
+                        int targetIndex,
+                        DockZone dropZone);
+    void floatChatWindow(ChatWindow *chat, const QPoint &globalPos, const QPoint &offset);
+    void closeChatWindow(ChatWindow *chat);
+    void updateDockOverlay(const QPoint &globalPos, QWidget *draggingContainer);
+    void hideDockOverlay();
+    void finishDomDrag();
+    void abortDomDrag();
     void updateDomColumnResize(int delta);
     void endDomColumnResize();
     void cancelPendingDomResize();
@@ -473,6 +525,8 @@ private:
     int m_levels;
     QVector<QVector<SavedColumn>> m_savedLayout;
     QNetworkAccessManager m_symbolFetcher;
+    QNetworkAccessManager m_modsFetcher;
+    bool m_modsRequestInFlight = false;
     bool m_symbolRequestInFlight = false;
     bool m_mexcFuturesRequestInFlight = false;
     bool m_uzxSpotRequestInFlight = false;
@@ -597,6 +651,14 @@ private:
     QPoint m_domDragStartGlobal;
     QPoint m_domDragStartWindowOffset;
     bool m_domDragActive = false;
+    QPointer<QWidget> m_domDragGrabber;
+    QPointer<QLabel> m_pendingTickerLabel;
+    QPointer<QWidget> m_pendingTickerContainer;
+    QPoint m_pendingTickerPressGlobal;
+    bool m_pendingTickerDrag = false;
+    QWidget *m_dockOverlay = nullptr;
+    QWidget *m_dockOverlayTarget = nullptr;
+    DockZone m_dockOverlayZone = DockZone::None;
     QWidget *m_domResizeContainer = nullptr;
     WorkspaceTab *m_domResizeTab = nullptr;
     QList<int> m_domResizeInitialSizes;
@@ -617,11 +679,13 @@ private:
     Qt::WindowStates m_prevWindowState = Qt::WindowNoState;
     QString m_lastNormalScreenName;
     bool m_restoreRefreshQueued = false;
+    bool m_restoreOnShow = false;
 
     QString m_authBaseUrl;
     QString m_authToken;
     QString m_authRole;
     QString m_authUser;
+    QSet<QString> m_installedMods;
 
     // Hotkey: ????????????? ???????? ?? ??????.
     int m_centerKey = Qt::Key_Shift;

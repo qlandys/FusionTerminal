@@ -69,12 +69,58 @@ type EmailCode struct {
 	Created   int64
 }
 
+type Session struct {
+	Token     string `json:"token"`
+	UserID    int64  `json:"user_id"`
+	ExpiresAt int64  `json:"expires_at"`
+	Created   int64  `json:"created_at"`
+}
+
+type Mod struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Summary       string   `json:"summary"`
+	Description   string   `json:"description"`
+	Author        string   `json:"author"`
+	Category      string   `json:"category"`
+	Version       string   `json:"version"`
+	LatestVersion string   `json:"latest_version"`
+	IconURL       string   `json:"icon_url"`
+	CoverURL      string   `json:"cover_url"`
+	SizeBytes     int64    `json:"size_bytes"`
+	Price         float64  `json:"price"`
+	UpdatedAt     int64    `json:"updated_at"`
+	Tags          []string `json:"tags"`
+}
+
+type UserMod struct {
+	UserID    int64  `json:"user_id"`
+	ModID     string `json:"mod_id"`
+	Owned     bool   `json:"owned"`
+	Installed bool   `json:"installed"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+type ChatMessage struct {
+	ID      int64  `json:"id"`
+	Key     string `json:"key"`
+	UserID  int64  `json:"user_id"`
+	User    string `json:"user"`
+	Text    string `json:"text"`
+	Created int64  `json:"created_at"`
+}
+
 type storeData struct {
-	NextUserID int64       `json:"next_user_id"`
-	NextCodeID int64       `json:"next_code_id"`
-	Users      []User      `json:"users"`
-	Codes      []EmailCode `json:"codes"`
-	Pending    []PendingReg `json:"pending"`
+	NextUserID    int64         `json:"next_user_id"`
+	NextCodeID    int64         `json:"next_code_id"`
+	NextMessageID int64         `json:"next_message_id"`
+	Users         []User        `json:"users"`
+	Codes         []EmailCode   `json:"codes"`
+	Pending       []PendingReg  `json:"pending"`
+	Sessions      []Session     `json:"sessions"`
+	Mods          []Mod         `json:"mods"`
+	UserMods      []UserMod     `json:"user_mods"`
+	Messages      []ChatMessage `json:"messages"`
 }
 
 type Store struct {
@@ -116,6 +162,15 @@ type verifyCodeReq struct {
 	Flow         string `json:"flow"`
 }
 
+type modInstallReq struct {
+	ModID string `json:"mod_id"`
+}
+
+type chatSendReq struct {
+	Key  string `json:"key"`
+	Text string `json:"text"`
+}
+
 type authResp struct {
 	Token string `json:"token"`
 	Role  string `json:"role"`
@@ -128,12 +183,16 @@ type authClaims struct {
 	Email string `json:"email"`
 }
 
+const chatModID = "chat-ladder"
+const chatRetention = 7 * 24 * time.Hour
+
 func main() {
 	cfg := loadConfig()
 	store, err := loadStore(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("store open: %v", err)
 	}
+	store.ensureMods()
 
 	srv := &Server{cfg: cfg, db: store}
 	mux := http.NewServeMux()
@@ -142,6 +201,11 @@ func main() {
 	mux.HandleFunc("/auth/register", srv.handleRegister)
 	mux.HandleFunc("/auth/verify_code", srv.handleVerifyCode)
 	mux.HandleFunc("/auth/login", srv.handleLogin)
+	mux.HandleFunc("/mods", srv.handleMods)
+	mux.HandleFunc("/mods/install", srv.handleModInstall)
+	mux.HandleFunc("/mods/remove", srv.handleModRemove)
+	mux.HandleFunc("/chat/history", srv.handleChatHistory)
+	mux.HandleFunc("/chat/send", srv.handleChatSend)
 
 	log.Printf("Fusion API listening on %s", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, withJSON(mux)); err != nil {
@@ -184,6 +248,186 @@ func withJSON(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, okResp{OK: true})
+}
+
+func (s *Server) handleMods(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResp{Error: "method not allowed"})
+		return
+	}
+	user, err := s.authUserFromRequest(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResp{Error: "unauthorized"})
+		return
+	}
+	mods := s.db.listMods()
+	resp := make([]map[string]any, 0, len(mods))
+	for _, m := range mods {
+		owned, installed := s.db.userModState(user.ID, m.ID, m.Price <= 0)
+		updateAvail := m.LatestVersion != "" && m.Version != "" && m.LatestVersion != m.Version
+		updatedISO := ""
+		if m.UpdatedAt > 0 {
+			updatedISO = time.Unix(m.UpdatedAt, 0).UTC().Format(time.RFC3339)
+		}
+		resp = append(resp, map[string]any{
+			"id":               m.ID,
+			"name":             m.Name,
+			"summary":          m.Summary,
+			"description":      m.Description,
+			"author":           m.Author,
+			"category":         m.Category,
+			"version":          m.Version,
+			"latest_version":   m.LatestVersion,
+			"icon_url":         m.IconURL,
+			"cover_url":        m.CoverURL,
+			"size_bytes":       m.SizeBytes,
+			"price":            m.Price,
+			"owned":            owned,
+			"installed":        installed,
+			"update_available": updateAvail,
+			"updated_at":       updatedISO,
+			"tags":             m.Tags,
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleModInstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResp{Error: "method not allowed"})
+		return
+	}
+	user, err := s.authUserFromRequest(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResp{Error: "unauthorized"})
+		return
+	}
+	var req modInstallReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResp{Error: "invalid json"})
+		return
+	}
+	modID := strings.TrimSpace(req.ModID)
+	if modID == "" {
+		writeJSON(w, http.StatusBadRequest, errorResp{Error: "mod_id required"})
+		return
+	}
+	mod, err := s.db.modByID(modID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, errorResp{Error: "mod not found"})
+		return
+	}
+	owned, _ := s.db.userModState(user.ID, modID, mod.Price <= 0)
+	if !owned {
+		writeJSON(w, http.StatusForbidden, errorResp{Error: "not_owned"})
+		return
+	}
+	if err := s.db.setUserMod(user.ID, modID, owned, true); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResp{Error: "install failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, okResp{OK: true})
+}
+
+func (s *Server) handleModRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResp{Error: "method not allowed"})
+		return
+	}
+	user, err := s.authUserFromRequest(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResp{Error: "unauthorized"})
+		return
+	}
+	var req modInstallReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResp{Error: "invalid json"})
+		return
+	}
+	modID := strings.TrimSpace(req.ModID)
+	if modID == "" {
+		writeJSON(w, http.StatusBadRequest, errorResp{Error: "mod_id required"})
+		return
+	}
+	mod, err := s.db.modByID(modID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, errorResp{Error: "mod not found"})
+		return
+	}
+	owned, _ := s.db.userModState(user.ID, modID, mod.Price <= 0)
+	if err := s.db.setUserMod(user.ID, modID, owned, false); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResp{Error: "remove failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, okResp{OK: true})
+}
+
+func (s *Server) handleChatHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResp{Error: "method not allowed"})
+		return
+	}
+	user, err := s.authUserFromRequest(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResp{Error: "unauthorized"})
+		return
+	}
+	if !s.db.userHasModInstalled(user.ID, chatModID) {
+		writeJSON(w, http.StatusForbidden, errorResp{Error: "mod_not_installed"})
+		return
+	}
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, errorResp{Error: "key required"})
+		return
+	}
+	cutoff := time.Now().Add(-chatRetention).Unix()
+	messages := s.db.listMessages(key, cutoff)
+	writeJSON(w, http.StatusOK, messages)
+}
+
+func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResp{Error: "method not allowed"})
+		return
+	}
+	user, err := s.authUserFromRequest(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResp{Error: "unauthorized"})
+		return
+	}
+	if !s.db.userHasModInstalled(user.ID, chatModID) {
+		writeJSON(w, http.StatusForbidden, errorResp{Error: "mod_not_installed"})
+		return
+	}
+	var req chatSendReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResp{Error: "invalid json"})
+		return
+	}
+	key := strings.TrimSpace(req.Key)
+	text := strings.TrimSpace(req.Text)
+	if key == "" || text == "" {
+		writeJSON(w, http.StatusBadRequest, errorResp{Error: "missing key or text"})
+		return
+	}
+	if len(text) > 500 {
+		writeJSON(w, http.StatusBadRequest, errorResp{Error: "message too long"})
+		return
+	}
+	msg := ChatMessage{
+		Key:     key,
+		UserID:  user.ID,
+		User:    user.Login,
+		Text:    text,
+		Created: time.Now().Unix(),
+	}
+	cutoff := time.Now().Add(-chatRetention).Unix()
+	if err := s.db.addMessage(msg, cutoff); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResp{Error: "send failed"})
+		return
+	}
 	writeJSON(w, http.StatusOK, okResp{OK: true})
 }
 
@@ -429,6 +673,27 @@ func (s *Server) resolveEmail(emailOrLogin string, login string) (string, error)
 	return user.Email, nil
 }
 
+func (s *Server) authUserFromRequest(r *http.Request) (*User, error) {
+	raw := strings.TrimSpace(r.Header.Get("Authorization"))
+	if raw == "" {
+		return nil, errors.New("missing token")
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(raw, "Bearer"))
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, errors.New("missing token")
+	}
+	sess, err := s.db.getSession(token)
+	if err != nil {
+		return nil, errors.New("invalid token")
+	}
+	user, err := s.db.getUserByID(sess.UserID)
+	if err != nil {
+		return nil, errors.New("invalid token")
+	}
+	return user, nil
+}
+
 func validateRegister(email, login, password string) error {
 	if email == "" || !strings.Contains(email, "@") {
 		return errors.New("invalid email")
@@ -440,6 +705,25 @@ func validateRegister(email, login, password string) error {
 		return errors.New("password too short")
 	}
 	return nil
+}
+
+func defaultMods() []Mod {
+	now := time.Now().Unix()
+	return []Mod{
+		{
+			ID:            chatModID,
+			Name:          "Chat in ladder",
+			Summary:       "Overlay chat per ticker (exchange + market).",
+			Description:   "Real-time chat for each orderbook. Messages expire after 7 days.",
+			Author:        "FusionTerminal",
+			Category:      "Chat",
+			Version:       "1.0.0",
+			LatestVersion: "1.0.0",
+			Price:         0.0,
+			UpdatedAt:     now,
+			Tags:          []string{"chat", "overlay", "ticker"},
+		},
+	}
 }
 
 func (s *Server) issueEmailCode(email, purpose string) error {
@@ -480,6 +764,10 @@ func (s *Server) issueToken(user *User) (string, error) {
 		Role:  user.Role,
 		User:  user.Login,
 		Email: user.Email,
+	}
+	expires := time.Now().Add(s.cfg.TokenTTL).Unix()
+	if err := s.db.addSession(token, user.ID, expires); err != nil {
+		return "", err
 	}
 	return token, nil
 }
@@ -737,7 +1025,7 @@ func loadStore(path string) (*Store, error) {
 }
 
 func (s *Store) ensureIDs() {
-	var maxUser, maxCode int64
+	var maxUser, maxCode, maxMsg int64
 	for _, u := range s.data.Users {
 		if u.ID > maxUser {
 			maxUser = u.ID
@@ -748,17 +1036,40 @@ func (s *Store) ensureIDs() {
 			maxCode = c.ID
 		}
 	}
+	for _, m := range s.data.Messages {
+		if m.ID > maxMsg {
+			maxMsg = m.ID
+		}
+	}
 	if s.data.NextUserID <= maxUser {
 		s.data.NextUserID = maxUser + 1
 	}
 	if s.data.NextCodeID <= maxCode {
 		s.data.NextCodeID = maxCode + 1
 	}
+	if s.data.NextMessageID <= maxMsg {
+		s.data.NextMessageID = maxMsg + 1
+	}
 	if s.data.NextUserID == 0 {
 		s.data.NextUserID = 1
 	}
 	if s.data.NextCodeID == 0 {
 		s.data.NextCodeID = 1
+	}
+	if s.data.NextMessageID == 0 {
+		s.data.NextMessageID = 1
+	}
+}
+
+func (s *Store) ensureMods() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.data.Mods) != 0 {
+		return
+	}
+	s.data.Mods = defaultMods()
+	if s.path != "" {
+		_ = s.saveLocked()
 	}
 }
 
@@ -832,6 +1143,70 @@ func (s *Store) getUserByLoginOrEmail(val string) (*User, error) {
 	return nil, errors.New("user not found")
 }
 
+func (s *Store) getUserByID(id int64) (*User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.data.Users {
+		if u.ID == id {
+			cp := u
+			return &cp, nil
+		}
+	}
+	return nil, errors.New("user not found")
+}
+
+func (s *Store) addSession(token string, userID int64, expiresAt int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	next := s.data.Sessions[:0]
+	for _, sess := range s.data.Sessions {
+		if sess.ExpiresAt > 0 && sess.ExpiresAt <= now {
+			continue
+		}
+		if sess.Token == token {
+			continue
+		}
+		next = append(next, sess)
+	}
+	s.data.Sessions = next
+	s.data.Sessions = append(s.data.Sessions, Session{
+		Token:     token,
+		UserID:    userID,
+		ExpiresAt: expiresAt,
+		Created:   now,
+	})
+	return s.saveLocked()
+}
+
+func (s *Store) getSession(token string) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	next := s.data.Sessions[:0]
+	var found *Session
+	for _, sess := range s.data.Sessions {
+		if sess.ExpiresAt > 0 && sess.ExpiresAt <= now {
+			continue
+		}
+		if sess.Token == token {
+			cp := sess
+			found = &cp
+			next = append(next, sess)
+			continue
+		}
+		next = append(next, sess)
+	}
+	if len(next) != len(s.data.Sessions) {
+		s.data.Sessions = next
+		_ = s.saveLocked()
+	}
+	if found == nil {
+		return nil, errors.New("session not found")
+	}
+	return found, nil
+}
+
 func (s *Store) addCode(code EmailCode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -856,6 +1231,120 @@ func (s *Store) addPending(p PendingReg) error {
 	}
 	s.data.Pending = append(s.data.Pending, p)
 	return s.saveLocked()
+}
+
+func (s *Store) modByID(id string) (*Mod, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.data.Mods {
+		if m.ID == id {
+			cp := m
+			return &cp, nil
+		}
+	}
+	return nil, errors.New("mod not found")
+}
+
+func (s *Store) listMods() []Mod {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Mod, len(s.data.Mods))
+	copy(out, s.data.Mods)
+	return out
+}
+
+func (s *Store) userModState(userID int64, modID string, defaultOwned bool) (owned bool, installed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, um := range s.data.UserMods {
+		if um.UserID == userID && um.ModID == modID {
+			return um.Owned, um.Installed
+		}
+	}
+	return defaultOwned, false
+}
+
+func (s *Store) getUserMod(userID int64, modID string) (*UserMod, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, um := range s.data.UserMods {
+		if um.UserID == userID && um.ModID == modID {
+			cp := um
+			return &cp, i
+		}
+	}
+	return nil, -1
+}
+
+func (s *Store) setUserMod(userID int64, modID string, owned bool, installed bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	for i := range s.data.UserMods {
+		if s.data.UserMods[i].UserID == userID && s.data.UserMods[i].ModID == modID {
+			s.data.UserMods[i].Owned = owned
+			s.data.UserMods[i].Installed = installed
+			s.data.UserMods[i].UpdatedAt = now
+			return s.saveLocked()
+		}
+	}
+	s.data.UserMods = append(s.data.UserMods, UserMod{
+		UserID:    userID,
+		ModID:     modID,
+		Owned:     owned,
+		Installed: installed,
+		UpdatedAt: now,
+	})
+	return s.saveLocked()
+}
+
+func (s *Store) userHasModInstalled(userID int64, modID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, um := range s.data.UserMods {
+		if um.UserID == userID && um.ModID == modID {
+			return um.Installed
+		}
+	}
+	return false
+}
+
+func (s *Store) addMessage(msg ChatMessage, cutoff int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.data.Messages[:0]
+	for _, m := range s.data.Messages {
+		if m.Created < cutoff {
+			continue
+		}
+		next = append(next, m)
+	}
+	s.data.Messages = next
+	msg.ID = s.data.NextMessageID
+	s.data.NextMessageID++
+	s.data.Messages = append(s.data.Messages, msg)
+	return s.saveLocked()
+}
+
+func (s *Store) listMessages(key string, cutoff int64) []ChatMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.data.Messages[:0]
+	var out []ChatMessage
+	for _, m := range s.data.Messages {
+		if m.Created < cutoff {
+			continue
+		}
+		next = append(next, m)
+		if m.Key == key {
+			out = append(out, m)
+		}
+	}
+	if len(next) != len(s.data.Messages) {
+		s.data.Messages = next
+		_ = s.saveLocked()
+	}
+	return out
 }
 
 func (s *Store) getPendingByEmailOrLogin(val string) (*PendingReg, bool) {

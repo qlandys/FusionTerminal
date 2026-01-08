@@ -6,6 +6,7 @@
 #include "DomWidget.h"
 #include "LadderClient.h"
 #include "PluginsWindow.h"
+#include "ChatWindow.h"
 #include "PrintsWidget.h"
 #include "ClustersWidget.h"
 #include "SettingsWindow.h"
@@ -22,6 +23,7 @@
 #include <QScreen>
 #include <QColor>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QInputDialog>
@@ -36,6 +38,9 @@
 #include <QButtonGroup>
 #include <QMouseEvent>
 #include <QWheelEvent>
+#include <climits>
+#include <cstdlib>
+#include <utility>
 #include <QPlainTextEdit>
 #include <QTextEdit>
 #include <cmath>
@@ -53,6 +58,7 @@
 #include <QSignalBlocker>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QSizeGrip>
 #include <QVariant>
 #include <QVBoxLayout>
 #include <QVariantAnimation>
@@ -72,6 +78,50 @@
 #include <QProcess>
 #include <QPropertyAnimation>
 #include <QEasingCurve>
+
+namespace {
+Qt::Edges resizeEdgesForPos(QWidget *window, const QPoint &globalPos, int borderWidth)
+{
+    if (!window || borderWidth <= 0) {
+        return Qt::Edges();
+    }
+    const QRect rect = window->frameGeometry();
+    Qt::Edges edges;
+    if (globalPos.x() - rect.left() <= borderWidth) {
+        edges |= Qt::LeftEdge;
+    } else if (rect.right() - globalPos.x() <= borderWidth) {
+        edges |= Qt::RightEdge;
+    }
+    if (globalPos.y() - rect.top() <= borderWidth) {
+        edges |= Qt::TopEdge;
+    } else if (rect.bottom() - globalPos.y() <= borderWidth) {
+        edges |= Qt::BottomEdge;
+    }
+    return edges;
+}
+
+Qt::CursorShape cursorForEdges(Qt::Edges edges)
+{
+    const bool left = edges.testFlag(Qt::LeftEdge);
+    const bool right = edges.testFlag(Qt::RightEdge);
+    const bool top = edges.testFlag(Qt::TopEdge);
+    const bool bottom = edges.testFlag(Qt::BottomEdge);
+
+    if ((left && top) || (right && bottom)) {
+        return Qt::SizeFDiagCursor;
+    }
+    if ((right && top) || (left && bottom)) {
+        return Qt::SizeBDiagCursor;
+    }
+    if (left || right) {
+        return Qt::SizeHorCursor;
+    }
+    if (top || bottom) {
+        return Qt::SizeVerCursor;
+    }
+    return Qt::ArrowCursor;
+}
+}
 #include <QTransform>
 #include <QUrl>
 #include <QCloseEvent>
@@ -1205,6 +1255,9 @@ MainWindow::MainWindow(const QString &backendPath,
     setWindowFlag(Qt::FramelessWindowHint);
 
     loadUserSettings();
+    if (!m_authToken.isEmpty()) {
+        requestInstalledMods();
+    }
     if (m_tradeManager) {
         connect(m_tradeManager, &TradeManager::logMessage, this, &MainWindow::appendConnectionsLog);
     }
@@ -2520,22 +2573,49 @@ void MainWindow::keyReleaseEvent(QKeyEvent *event)
 
 void MainWindow::changeEvent(QEvent *event)
 {
+    auto scheduleRestoreRefresh = [this]() {
+        if (m_restoreRefreshQueued) {
+            return;
+        }
+        m_restoreRefreshQueued = true;
+        QTimer::singleShot(0, this, [this]() {
+            m_restoreRefreshQueued = false;
+            if (isMinimized()) {
+                return;
+            }
+            QWidget *central = centralWidget();
+            if (central) {
+                central->setUpdatesEnabled(false);
+                central->setVisible(false);
+            }
+            QTimer::singleShot(0, this, [this, central]() {
+                if (central) {
+                    central->setVisible(true);
+                    central->setUpdatesEnabled(true);
+                    central->update();
+                }
+                const auto quicks = findChildren<QQuickWidget *>();
+                for (QQuickWidget *qw : quicks) {
+                    if (qw) {
+                        qw->setUpdatesEnabled(true);
+                        qw->update();
+                    }
+                }
+                update();
+            });
+        });
+    };
+
     if (event && event->type() == QEvent::WindowStateChange) {
         const Qt::WindowStates cur = windowState();
         const bool wasMinimized = m_prevWindowState.testFlag(Qt::WindowMinimized);
         updateMaximizeIcon();
         m_prevWindowState = cur;
+        if (cur.testFlag(Qt::WindowMinimized)) {
+            m_restoreOnShow = true;
+        }
         if (wasMinimized && !cur.testFlag(Qt::WindowMinimized)) {
-            if (m_restoreRefreshQueued) {
-                QMainWindow::changeEvent(event);
-                return;
-            }
-            m_restoreRefreshQueued = true;
-            QTimer::singleShot(0, this, [this]() {
-                m_restoreRefreshQueued = false;
-                if (isMinimized() || isMaximized()) {
-                    return;
-                }
+            if (!m_restoreRefreshQueued) {
                 QRect geom = frameGeometry();
                 QScreen *scr = nullptr;
                 if (windowHandle()) {
@@ -2562,26 +2642,13 @@ void MainWindow::changeEvent(QEvent *event)
                         setGeometry(x, y, w, h);
                     }
                 }
-                QWidget *central = centralWidget();
-                if (central) {
-                    central->setUpdatesEnabled(false);
-                    central->setVisible(false);
-                }
-                QTimer::singleShot(0, this, [this, central]() {
-                    if (central) {
-                        central->setVisible(true);
-                        central->setUpdatesEnabled(true);
-                        central->update();
-                    }
-                    const auto quicks = findChildren<QQuickWidget *>();
-                    for (QQuickWidget *qw : quicks) {
-                        if (qw) {
-                            qw->update();
-                        }
-                    }
-                    update();
-                });
-            });
+                scheduleRestoreRefresh();
+            }
+        }
+    } else if (event && (event->type() == QEvent::Show || event->type() == QEvent::WindowActivate)) {
+        if (m_restoreOnShow && !isMinimized()) {
+            m_restoreOnShow = false;
+            scheduleRestoreRefresh();
         }
     }
     QMainWindow::changeEvent(event);
@@ -2887,8 +2954,10 @@ QWidget *MainWindow::buildMainArea(QWidget *parent)
         m_authToken.clear();
         m_authRole.clear();
         m_authUser.clear();
+        m_installedMods.clear();
         saveUserSettings();
         updateAuthNavUi();
+        updateChatButtons();
         if (statusBar()) {
             statusBar()->showMessage(tr("Signed out."), 2500);
         }
@@ -3358,6 +3427,8 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     header->setObjectName(QStringLiteral("DomTitleBar"));
     header->setProperty("domContainerPtr",
                         QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(column)));
+    header->setMouseTracking(true);
+    header->installEventFilter(this);
     auto *hLayout = new QHBoxLayout(header);
     hLayout->setContentsMargins(7, 1, 0, 1);
     hLayout->setSpacing(5);
@@ -3423,6 +3494,19 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     compressionButton->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
     hLayout->addWidget(compressionButton);
     result.compressionButton = compressionButton;
+
+    auto *chatButton = new QToolButton(header);
+    chatButton->setObjectName(QStringLiteral("DomHeaderChatButton"));
+    chatButton->setAutoRaise(true);
+    chatButton->setIconSize(QSize(12, 12));
+    chatButton->setCursor(Qt::PointingHandCursor);
+    chatButton->setFixedSize(20, 20);
+    chatButton->setVisible(isChatModAvailable());
+    hLayout->addWidget(chatButton, 0, Qt::AlignVCenter);
+    result.chatButton = chatButton;
+    connect(chatButton, &QToolButton::clicked, this, [this, column]() {
+        openChatForContainer(column);
+    });
 
     auto *closeButton = new QToolButton(header);
     closeButton->setObjectName(QStringLiteral("DomHeaderCloseButton"));
@@ -6903,16 +6987,32 @@ QString MainWindow::resolveAssetPath(const QString &relative) const
 
 bool MainWindow::locateColumn(QWidget *container, WorkspaceTab *&tabOut, DomColumn *&colOut, int &splitIndex)
 {
+    QSplitter *splitter = nullptr;
+    return locateColumnEx(container, tabOut, colOut, splitter, splitIndex);
+}
+
+bool MainWindow::locateColumnEx(QWidget *container,
+                                WorkspaceTab *&tabOut,
+                                DomColumn *&colOut,
+                                QSplitter *&splitterOut,
+                                int &splitIndex)
+{
     tabOut = nullptr;
     colOut = nullptr;
+    splitterOut = nullptr;
     splitIndex = -1;
+    if (!container) {
+        return false;
+    }
     for (auto &tab : m_tabs) {
-        if (!tab.columns) continue;
         for (auto &col : tab.columnsData) {
             if (col.container == container) {
                 tabOut = &tab;
                 colOut = &col;
-                splitIndex = tab.columns->indexOf(container);
+                splitterOut = findParentSplitter(container);
+                if (splitterOut) {
+                    splitIndex = splitterOut->indexOf(container);
+                }
                 return true;
             }
         }
@@ -7078,22 +7178,56 @@ void MainWindow::floatDomColumn(WorkspaceTab &tab, DomColumn &col, int indexInSp
     if (!tab.columns || col.isFloating || !col.container) {
         return;
     }
-    col.lastSplitterIndex = indexInSplitter >= 0 ? indexInSplitter : tab.columns->indexOf(col.container);
-    col.lastSplitterSizes = tab.columns->sizes();
+    QSplitter *parentSplitter = findParentSplitter(col.container);
+    col.lastParentSplitter = parentSplitter;
+    if (parentSplitter) {
+        col.lastSplitterIndex =
+            indexInSplitter >= 0 ? indexInSplitter : parentSplitter->indexOf(col.container);
+        col.lastSplitterSizes = parentSplitter->sizes();
+    } else {
+        col.lastSplitterIndex = -1;
+        col.lastSplitterSizes.clear();
+    }
     if (m_domResizeContainer == col.container) {
         endDomColumnResize();
     } else if (m_domResizePending && m_domResizeContainer == col.container) {
         cancelPendingDomResize();
     }
     col.container->setParent(nullptr);
+    if (parentSplitter) {
+        collapseSplitterIfSingle(parentSplitter);
+    }
 
-    QWidget *win = new QWidget(nullptr, Qt::Window);
+    QWidget *win = new QWidget(nullptr,
+                               Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+    win->setObjectName(QStringLiteral("DomFloatingWindow"));
     win->setAttribute(Qt::WA_DeleteOnClose, false);
+    win->setAttribute(Qt::WA_NoMousePropagation, true);
+    win->setAttribute(Qt::WA_TransparentForMouseEvents, false);
+    win->setAttribute(Qt::WA_NativeWindow, true);
+    win->setMouseTracking(true);
+    win->setFocusPolicy(Qt::StrongFocus);
     win->setWindowTitle(col.symbol.isEmpty() ? tr("DOM") : col.symbol);
-    auto *layout = new QVBoxLayout(win);
-    layout->setContentsMargins(0, 0, 0, 0);
+    win->setStyleSheet(QStringLiteral(
+        "QWidget#DomFloatingWindow {"
+        "  background-color: #1c1c1c;"
+        "  border: 1px solid #2b2b2b;"
+        "}"));
+    win->setProperty("domContainerPtr",
+                     QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(col.container)));
+    col.container->setAttribute(Qt::WA_TransparentForMouseEvents, false);
+    col.container->setMouseTracking(true);
+    col.container->setFocusPolicy(Qt::StrongFocus);
+    win->winId();
+    auto *layout = new QGridLayout(win);
+    layout->setContentsMargins(1, 1, 1, 1);
     layout->setSpacing(0);
-    layout->addWidget(col.container);
+    layout->addWidget(col.container, 0, 0);
+    auto *grip = new QSizeGrip(win);
+    grip->setObjectName(QStringLiteral("DomFloatSizeGrip"));
+    grip->setFixedSize(14, 14);
+    grip->setCursor(Qt::SizeFDiagCursor);
+    layout->addWidget(grip, 0, 0, Qt::AlignRight | Qt::AlignBottom);
     col.floatingWindow = win;
     col.isFloating = true;
     win->installEventFilter(this);
@@ -7104,6 +7238,13 @@ void MainWindow::floatDomColumn(WorkspaceTab &tab, DomColumn &col, int indexInSp
         win->move(globalPos - m_domDragStartWindowOffset);
     }
     win->show();
+    win->raise();
+    win->activateWindow();
+    if (m_domDragGrabber) {
+        m_domDragGrabber->releaseMouse();
+        m_domDragGrabber = win;
+        win->grabMouse();
+    }
 }
 
 void MainWindow::dockDomColumn(WorkspaceTab &tab, DomColumn &col, int preferredIndex)
@@ -7117,17 +7258,25 @@ void MainWindow::dockDomColumn(WorkspaceTab &tab, DomColumn &col, int preferredI
         col.floatingWindow = nullptr;
     }
 
-    const int spacerIndex = tab.columnsSpacer ? tab.columns->indexOf(tab.columnsSpacer) : -1;
-    const int maxInsertIndex = (spacerIndex >= 0) ? spacerIndex : tab.columns->count();
+    QSplitter *targetSplitter = col.lastParentSplitter ? col.lastParentSplitter.data() : tab.columns;
+    if (!targetSplitter) {
+        targetSplitter = tab.columns;
+    }
     int insertIndex = preferredIndex >= 0 ? preferredIndex : col.lastSplitterIndex;
-    if (insertIndex < 0) {
+    int maxInsertIndex = targetSplitter->count();
+    if (targetSplitter == tab.columns && tab.columnsSpacer) {
+        const int spacerIndex = tab.columns->indexOf(tab.columnsSpacer);
+        if (spacerIndex >= 0) {
+            maxInsertIndex = spacerIndex;
+        }
+    }
+    if (insertIndex < 0 || insertIndex > maxInsertIndex) {
         insertIndex = maxInsertIndex;
     }
-    insertIndex = std::min(insertIndex, maxInsertIndex);
-    tab.columns->insertWidget(insertIndex, col.container);
-    tab.columns->setStretchFactor(tab.columns->indexOf(col.container), 0);
-    if (!col.lastSplitterSizes.isEmpty()) {
-        tab.columns->setSizes(col.lastSplitterSizes);
+    targetSplitter->insertWidget(insertIndex, col.container);
+    targetSplitter->setStretchFactor(targetSplitter->indexOf(col.container), 0);
+    if (!col.lastSplitterSizes.isEmpty() && targetSplitter == col.lastParentSplitter.data()) {
+        targetSplitter->setSizes(col.lastSplitterSizes);
     }
     col.isFloating = false;
 }
@@ -7136,11 +7285,653 @@ void MainWindow::openPluginsWindow()
 {
     if (!m_pluginsWindow) {
         m_pluginsWindow = new PluginsWindow(this);
+        connect(m_pluginsWindow,
+                &PluginsWindow::installedModsChanged,
+                this,
+                &MainWindow::updateInstalledMods);
     }
     m_pluginsWindow->setAuthContext(m_authBaseUrl, m_authToken, m_authRole, m_authUser);
     m_pluginsWindow->show();
     m_pluginsWindow->raise();
     m_pluginsWindow->activateWindow();
+}
+
+QSplitter *MainWindow::findParentSplitter(QWidget *widget) const
+{
+    QWidget *parent = widget ? widget->parentWidget() : nullptr;
+    while (parent) {
+        if (auto *splitter = qobject_cast<QSplitter *>(parent)) {
+            return splitter;
+        }
+        parent = parent->parentWidget();
+    }
+    return nullptr;
+}
+
+void MainWindow::collapseSplitterIfSingle(QSplitter *splitter)
+{
+    if (!splitter) {
+        return;
+    }
+    if (splitter->count() != 1) {
+        return;
+    }
+    QWidget *child = splitter->widget(0);
+    auto *parentSplitter = qobject_cast<QSplitter *>(splitter->parentWidget());
+    if (!child || !parentSplitter) {
+        return;
+    }
+    const int index = parentSplitter->indexOf(splitter);
+    if (index < 0) {
+        return;
+    }
+    child->setParent(parentSplitter);
+    parentSplitter->insertWidget(index, child);
+    splitter->deleteLater();
+}
+
+void MainWindow::applyDockDrop(WorkspaceTab &dragTab,
+                               DomColumn &dragCol,
+                               WorkspaceTab &targetTab,
+                               DomColumn &targetCol,
+                               int targetIndex,
+                               QSplitter *targetSplitter,
+                               DockZone dropZone)
+{
+    if (dropZone == DockZone::None || !targetSplitter) {
+        return;
+    }
+    if (&dragTab != &targetTab || &dragCol == &targetCol) {
+        return;
+    }
+    if (!dragCol.container || !targetCol.container) {
+        return;
+    }
+
+    QSplitter *dragParent = findParentSplitter(dragCol.container);
+    int dragIndex = dragParent ? dragParent->indexOf(dragCol.container) : -1;
+    if (dragParent && dragParent == targetSplitter && dragIndex >= 0 && dragIndex < targetIndex) {
+        targetIndex -= 1;
+    }
+
+    if (dragCol.floatingWindow) {
+        dragCol.floatingWindow->removeEventFilter(this);
+        dragCol.floatingWindow->hide();
+        dragCol.floatingWindow = nullptr;
+    }
+    dragCol.isFloating = false;
+
+    if (dragCol.container->parentWidget()) {
+        dragCol.container->setParent(nullptr);
+    }
+    if (dragParent && dragParent != targetSplitter) {
+        collapseSplitterIfSingle(dragParent);
+    }
+
+    QWidget *targetWidget = targetCol.container;
+    if (targetWidget->parentWidget()) {
+        targetWidget->setParent(nullptr);
+    }
+
+    const bool vertical = (dropZone == DockZone::Top || dropZone == DockZone::Bottom);
+    auto *splitter = new QSplitter(vertical ? Qt::Vertical : Qt::Horizontal, targetSplitter);
+    splitter->setObjectName(QStringLiteral("DomDockSplitter"));
+    splitter->setChildrenCollapsible(false);
+    splitter->setHandleWidth(3);
+    splitter->setStyleSheet(QStringLiteral(
+        "QSplitter#DomDockSplitter::handle {"
+        "  background-color: #2b2b2b;"
+        "}"
+        "QSplitter#DomDockSplitter::handle:hover {"
+        "  background-color: #3a3a3a;"
+        "}"));
+
+    if (dropZone == DockZone::Left || dropZone == DockZone::Top) {
+        splitter->addWidget(dragCol.container);
+        splitter->addWidget(targetWidget);
+    } else {
+        splitter->addWidget(targetWidget);
+        splitter->addWidget(dragCol.container);
+    }
+    splitter->setStretchFactor(0, 1);
+    splitter->setStretchFactor(1, 1);
+    splitter->setSizes({1, 1});
+
+    if (targetIndex < 0) {
+        targetIndex = targetSplitter->count();
+    }
+    targetSplitter->insertWidget(targetIndex, splitter);
+    targetSplitter->setStretchFactor(targetSplitter->indexOf(splitter), 0);
+
+    dragCol.lastParentSplitter = splitter;
+    dragCol.lastSplitterIndex = splitter->indexOf(dragCol.container);
+    dragCol.lastSplitterSizes = splitter->sizes();
+}
+
+void MainWindow::applyDockDropWidget(QWidget *dragWidget,
+                                     QWidget *targetWidget,
+                                     QSplitter *targetSplitter,
+                                     int targetIndex,
+                                     DockZone dropZone)
+{
+    if (!dragWidget || !targetWidget || !targetSplitter || dropZone == DockZone::None) {
+        return;
+    }
+    if (dragWidget == targetWidget) {
+        return;
+    }
+
+    QSplitter *dragParent = findParentSplitter(dragWidget);
+    int dragIndex = dragParent ? dragParent->indexOf(dragWidget) : -1;
+    if (dragParent && dragParent == targetSplitter && dragIndex >= 0 && dragIndex < targetIndex) {
+        targetIndex -= 1;
+    }
+
+    if (dragWidget->parentWidget()) {
+        dragWidget->setParent(nullptr);
+    }
+    if (dragParent && dragParent != targetSplitter) {
+        collapseSplitterIfSingle(dragParent);
+    }
+    if (targetWidget->parentWidget()) {
+        targetWidget->setParent(nullptr);
+    }
+
+    const bool vertical = (dropZone == DockZone::Top || dropZone == DockZone::Bottom);
+    auto *splitter = new QSplitter(vertical ? Qt::Vertical : Qt::Horizontal, targetSplitter);
+    splitter->setObjectName(QStringLiteral("DomDockSplitter"));
+    splitter->setChildrenCollapsible(false);
+    splitter->setHandleWidth(3);
+    splitter->setStyleSheet(QStringLiteral(
+        "QSplitter#DomDockSplitter::handle {"
+        "  background-color: #2b2b2b;"
+        "}"
+        "QSplitter#DomDockSplitter::handle:hover {"
+        "  background-color: #3a3a3a;"
+        "}"));
+
+    if (dropZone == DockZone::Left || dropZone == DockZone::Top) {
+        splitter->addWidget(dragWidget);
+        splitter->addWidget(targetWidget);
+    } else {
+        splitter->addWidget(targetWidget);
+        splitter->addWidget(dragWidget);
+    }
+    splitter->setStretchFactor(0, 1);
+    splitter->setStretchFactor(1, 1);
+    splitter->setSizes({1, 1});
+
+    if (targetIndex < 0) {
+        targetIndex = targetSplitter->count();
+    }
+    targetSplitter->insertWidget(targetIndex, splitter);
+    targetSplitter->setStretchFactor(targetSplitter->indexOf(splitter), 0);
+}
+
+void MainWindow::dockChatWindow(ChatWindow *chat,
+                                QWidget *targetWidget,
+                                QSplitter *targetSplitter,
+                                int targetIndex,
+                                DockZone dropZone)
+{
+    if (!chat || !targetWidget || !targetSplitter) {
+        return;
+    }
+    chat->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+    chat->setDocked(true);
+    applyDockDropWidget(chat, targetWidget, targetSplitter, targetIndex, dropZone);
+}
+
+void MainWindow::floatChatWindow(ChatWindow *chat, const QPoint &globalPos, const QPoint &offset)
+{
+    if (!chat) {
+        return;
+    }
+    QSplitter *parentSplitter = findParentSplitter(chat);
+    if (chat->parentWidget()) {
+        chat->setParent(nullptr);
+    }
+    if (parentSplitter) {
+        collapseSplitterIfSingle(parentSplitter);
+    }
+    chat->setDocked(false);
+    chat->move(globalPos - offset);
+    chat->show();
+    chat->raise();
+    chat->startFloatingDrag(globalPos, offset);
+}
+
+void MainWindow::closeChatWindow(ChatWindow *chat)
+{
+    if (!chat) {
+        return;
+    }
+    QSplitter *parentSplitter = findParentSplitter(chat);
+    if (chat->parentWidget()) {
+        chat->setParent(nullptr);
+    }
+    if (parentSplitter) {
+        collapseSplitterIfSingle(parentSplitter);
+    }
+    chat->setDocked(false);
+    chat->hide();
+}
+
+void MainWindow::updateDockOverlay(const QPoint &globalPos, QWidget *draggingContainer)
+{
+    WorkspaceTab *tab = currentWorkspaceTab();
+    if (!tab) {
+        hideDockOverlay();
+        return;
+    }
+
+    QWidget *target = nullptr;
+    QRect targetRect;
+    const auto findBestTarget = [&](bool requireContains) {
+        QWidget *best = nullptr;
+        QRect bestRect;
+        int bestDist = INT_MAX;
+        for (auto &col : tab->columnsData) {
+            if (!col.container || col.container == draggingContainer || col.isFloating) {
+                continue;
+            }
+            if (!col.container->isVisible()) {
+                continue;
+            }
+            const QRect rect(col.container->mapToGlobal(QPoint(0, 0)), col.container->size());
+            if (requireContains) {
+                if (rect.contains(globalPos)) {
+                    return std::pair<QWidget *, QRect>(col.container, rect);
+                }
+                continue;
+            }
+            const int snapDistance = 48;
+            const QRect snapRect = rect.adjusted(-snapDistance, -snapDistance, snapDistance, snapDistance);
+            if (!snapRect.contains(globalPos)) {
+                continue;
+            }
+            const int dist = std::abs(globalPos.x() - rect.center().x());
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = col.container;
+                bestRect = rect;
+            }
+        }
+        return std::pair<QWidget *, QRect>(best, bestRect);
+    };
+
+    auto [directTarget, directRect] = findBestTarget(true);
+    target = directTarget;
+    targetRect = directRect;
+
+    if (!target && tab->columns) {
+        const QRect splitterRect(tab->columns->mapToGlobal(QPoint(0, 0)), tab->columns->size());
+        if (splitterRect.contains(globalPos)) {
+            auto [nearestTarget, nearestRect] = findBestTarget(false);
+            target = nearestTarget;
+            targetRect = nearestRect;
+        }
+    }
+
+    if (!target) {
+        hideDockOverlay();
+        return;
+    }
+
+    if (!m_dockOverlay) {
+        auto *overlay = new QWidget(this, Qt::ToolTip | Qt::FramelessWindowHint);
+        overlay->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        overlay->setAttribute(Qt::WA_TranslucentBackground, true);
+        overlay->setObjectName(QStringLiteral("DomDockOverlay"));
+        overlay->setFixedSize(96, 96);
+        auto *grid = new QGridLayout(overlay);
+        grid->setContentsMargins(6, 6, 6, 6);
+        grid->setSpacing(6);
+        auto makeCell = [overlay, this](const QString &iconName) {
+            auto *cell = new QLabel(overlay);
+            cell->setObjectName(QStringLiteral("DockZoneCell"));
+            cell->setFixedSize(18, 18);
+            cell->setAlignment(Qt::AlignCenter);
+            cell->setProperty("active", false);
+            cell->setProperty("iconName", iconName);
+            const QIcon icon = loadIconTinted(iconName, QColor("#c9cfd8"), QSize(16, 16));
+            cell->setPixmap(icon.pixmap(16, 16));
+            return cell;
+        };
+        auto *top = makeCell(QStringLiteral("square-chevron-up"));
+        auto *left = makeCell(QStringLiteral("square-chevron-left"));
+        auto *right = makeCell(QStringLiteral("square-chevron-right"));
+        auto *bottom = makeCell(QStringLiteral("square-chevron-down"));
+        top->setProperty("zone", static_cast<int>(DockZone::Top));
+        left->setProperty("zone", static_cast<int>(DockZone::Left));
+        right->setProperty("zone", static_cast<int>(DockZone::Right));
+        bottom->setProperty("zone", static_cast<int>(DockZone::Bottom));
+        grid->addWidget(top, 0, 1, Qt::AlignCenter);
+        grid->addWidget(left, 1, 0, Qt::AlignCenter);
+        grid->addWidget(right, 1, 2, Qt::AlignCenter);
+        grid->addWidget(bottom, 2, 1, Qt::AlignCenter);
+        overlay->setStyleSheet(QStringLiteral(
+            "QLabel#DockZoneCell {"
+            "  background: transparent;"
+            "}"));
+        m_dockOverlay = overlay;
+    }
+
+    const QSize overlaySize = m_dockOverlay->size();
+    const QPoint center = targetRect.center() - QPoint(overlaySize.width() / 2, overlaySize.height() / 2);
+    m_dockOverlay->move(center);
+    m_dockOverlay->show();
+    m_dockOverlay->raise();
+
+    DockZone zone = DockZone::None;
+    const QList<QLabel *> cells = m_dockOverlay->findChildren<QLabel *>(QStringLiteral("DockZoneCell"));
+    if (targetRect.contains(globalPos)) {
+        const QPoint local = m_dockOverlay->mapFromGlobal(globalPos);
+        for (QLabel *cell : cells) {
+            if (!cell) {
+                continue;
+            }
+            const QRect cellRect = cell->geometry();
+            if (cellRect.contains(local)) {
+                zone = static_cast<DockZone>(cell->property("zone").toInt());
+                break;
+            }
+        }
+    } else {
+        zone = (globalPos.x() < targetRect.center().x()) ? DockZone::Left : DockZone::Right;
+    }
+
+    for (QLabel *cell : cells) {
+        if (!cell) {
+            continue;
+        }
+        const DockZone cellZone = static_cast<DockZone>(cell->property("zone").toInt());
+        cell->setProperty("active", cellZone == zone);
+        cell->style()->unpolish(cell);
+        cell->style()->polish(cell);
+        const QString iconName = cell->property("iconName").toString();
+        const QColor iconColor = (cellZone == zone) ? QColor("#e9f1ff") : QColor("#c9cfd8");
+        const QIcon icon = loadIconTinted(iconName, iconColor, QSize(16, 16));
+        cell->setPixmap(icon.pixmap(16, 16));
+    }
+
+    m_dockOverlayTarget = target;
+    m_dockOverlayZone = zone;
+}
+
+void MainWindow::hideDockOverlay()
+{
+    m_dockOverlayTarget = nullptr;
+    m_dockOverlayZone = DockZone::None;
+    if (m_dockOverlay) {
+        m_dockOverlay->hide();
+    }
+}
+
+void MainWindow::finishDomDrag()
+{
+    if (m_draggingDomContainer && m_domDragActive) {
+        WorkspaceTab *dragTab = nullptr;
+        DomColumn *dragCol = nullptr;
+        QSplitter *dragSplitter = nullptr;
+        int dragIndex = -1;
+        locateColumnEx(m_draggingDomContainer, dragTab, dragCol, dragSplitter, dragIndex);
+        if (dragTab && dragCol && m_dockOverlayTarget && m_dockOverlayZone != DockZone::None) {
+            WorkspaceTab *targetTab = nullptr;
+            DomColumn *targetCol = nullptr;
+            QSplitter *targetSplitter = nullptr;
+            int targetIndex = -1;
+            locateColumnEx(m_dockOverlayTarget, targetTab, targetCol, targetSplitter, targetIndex);
+            if (targetTab && targetCol && targetSplitter) {
+                applyDockDrop(*dragTab,
+                              *dragCol,
+                              *targetTab,
+                              *targetCol,
+                              targetIndex,
+                              targetSplitter,
+                              m_dockOverlayZone);
+            }
+        }
+    }
+    hideDockOverlay();
+    if (m_domDragGrabber) {
+        m_domDragGrabber->releaseMouse();
+    }
+    m_domDragGrabber = nullptr;
+    m_draggingDomContainer = nullptr;
+    m_domDragActive = false;
+    m_pendingTickerLabel = nullptr;
+    m_pendingTickerContainer = nullptr;
+    m_pendingTickerDrag = false;
+}
+
+void MainWindow::abortDomDrag()
+{
+    hideDockOverlay();
+    if (m_domDragGrabber) {
+        m_domDragGrabber->releaseMouse();
+    }
+    m_domDragGrabber = nullptr;
+    m_draggingDomContainer = nullptr;
+    m_domDragActive = false;
+    m_pendingTickerLabel = nullptr;
+    m_pendingTickerContainer = nullptr;
+    m_pendingTickerDrag = false;
+}
+
+void MainWindow::openChatForContainer(QWidget *container)
+{
+    if (!container) {
+        return;
+    }
+    if (m_authToken.isEmpty()) {
+        if (statusBar()) {
+            statusBar()->showMessage(tr("Sign in to use chat."), 2500);
+        }
+        return;
+    }
+    if (!isModInstalled(QStringLiteral("chat-ladder"))) {
+        if (statusBar()) {
+            statusBar()->showMessage(tr("Install the chat mod to use chat."), 2500);
+        }
+        return;
+    }
+    WorkspaceTab *tab = nullptr;
+    DomColumn *col = nullptr;
+    int splitIndex = -1;
+    if (!locateColumn(container, tab, col, splitIndex) || !col) {
+        return;
+    }
+    if (!col->chatWindow) {
+        col->chatWindow = new ChatWindow(this);
+        connect(col->chatWindow,
+                &ChatWindow::dragMoved,
+                this,
+                [this](const QPoint &pos) {
+                    updateDockOverlay(pos, nullptr);
+                });
+        connect(col->chatWindow,
+                &ChatWindow::dragReleased,
+                this,
+                [this](const QPoint &pos) {
+                    auto *chat = qobject_cast<ChatWindow *>(sender());
+                    if (chat && m_dockOverlayTarget && m_dockOverlayZone != DockZone::None) {
+                        WorkspaceTab *targetTab = nullptr;
+                        DomColumn *targetCol = nullptr;
+                        QSplitter *targetSplitter = nullptr;
+                        int targetIndex = -1;
+                        locateColumnEx(m_dockOverlayTarget, targetTab, targetCol, targetSplitter, targetIndex);
+                        if (targetTab && targetCol && targetSplitter) {
+                            dockChatWindow(chat,
+                                           targetCol->container,
+                                           targetSplitter,
+                                           targetIndex,
+                                           m_dockOverlayZone);
+                        }
+                    }
+                    hideDockOverlay();
+                });
+        connect(col->chatWindow,
+                &ChatWindow::requestUndock,
+                this,
+                [this](ChatWindow *chat, const QPoint &pos, const QPoint &offset) {
+                    floatChatWindow(chat, pos, offset);
+                });
+        connect(col->chatWindow,
+                &ChatWindow::requestClose,
+                this,
+                [this](ChatWindow *chat) {
+                    closeChatWindow(chat);
+                });
+    }
+    col->chatWindow->setAuthContext(m_authBaseUrl, m_authToken, m_authUser);
+    const QString key = chatKeyForColumn(*col);
+    const QString title = chatTitleForColumn(*col);
+    col->chatWindow->setChatKey(key, title);
+    col->chatWindow->show();
+    col->chatWindow->raise();
+    col->chatWindow->activateWindow();
+}
+
+QString MainWindow::chatKeyForColumn(const DomColumn &col) const
+{
+    const SymbolSource source = symbolSourceForAccount(col.accountName);
+    QString exchange = QStringLiteral("UNKNOWN");
+    QString market = QStringLiteral("SPOT");
+    const bool lighterPerp = (source == SymbolSource::Lighter) && !col.symbol.contains(QLatin1Char('/'));
+    switch (source) {
+    case SymbolSource::Mexc:
+        exchange = QStringLiteral("MEXC");
+        market = QStringLiteral("SPOT");
+        break;
+    case SymbolSource::MexcFutures:
+        exchange = QStringLiteral("MEXC");
+        market = QStringLiteral("FUTURES");
+        break;
+    case SymbolSource::BinanceSpot:
+        exchange = QStringLiteral("BINANCE");
+        market = QStringLiteral("SPOT");
+        break;
+    case SymbolSource::BinanceFutures:
+        exchange = QStringLiteral("BINANCE");
+        market = QStringLiteral("FUTURES");
+        break;
+    case SymbolSource::UzxSpot:
+        exchange = QStringLiteral("UZX");
+        market = QStringLiteral("SPOT");
+        break;
+    case SymbolSource::UzxSwap:
+        exchange = QStringLiteral("UZX");
+        market = QStringLiteral("SWAP");
+        break;
+    case SymbolSource::Lighter:
+        exchange = QStringLiteral("LIGHTER");
+        market = lighterPerp ? QStringLiteral("PERP") : QStringLiteral("SPOT");
+        break;
+    }
+    return QStringLiteral("%1:%2:%3")
+        .arg(exchange.toLower(), market.toLower(), col.symbol.toUpper());
+}
+
+QString MainWindow::chatTitleForColumn(const DomColumn &col) const
+{
+    const QString key = chatKeyForColumn(col);
+    const QStringList parts = key.split(QLatin1Char(':'), Qt::SkipEmptyParts);
+    const QString exchange = parts.isEmpty() ? QStringLiteral("UNKNOWN") : parts.at(0).toUpper();
+    return QStringLiteral("%1: %2 CHAT").arg(exchange, col.symbol.toUpper());
+}
+
+void MainWindow::requestInstalledMods()
+{
+    if (m_modsRequestInFlight) {
+        return;
+    }
+    if (m_authToken.trimmed().isEmpty()) {
+        if (!m_installedMods.isEmpty()) {
+            m_installedMods.clear();
+            updateChatButtons();
+        }
+        return;
+    }
+    QString base = m_authBaseUrl.trimmed();
+    if (base.isEmpty()) {
+        base = QStringLiteral("https://api.fusionterminal.xyz");
+    }
+    if (base.endsWith('/')) {
+        base.chop(1);
+    }
+
+    QNetworkRequest request(QUrl(base + QStringLiteral("/mods")));
+    request.setRawHeader("Authorization", QByteArray("Bearer ") + m_authToken.toUtf8());
+    m_modsRequestInFlight = true;
+    QNetworkReply *reply = m_modsFetcher.get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        m_modsRequestInFlight = false;
+        const QByteArray raw = reply->readAll();
+        reply->deleteLater();
+
+        if (reply->error() != QNetworkReply::NoError) {
+            if (!m_installedMods.isEmpty()) {
+                m_installedMods.clear();
+                updateChatButtons();
+            }
+            return;
+        }
+
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isArray()) {
+            return;
+        }
+        QStringList installed;
+        const QJsonArray arr = doc.array();
+        for (const QJsonValue &v : arr) {
+            if (!v.isObject()) {
+                continue;
+            }
+            const QJsonObject obj = v.toObject();
+            if (!obj.value(QStringLiteral("installed")).toBool()) {
+                continue;
+            }
+            const QString id = obj.value(QStringLiteral("id")).toString();
+            if (!id.isEmpty()) {
+                installed.push_back(id);
+            }
+        }
+        updateInstalledMods(installed);
+    });
+}
+
+void MainWindow::updateInstalledMods(const QStringList &installedMods)
+{
+    QSet<QString> next = QSet<QString>(installedMods.begin(), installedMods.end());
+    if (next == m_installedMods) {
+        return;
+    }
+    m_installedMods = std::move(next);
+    updateChatButtons();
+}
+
+bool MainWindow::isModInstalled(const QString &modId) const
+{
+    return m_installedMods.contains(modId);
+}
+
+bool MainWindow::isChatModAvailable() const
+{
+    return !m_authToken.isEmpty() && isModInstalled(QStringLiteral("chat-ladder"));
+}
+
+void MainWindow::updateChatButtons()
+{
+    const bool enabled = isChatModAvailable();
+    for (auto &tab : m_tabs) {
+        for (auto &col : tab.columnsData) {
+            if (col.chatButton) {
+                col.chatButton->setVisible(enabled);
+                col.chatButton->setEnabled(enabled);
+            }
+        }
+    }
 }
 
 void MainWindow::openSettingsWindow()
@@ -7229,6 +8020,7 @@ void MainWindow::updateAuthNavUi()
             m_authBadge->show();
         }
     }
+    updateChatButtons();
 }
 
 void MainWindow::openAuthWindow()
@@ -7622,6 +8414,7 @@ void MainWindow::openAuthWindow()
         m_authUser = user;
         saveUserSettings();
         updateAuthNavUi();
+        requestInstalledMods();
     };
 
     connect(close, &QPushButton::clicked, dlg, &QDialog::close);
@@ -8399,6 +9192,92 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
         }
     }
 
+    if (event && (event->type() == QEvent::UngrabMouse || event->type() == QEvent::WindowDeactivate)) {
+        if (m_domDragGrabber || m_draggingDomContainer || m_domDragActive || m_pendingTickerLabel) {
+            if (QApplication::mouseButtons().testFlag(Qt::LeftButton)) {
+                return QMainWindow::eventFilter(obj, event);
+            }
+            abortDomDrag();
+        }
+    }
+
+    if (event) {
+        const QEvent::Type type = event->type();
+        const bool isMouseEvent = (type == QEvent::MouseMove || type == QEvent::MouseButtonPress
+                                   || type == QEvent::MouseButtonRelease
+                                   || type == QEvent::MouseButtonDblClick
+                                   || type == QEvent::Wheel);
+        if (isMouseEvent) {
+            QWidget *eventWidget = qobject_cast<QWidget *>(obj);
+            if (eventWidget) {
+                QPoint globalPos;
+                if (type == QEvent::Wheel) {
+                    auto *we = static_cast<QWheelEvent *>(event);
+                    globalPos = we->globalPosition().toPoint();
+                } else {
+                    auto *me = static_cast<QMouseEvent *>(event);
+                    globalPos = me->globalPosition().toPoint();
+                }
+                const auto insideFloating = [&](QWidget *floating, QWidget *source) {
+                    if (!floating || !floating->isVisible()) {
+                        return false;
+                    }
+                    if (source && (source == floating || floating->isAncestorOf(source))) {
+                        return false;
+                    }
+                    const QRect rect = floating->frameGeometry();
+                    return rect.contains(globalPos);
+                };
+                QWidget *hoverTop = QApplication::topLevelAt(globalPos);
+                bool hoverIsFloating = false;
+                if (hoverTop) {
+                    for (auto &tab : m_tabs) {
+                        for (auto &col : tab.columnsData) {
+                            if (col.floatingWindow && hoverTop == col.floatingWindow) {
+                                hoverIsFloating = true;
+                            }
+                            if (col.chatWindow && !col.chatWindow->isDocked()
+                                && hoverTop == col.chatWindow) {
+                                hoverIsFloating = true;
+                            }
+                        }
+                    }
+                }
+                bool sourceIsFloating = false;
+                for (auto &tab : m_tabs) {
+                    for (auto &col : tab.columnsData) {
+                        if (!sourceIsFloating && col.floatingWindow
+                            && (eventWidget == col.floatingWindow
+                                || col.floatingWindow->isAncestorOf(eventWidget))) {
+                            sourceIsFloating = true;
+                        }
+                        if (!sourceIsFloating && col.chatWindow && !col.chatWindow->isDocked()
+                            && (eventWidget == col.chatWindow
+                                || col.chatWindow->isAncestorOf(eventWidget))) {
+                            sourceIsFloating = true;
+                        }
+                    }
+                }
+                if (!sourceIsFloating && hoverIsFloating) {
+                    return true;
+                }
+                if (!sourceIsFloating) {
+                    for (auto &tab : m_tabs) {
+                        for (auto &col : tab.columnsData) {
+                            if (insideFloating(col.floatingWindow, eventWidget)) {
+                                return true;
+                            }
+                            if (col.chatWindow && !col.chatWindow->isDocked()
+                                && insideFloating(col.chatWindow, eventWidget)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (obj == m_settingsSearchEdit && event && event->type() == QEvent::KeyPress) {
         auto *ke = static_cast<QKeyEvent *>(event);
         if (ke->key() == Qt::Key_Escape) {
@@ -8761,10 +9640,24 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
         if (event->type() == QEvent::MouseButtonPress) {
             auto *me = static_cast<QMouseEvent *>(event);
             if (me->button() == Qt::LeftButton && container) {
+                WorkspaceTab *tab = nullptr;
+                DomColumn *col = nullptr;
+                QSplitter *parentSplitter = nullptr;
+                int idx = -1;
+                locateColumnEx(container, tab, col, parentSplitter, idx);
+                if (col && col->floatingWindow) {
+                    col->floatingWindow->raise();
+                    col->floatingWindow->activateWindow();
+                }
+                if (frame) {
+                    m_domDragGrabber = frame;
+                    frame->grabMouse();
+                }
                 m_draggingDomContainer = container;
                 m_domDragStartGlobal = me->globalPos();
                 m_domDragStartWindowOffset = me->globalPos() - container->mapToGlobal(QPoint(0, 0));
-                m_domDragActive = false;
+                locateColumnEx(m_draggingDomContainer, tab, col, parentSplitter, idx);
+                m_domDragActive = (col && col->isFloating);
                 return true;
             }
         } else if (event->type() == QEvent::MouseMove) {
@@ -8772,8 +9665,9 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
                 auto *me = static_cast<QMouseEvent *>(event);
                 WorkspaceTab *tab = nullptr;
                 DomColumn *col = nullptr;
+                QSplitter *parentSplitter = nullptr;
                 int idx = -1;
-                locateColumn(m_draggingDomContainer, tab, col, idx);
+                locateColumnEx(m_draggingDomContainer, tab, col, parentSplitter, idx);
                 const int dist = (me->globalPos() - m_domDragStartGlobal).manhattanLength();
                 if (dist > 6 && tab && col && !col->isFloating && (me->buttons() & Qt::LeftButton)) {
                     floatDomColumn(*tab, *col, idx, me->globalPos());
@@ -8781,12 +9675,15 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
                 }
                 if (m_domDragActive && col && col->floatingWindow) {
                     col->floatingWindow->move(me->globalPos() - m_domDragStartWindowOffset);
+                    col->floatingWindow->raise();
+                    updateDockOverlay(me->globalPos(), col->container);
                 }
                 return true;
             }
         } else if (event->type() == QEvent::MouseButtonRelease) {
-            m_draggingDomContainer = nullptr;
-            m_domDragActive = false;
+            if (m_draggingDomContainer) {
+                finishDomDrag();
+            }
             return true;
         } else if (event->type() == QEvent::MouseButtonDblClick) {
             auto *me = static_cast<QMouseEvent *>(event);
@@ -8858,9 +9755,52 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
     // Handle close of floating DOM window: dock it back.
     for (auto &tab : m_tabs) {
         for (auto &col : tab.columnsData) {
-            if (col.floatingWindow == obj && event->type() == QEvent::Close) {
-                dockDomColumn(tab, col);
-                return true;
+            if (col.floatingWindow == obj) {
+                if (event->type() == QEvent::MouseMove) {
+                    auto *me = static_cast<QMouseEvent *>(event);
+                    if (m_domDragActive && m_draggingDomContainer == col.container
+                        && (me->buttons() & Qt::LeftButton)) {
+                        col.floatingWindow->move(me->globalPos() - m_domDragStartWindowOffset);
+                        col.floatingWindow->raise();
+                        updateDockOverlay(me->globalPos(), col.container);
+                        return true;
+                    }
+                    if (!m_domDragActive) {
+                        const Qt::Edges edges =
+                            resizeEdgesForPos(col.floatingWindow, me->globalPos(), m_resizeBorderWidth);
+                        const Qt::CursorShape shape = cursorForEdges(edges);
+                        if (col.floatingWindow->cursor().shape() != shape) {
+                            col.floatingWindow->setCursor(shape);
+                        }
+                    }
+                } else if (event->type() == QEvent::Leave) {
+                    col.floatingWindow->unsetCursor();
+                } else if (event->type() == QEvent::MouseButtonPress) {
+                    auto *me = static_cast<QMouseEvent *>(event);
+                    if (me->button() == Qt::LeftButton && !m_domDragActive) {
+                        if (QWindow *w = col.floatingWindow->windowHandle()) {
+                            const Qt::Edges edges =
+                                resizeEdgesForPos(col.floatingWindow, me->globalPos(), m_resizeBorderWidth);
+                            if (edges != Qt::Edges()) {
+                                w->startSystemResize(edges);
+                                return true;
+                            }
+                        }
+                    }
+                } else if (event->type() == QEvent::MouseButtonRelease) {
+                    if (m_domDragActive && m_draggingDomContainer == col.container) {
+                        finishDomDrag();
+                        return true;
+                    }
+                }
+                if (event->type() == QEvent::Enter || event->type() == QEvent::MouseButtonPress) {
+                    col.floatingWindow->raise();
+                    col.floatingWindow->activateWindow();
+                }
+                if (event->type() == QEvent::Close) {
+                    dockDomColumn(tab, col);
+                    return true;
+                }
             }
         }
     }
@@ -8903,26 +9843,124 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
         obj == m_topBar || obj == m_workspaceTabs || obj == m_addTabButton
         || obj == m_timeLabel;
 
-    // Hover/click on ticker label to open symbol picker.
+    // Hover/click on ticker label to open symbol picker or drag the column.
     for (auto &tab : m_tabs) {
         for (auto &col : tab.columnsData) {
-            if (obj == col.tickerLabel && event->type() == QEvent::Enter) {
+            if (obj != col.tickerLabel) {
+                continue;
+            }
+            if (event->type() == QEvent::Enter) {
                 if (col.tickerLabel) {
                     applyTickerLabelStyle(col.tickerLabel, col.accountColor, true);
                 }
                 return true;
             }
-            if (obj == col.tickerLabel && event->type() == QEvent::Leave) {
+            if (event->type() == QEvent::Leave) {
                 if (col.tickerLabel) {
                     applyTickerLabelStyle(col.tickerLabel, col.accountColor, false);
                 }
                 return true;
             }
-            if (obj == col.tickerLabel && event->type() == QEvent::MouseButtonPress) {
+            if (event->type() == QEvent::MouseButtonPress) {
                 auto *me = static_cast<QMouseEvent *>(event);
-                if (me->button() == Qt::LeftButton) {
-                    retargetDomColumn(col, QString());
+                if (me->button() == Qt::LeftButton && col.container) {
+                    if (col.floatingWindow) {
+                        col.floatingWindow->raise();
+                        col.floatingWindow->activateWindow();
+                    }
+                    if (col.tickerLabel) {
+                        m_domDragGrabber = col.tickerLabel;
+                        col.tickerLabel->grabMouse();
+                    }
+                    m_pendingTickerLabel = col.tickerLabel;
+                    m_pendingTickerContainer = col.container;
+                    m_pendingTickerPressGlobal = me->globalPos();
+                    m_pendingTickerDrag = false;
+                    m_draggingDomContainer = col.container;
+                    m_domDragStartGlobal = me->globalPos();
+                    m_domDragStartWindowOffset =
+                        me->globalPos() - col.container->mapToGlobal(QPoint(0, 0));
+                    m_domDragActive = false;
                     return true;
+                }
+            }
+            if (event->type() == QEvent::MouseMove) {
+                if (m_pendingTickerLabel == col.tickerLabel && m_draggingDomContainer) {
+                    auto *me = static_cast<QMouseEvent *>(event);
+                    WorkspaceTab *dragTab = nullptr;
+                    DomColumn *dragCol = nullptr;
+                    QSplitter *dragSplitter = nullptr;
+                    int dragIndex = -1;
+                    locateColumnEx(m_draggingDomContainer, dragTab, dragCol, dragSplitter, dragIndex);
+                    const int dist =
+                        (me->globalPos() - m_pendingTickerPressGlobal).manhattanLength();
+                    if (!m_pendingTickerDrag && (me->buttons() & Qt::LeftButton) && dist > 6) {
+                        m_pendingTickerDrag = true;
+                        if (dragTab && dragCol && !dragCol->isFloating) {
+                            floatDomColumn(*dragTab, *dragCol, dragIndex, me->globalPos());
+                        }
+                        m_domDragActive = true;
+                    }
+                    if (m_domDragActive && dragCol && dragCol->floatingWindow) {
+                        dragCol->floatingWindow->move(me->globalPos() - m_domDragStartWindowOffset);
+                        dragCol->floatingWindow->raise();
+                        updateDockOverlay(me->globalPos(), dragCol->container);
+                    }
+                    return true;
+                }
+            }
+            if (event->type() == QEvent::MouseButtonRelease) {
+                if (m_pendingTickerLabel == col.tickerLabel) {
+                    if (m_pendingTickerDrag) {
+                        finishDomDrag();
+                    } else {
+                        retargetDomColumn(col, QString());
+                        abortDomDrag();
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Allow resizing floating DOMs by dragging their edges even when the DOM container
+    // receives the mouse event.
+    if (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonPress
+        || event->type() == QEvent::Leave) {
+        QWidget *column = columnContainerForObject(obj);
+        if (column) {
+            WorkspaceTab *tab = nullptr;
+            DomColumn *col = nullptr;
+            int idx = -1;
+            if (locateColumn(column, tab, col, idx) && col && col->floatingWindow) {
+                if (event->type() == QEvent::MouseMove) {
+                    auto *me = static_cast<QMouseEvent *>(event);
+                    if (!m_domDragActive) {
+                        const Qt::Edges edges =
+                            resizeEdgesForPos(col->floatingWindow,
+                                              me->globalPosition().toPoint(),
+                                              m_resizeBorderWidth);
+                        const Qt::CursorShape shape = cursorForEdges(edges);
+                        if (column->cursor().shape() != shape) {
+                            column->setCursor(shape);
+                        }
+                    }
+                } else if (event->type() == QEvent::Leave) {
+                    column->unsetCursor();
+                } else if (event->type() == QEvent::MouseButtonPress) {
+                    auto *me = static_cast<QMouseEvent *>(event);
+                    if (me->button() == Qt::LeftButton) {
+                        const Qt::Edges edges =
+                            resizeEdgesForPos(col->floatingWindow,
+                                              me->globalPosition().toPoint(),
+                                              m_resizeBorderWidth);
+                        if (edges != Qt::Edges()) {
+                            if (QWindow *w = col->floatingWindow->windowHandle()) {
+                                w->startSystemResize(edges);
+                                return true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -12976,6 +14014,10 @@ void MainWindow::applySymbolToColumn(DomColumn &col,
     if (col.client) {
         restartColumnClient(col);
     }
+    if (col.chatWindow) {
+        col.chatWindow->setAuthContext(m_authBaseUrl, m_authToken, m_authUser);
+        col.chatWindow->setChatKey(chatKeyForColumn(col), chatTitleForColumn(col));
+    }
     syncWatchedSymbols();
 }
 
@@ -13244,6 +14286,22 @@ void MainWindow::applyHeaderAccent(DomColumn &col)
             col.readOnlyLabel->setToolTip(tr("Binance работает только в режиме read-only (торговля отключена)."));
         }
 
+    }
+    if (col.chatButton) {
+        QIcon icon = loadIconTinted(QStringLiteral("message-chatbot"), fg, QSize(12, 12));
+        if (icon.isNull()) {
+            QPixmap pix(12, 12);
+            pix.fill(Qt::transparent);
+            QPainter p(&pix);
+            p.setRenderHint(QPainter::Antialiasing, false);
+            QPen pen(fg);
+            pen.setCosmetic(true);
+            p.setPen(pen);
+            p.drawRect(QRect(1, 1, 10, 10));
+            icon = QIcon(pix);
+        }
+        col.chatButton->setIcon(icon);
+        col.chatButton->setToolTip(tr("Chat"));
     }
     if (col.closeButton) {
         col.closeButton->setIcon(loadIconTinted(QStringLiteral("x"), fg, QSize(12, 12)));

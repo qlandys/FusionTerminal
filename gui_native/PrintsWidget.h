@@ -123,6 +123,7 @@ private:
     QHash<qint64, int> m_tickToRow;
     int m_rowHeight = 20;
     QHash<QString, double> m_spawnProgress;
+    bool m_disableAnimations = false;
     QBasicTimer m_animTimer;
     int m_hoverRow = -1;
     double m_hoverPrice = 0.0;
@@ -140,7 +141,8 @@ private:
     bool m_quickReady = false;
     int m_maxVisiblePrints = 64;
     QElapsedTimer m_quickUpdateThrottle;
-    static constexpr qint64 kMinQuickUpdateIntervalNs = 6000000; // ~160 Hz
+    static constexpr qint64 kMinQuickUpdateIntervalNs = 10000000; // ~100 Hz to reduce SG churn
+    bool m_useGpuPrints = false;
     PrintCirclesModel m_circlesModel;
     PrintOrdersModel m_ordersModel;
     PrintClustersModel m_clustersModel;
@@ -174,4 +176,21 @@ private:
     QVector<double> m_clusterBucketTotals;
     QVector<qint64> m_clusterBucketStartMs;
     QTimer m_clusterBoundaryTimer;
+
+    struct ClusterAgg {
+        double total = 0.0;
+        double delta = 0.0;
+    };
+    qint64 m_clusterCurrentBucket = 0;
+    int m_clusterAggBucketMs = 0;
+    int m_clusterAggBucketCount = 0;
+    QVector<QHash<qint64, ClusterAgg>> m_clusterAggByCol;
+    QVector<double> m_clusterAggTotalsByCol;
+    quint64 m_clusterMappingRevision = 0;
+    quint64 m_clusterAggBuiltRevision = 0;
+
+    void resetClusterAgg();
+    void rebuildClusterAggFromTrades(qint64 nowMs);
+    void advanceClusterBuckets(qint64 nowMs);
+    void ingestClusterTrade(const ClusterTrade &t, qint64 nowMs);
 };

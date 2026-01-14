@@ -9443,6 +9443,7 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
         if (!ctx->privateSocket.isValid()) {
             return;
         }
+        ctx->lastPrivatePingSentMs = QDateTime::currentMSecsSinceEpoch();
         if (ctx->profile == ConnectionStore::Profile::MexcFutures) {
             ctx->privateSocket.sendTextMessage(QStringLiteral("{\"method\":\"ping\"}"));
         } else {
@@ -9617,6 +9618,13 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
                       self->scheduleReconnect(*ctx);
                   });
     self->connect(&ctx->privateSocket,
+                  &QWebSocket::pong,
+                  self,
+                  [self, ctx](quint64 elapsedMs, const QByteArray &) {
+                      ctx->lastPrivatePingMs = static_cast<int>(elapsedMs);
+                      emit self->privatePingUpdated(ctx->accountName, ctx->lastPrivatePingMs);
+                  });
+    self->connect(&ctx->privateSocket,
                   &QWebSocket::textMessageReceived,
                   self,
                   [self, ctx](const QString &message) {
@@ -9631,6 +9639,12 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
                       if (profile == ConnectionStore::Profile::MexcFutures) {
                           const QString channel = obj.value(QStringLiteral("channel")).toString();
                           if (channel.compare(QStringLiteral("pong"), Qt::CaseInsensitive) == 0) {
+                              if (ctx->lastPrivatePingSentMs > 0) {
+                                  const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+                                  const qint64 delta = std::max<qint64>(0, nowMs - ctx->lastPrivatePingSentMs);
+                                  ctx->lastPrivatePingMs = static_cast<int>(delta);
+                                  emit self->privatePingUpdated(ctx->accountName, ctx->lastPrivatePingMs);
+                              }
                               return;
                           }
                           if (channel == QStringLiteral("rs.login")) {

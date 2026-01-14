@@ -38,6 +38,8 @@ if (Qt6_FOUND)
 
     add_executable(FusionTerminal
         gui_native/main.cpp
+        gui_native/AnimatedSplitter.cpp
+        gui_native/AnimatedSplitter.h
         gui_native/MainWindow.cpp
         gui_native/MainWindow.h
         gui_native/LadderClient.cpp
@@ -72,6 +74,16 @@ if (Qt6_FOUND)
         gui_native/DomWidget.h
         gui_native/DomLevelsModel.cpp
         gui_native/DomLevelsModel.h
+        gui_native/GpuDomItem.cpp
+        gui_native/GpuDomItem.h
+        gui_native/GpuGridItem.cpp
+        gui_native/GpuGridItem.h
+        gui_native/GpuTrailItem.cpp
+        gui_native/GpuTrailItem.h
+        gui_native/GpuCirclesItem.cpp
+        gui_native/GpuCirclesItem.h
+        gui_native/GpuMarkerItem.cpp
+        gui_native/GpuMarkerItem.h
         gui_native/SymbolPickerDialog.cpp
         gui_native/SymbolPickerDialog.h
     )

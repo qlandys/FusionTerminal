@@ -71,6 +71,8 @@ public:
     QHash<int, QByteArray> roleNames() const override;
 
     void setRows(QVector<Row> rows);
+    const Row &rowAt(int index) const;
+    void updateRows(const QVector<int> &indices, const QVector<Row> &rows);
 
 private:
     QVector<Row> m_rows;

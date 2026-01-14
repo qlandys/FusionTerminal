@@ -30,6 +30,7 @@ private:
     PrintsWidget *m_prints = nullptr;
     QQuickWidget *m_quickWidget = nullptr;
     bool m_quickReady = false;
+    bool m_useGpuClusters = false;
     int m_rowCount = 0;
     int m_rowHeight = 20;
     int m_infoAreaHeight = 26;

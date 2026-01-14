@@ -6,9 +6,13 @@
 #include <QVariant>
 #include <QElapsedTimer>
 #include <QRect>
+#include <QSet>
+#include <QHash>
+#include <QPointer>
 #include "DomTypes.h"
 #include "TradeTypes.h"
 #include "DomLevelsModel.h"
+#include "GpuDomItem.h"
 
 class QMouseEvent;
 class QEvent;
@@ -84,6 +88,7 @@ public:
     Q_INVOKABLE void handleRowClickIndex(int row, int button);
     Q_INVOKABLE void handleRowHover(int row);
     Q_INVOKABLE void handleExitClick();
+    void notifyBucketTicksUpdated(const QVector<qint64> &bucketTicks);
 
 signals:
     void rowClicked(Qt::MouseButton button, int row, double price, double bidQty, double askQty);
@@ -121,14 +126,48 @@ private:
     QString m_actionOverlayText;
     QQuickWidget *m_quickWidget = nullptr;
     bool m_quickReady = false;
+    bool m_quickAllowed = true;
+    bool m_useGpuDom = false;
+    QPointer<GpuDomItem> m_gpuDomItem;
+    bool m_disableIncremental = false;
     QWidget *m_actionOverlayWidget = nullptr;
     QLabel *m_actionOverlayLabel = nullptr;
     QWidget *m_actionOverlayParent = nullptr;
     QElapsedTimer m_snapshotThrottle;
-    static constexpr qint64 kMinSnapshotIntervalNs = 8000000; // ~120 Гц
+    static constexpr qint64 kMinSnapshotIntervalNs = 8000000; // ~120 Hz
     DomLevelsModel m_levelsModel;
     int m_cachedTotalHeight = -1;
     int m_cachedPriceColumnWidth = -1;
+    double m_cachedLevelTickSize = 0.0;
+    qint64 m_cachedLayoutMinTick = 0;
+    qint64 m_cachedLayoutMaxTick = 0;
+    qint64 m_cachedLayoutCompression = 1;
+    int m_cachedLayoutRowsCount = 0;
+    bool m_cachedLayoutValid = false;
+    int m_cachedWidthForPrice = -1;
+    QString m_cachedFontKeyForPrice;
+    double m_cachedTickForPrice = 0.0;
+    QSet<qint64> m_dirtyBucketTicks;
+    bool m_forceFullRecalc = false;
+    bool m_quickSnapshotScheduled = false;
+
+    int m_orderHighlightCount = 0;
+    bool m_qmlHasOrderHighlights = false;
+
+    struct MarkerAgg {
+        double notional = 0.0;
+        bool buy = true;
+        qint64 createdMs = 0;
+    };
+    QHash<qint64, MarkerAgg> m_cachedMarkersByTick;
+    int m_cachedMarkersOrdersHash = 0;
+    qint64 m_cachedMarkersCompression = 1;
+    double m_cachedMarkersTickSize = 0.0;
+
+    QSet<qint64> m_cachedHighlightTicks;
+    int m_cachedHighlightHash = 0;
+    qint64 m_cachedHighlightCompression = 1;
+    double m_cachedHighlightTickSize = 0.0;
 
     void updateHoverInfo(int row);
     double cumulativeNotionalForRow(int row) const;
@@ -138,6 +177,8 @@ private:
     void updateQuickOverlayProperties();
     void applyPendingSnapshot();
     void updateQuickSnapshot();
+    void scheduleQuickSnapshotUpdate();
+    void resolveGpuDomItem();
     void ensureActionOverlayParent();
     void updateActionOverlayGeometry();
 };

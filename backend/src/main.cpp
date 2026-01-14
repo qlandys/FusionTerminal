@@ -46,6 +46,175 @@ namespace
     using namespace std::chrono_literals;
     using json = nlohmann::json;
 
+    class StdoutBatchWriter
+    {
+    public:
+        StdoutBatchWriter()
+        {
+            const char* ms = std::getenv("BACKEND_STDOUT_FLUSH_MS");
+            if (ms && *ms)
+            {
+                try
+                {
+                    const int v = std::max(0, std::stoi(ms));
+                    flushInterval = std::chrono::milliseconds(std::clamp(v, 0, 250));
+                }
+                catch (...)
+                {
+                }
+            }
+            const char* bytes = std::getenv("BACKEND_STDOUT_FLUSH_BYTES");
+            if (bytes && *bytes)
+            {
+                try
+                {
+                    const int v = std::max(0, std::stoi(bytes));
+                    flushBytes = static_cast<std::size_t>(std::clamp(v, 1024, 512 * 1024));
+                }
+                catch (...)
+                {
+                }
+            }
+        }
+
+        void writeLine(const std::string& line)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(mu);
+            buf.append(line);
+            buf.push_back('\n');
+            if (flushInterval.count() == 0 || buf.size() >= flushBytes || now - lastFlush >= flushInterval)
+            {
+                flushLocked();
+                lastFlush = now;
+            }
+        }
+
+        void flush()
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            flushLocked();
+            lastFlush = std::chrono::steady_clock::now();
+        }
+
+    private:
+        void flushLocked()
+        {
+            if (buf.empty())
+            {
+                return;
+            }
+            std::cout.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+            std::cout.flush();
+            buf.clear();
+        }
+
+        std::mutex mu;
+        std::string buf;
+        std::chrono::milliseconds flushInterval{8};
+        std::size_t flushBytes{16 * 1024};
+        std::chrono::steady_clock::time_point lastFlush{std::chrono::steady_clock::now()};
+    };
+
+    static StdoutBatchWriter& stdoutWriter()
+    {
+        static StdoutBatchWriter w;
+        return w;
+    }
+
+    class TradeBatcher
+    {
+    public:
+        TradeBatcher()
+        {
+            enabled = !std::getenv("BACKEND_TRADE_BATCH_DISABLE");
+            const char* ms = std::getenv("BACKEND_TRADE_BATCH_MS");
+            if (ms && *ms)
+            {
+                try
+                {
+                    const int v = std::max(0, std::stoi(ms));
+                    flushInterval = std::chrono::milliseconds(std::clamp(v, 0, 250));
+                }
+                catch (...)
+                {
+                }
+            }
+            const char* max = std::getenv("BACKEND_TRADE_BATCH_MAX");
+            if (max && *max)
+            {
+                try
+                {
+                    const int v = std::max(1, std::stoi(max));
+                    flushMax = static_cast<std::size_t>(std::clamp(v, 1, 2048));
+                }
+                catch (...)
+                {
+                }
+            }
+        }
+
+        void add(const std::string& symbol, json&& trade)
+        {
+            if (!enabled)
+            {
+                // Fallback: emit one-per-line.
+                stdoutWriter().writeLine(trade.dump());
+                return;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(mu);
+            if (this->symbol.empty())
+            {
+                this->symbol = symbol;
+            }
+            // Keep payload compact: symbol on top-level.
+            trade.erase("symbol");
+            batch.push_back(std::move(trade));
+            if (flushInterval.count() == 0 || batch.size() >= flushMax || now - lastFlush >= flushInterval)
+            {
+                flushLocked();
+                lastFlush = now;
+            }
+        }
+
+        void flush()
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            flushLocked();
+            lastFlush = std::chrono::steady_clock::now();
+        }
+
+    private:
+        void flushLocked()
+        {
+            if (batch.empty())
+            {
+                return;
+            }
+            json out;
+            out["type"] = "trades";
+            out["symbol"] = symbol;
+            out["events"] = std::move(batch);
+            batch = json::array();
+            stdoutWriter().writeLine(out.dump());
+        }
+
+        std::mutex mu;
+        bool enabled{true};
+        std::string symbol;
+        json batch = json::array();
+        std::chrono::milliseconds flushInterval{16};
+        std::size_t flushMax{64};
+        std::chrono::steady_clock::time_point lastFlush{std::chrono::steady_clock::now()};
+    };
+
+    static TradeBatcher& tradeBatcher()
+    {
+        static TradeBatcher b;
+        return b;
+    }
+
     struct Config
     {
         std::string symbol{"BIOUSDT"};
@@ -1170,7 +1339,7 @@ namespace
                     {
                         out["timestamp"] = ts;
                     }
-                    std::cout << out.dump() << '\n' << std::flush;
+                    stdoutWriter().writeLine(out.dump());
                     if (tradeId > 0)
                     {
                         lastTradeId = std::max(lastTradeId, tradeId);
@@ -1483,7 +1652,7 @@ namespace
                 {
                     out["timestamp"] = ts;
                 }
-                std::cout << out.dump() << '\n' << std::flush;
+                stdoutWriter().writeLine(out.dump());
                 if (tradeId > 0)
                 {
                     lastTradeId = std::max(lastTradeId, tradeId);
@@ -2278,6 +2447,16 @@ namespace
                 {
                     clearManualCenterAndEmit();
                 }
+                else if (cmd == "force_full")
+                {
+                    if (!g_bookReady.load()) continue;
+                    std::lock_guard<std::mutex> lock(g_bookMutex);
+                    if (!g_bookPtr) continue;
+                    g_lastLadderRows.clear();
+                    g_haveLastLadder = false;
+                    g_forceFullLadder = true;
+                    emitCurrentLadderLocked();
+                }
             }
             catch (const std::exception& ex)
             {
@@ -2318,13 +2497,19 @@ namespace
             json rows = json::array();
             for (const auto &row : rowsSparse)
             {
-                rows.push_back({{"tick", row.tick},
-                                {"bid", row.bidQuantity},
-                                {"ask", row.askQuantity}});
+                json r;
+                r["tick"] = row.tick;
+                if (row.bidQuantity > 0.0) {
+                    r["bid"] = row.bidQuantity;
+                }
+                if (row.askQuantity > 0.0) {
+                    r["ask"] = row.askQuantity;
+                }
+                rows.push_back(std::move(r));
             }
             out["rows"] = std::move(rows);
             enrich(out);
-            std::cout << out.dump() << '\n' << std::flush;
+            stdoutWriter().writeLine(out.dump());
             g_haveLastLadder = true;
             g_forceFullLadder = false;
         }
@@ -2344,12 +2529,20 @@ namespace
                 const auto &prev = g_lastLadderRows[static_cast<std::size_t>(j)];
                 if (cur.tick == prev.tick)
                 {
-                    if (std::abs(prev.bidQuantity - cur.bidQuantity) > 1e-9
-                        || std::abs(prev.askQuantity - cur.askQuantity) > 1e-9)
+                    const bool bidChanged = (std::abs(prev.bidQuantity - cur.bidQuantity) > 1e-9);
+                    const bool askChanged = (std::abs(prev.askQuantity - cur.askQuantity) > 1e-9);
+                    if (bidChanged || askChanged)
                     {
-                        updates.push_back({{"tick", cur.tick},
-                                           {"bid", cur.bidQuantity},
-                                           {"ask", cur.askQuantity}});
+                        json u;
+                        u["tick"] = cur.tick;
+                        if (bidChanged) {
+                            // Include zeros: we must be able to clear one side while keeping the other.
+                            u["bid"] = cur.bidQuantity;
+                        }
+                        if (askChanged) {
+                            u["ask"] = cur.askQuantity;
+                        }
+                        updates.push_back(std::move(u));
                     }
                     ++i;
                     ++j;
@@ -2357,9 +2550,15 @@ namespace
                 else if (cur.tick > prev.tick)
                 {
                     // New tick appears in current window.
-                    updates.push_back({{"tick", cur.tick},
-                                       {"bid", cur.bidQuantity},
-                                       {"ask", cur.askQuantity}});
+                    json u;
+                    u["tick"] = cur.tick;
+                    if (cur.bidQuantity > 0.0) {
+                        u["bid"] = cur.bidQuantity;
+                    }
+                    if (cur.askQuantity > 0.0) {
+                        u["ask"] = cur.askQuantity;
+                    }
+                    updates.push_back(std::move(u));
                     ++i;
                 }
                 else
@@ -2373,9 +2572,15 @@ namespace
             for (; i < currCount; ++i)
             {
                 const auto &cur = rowsSparse[static_cast<std::size_t>(i)];
-                updates.push_back({{"tick", cur.tick},
-                                   {"bid", cur.bidQuantity},
-                                   {"ask", cur.askQuantity}});
+                json u;
+                u["tick"] = cur.tick;
+                if (cur.bidQuantity > 0.0) {
+                    u["bid"] = cur.bidQuantity;
+                }
+                if (cur.askQuantity > 0.0) {
+                    u["ask"] = cur.askQuantity;
+                }
+                updates.push_back(std::move(u));
             }
             for (; j < prevCount; ++j)
             {
@@ -2391,7 +2596,7 @@ namespace
                 out["updates"] = std::move(updates);
                 out["removals"] = std::move(removals);
                 enrich(out);
-                std::cout << out.dump() << '\n' << std::flush;
+                stdoutWriter().writeLine(out.dump());
             }
         }
 
@@ -2584,7 +2789,7 @@ namespace
                             t["qty"] = d.quantity;
                             t["side"] = d.buy ? "buy" : "sell";
                             t["timestamp"] = d.time;
-                            std::cout << t.dump() << '\n' << std::flush;
+                            tradeBatcher().add(config.symbol, std::move(t));
                         }
                         continue;
                     }
@@ -2915,7 +3120,7 @@ namespace
                         const int sideCode = d.value("T", 1);
                         t["side"] = (sideCode == 2) ? "sell" : "buy";
                         t["timestamp"] = d.value("t", 0);
-                        std::cout << t.dump() << '\n' << std::flush;
+                        tradeBatcher().add(config.symbol, std::move(t));
                     }
                     continue;
                 }
@@ -3579,7 +3784,7 @@ bool runBinanceWebSocket(const Config &config, dom::OrderBook &book, bool future
                 t["qty"] = qty;
                 t["side"] = buy ? "buy" : "sell";
                 t["timestamp"] = ts;
-                std::cout << t.dump() << '\n' << std::flush;
+                tradeBatcher().add(config.symbol, std::move(t));
             }
         }
 
@@ -3844,16 +4049,22 @@ bool runUzxWebSocket(const Config& config, dom::OrderBook& book, double tickSize
         }
 
         auto processJson = [&](const std::string& text) {
+            static const bool debugUzx = []() {
+                const char* v = std::getenv("BACKEND_DEBUG_UZX");
+                return v && *v && std::string(v) != "0";
+            }();
             auto j = json::parse(text);
             if (j.contains("event") && j.contains("status"))
             {
                 const std::string event = j.value("event", std::string());
                 if (event == "sub" || event == "subscribe")
                 {
-                    std::cerr << "[backend] UZX ws subscribed: " << text << std::endl;
+                    if (debugUzx) {
+                        std::cerr << "[backend] UZX ws subscribed: " << text << std::endl;
+                    }
                 }
             }
-            if (text.find("fills") != std::string::npos)
+            if (debugUzx && text.find("fills") != std::string::npos)
             {
                 std::cerr << "[backend] UZX fills raw: " << text << std::endl;
             }
@@ -3895,7 +4106,7 @@ bool runUzxWebSocket(const Config& config, dom::OrderBook& book, double tickSize
                 t["side"] = (side == "sell") ? "sell" : "buy";
                 const long long ts = fill.value("ts", parentTs);
                 t["timestamp"] = ts;
-                std::cout << t.dump() << '\n' << std::flush;
+                tradeBatcher().add(config.symbol, std::move(t));
             };
             const std::string topType = j.value("type", std::string());
             if (isFillsType(topType)) {

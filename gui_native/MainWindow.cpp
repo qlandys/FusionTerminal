@@ -13,6 +13,7 @@
 #include "ThemeManager.h"
 #include "TradeManager.h"
 #include "SymbolPickerDialog.h"
+#include "AnimatedSplitter.h"
 #include <QApplication>
 #include <QCoreApplication>
 #include <QGuiApplication>
@@ -142,6 +143,7 @@ Qt::CursorShape cursorForEdges(Qt::Edges edges)
 #include <QPair>
 #include <QPainterPath>
 #include <QRandomGenerator>
+#include <QElapsedTimer>
 #include <QDesktopServices>
 #include <QTabWidget>
 #include <QQuickWidget>
@@ -354,6 +356,52 @@ constexpr qint64 kPendingMarkerTimeoutMs = 8000;
 constexpr int kMinBaseLadderLevels = 50;
 constexpr int kMaxBaseLadderLevels = 4000;
 constexpr int kMaxEffectiveLadderLevels = 20000;
+
+class UiStallMonitor final : public QObject {
+    Q_OBJECT
+public:
+    explicit UiStallMonitor(QObject *parent = nullptr)
+        : QObject(parent)
+    {
+        int thresholdMs = qEnvironmentVariableIntValue("FUSION_STALL_THRESHOLD_MS");
+        if (thresholdMs <= 0) {
+            thresholdMs = 40;
+        }
+        m_thresholdMs = std::clamp(thresholdMs, 5, 1000);
+        m_log = qEnvironmentVariableIntValue("FUSION_STALL_LOG") > 0;
+
+        m_timer.setTimerType(Qt::PreciseTimer);
+        m_timer.setInterval(8);
+        connect(&m_timer, &QTimer::timeout, this, &UiStallMonitor::tick);
+        m_elapsed.start();
+        m_lastMs = m_elapsed.elapsed();
+        m_timer.start();
+    }
+
+private slots:
+    void tick()
+    {
+        const qint64 now = m_elapsed.elapsed();
+        const qint64 dt = now - m_lastMs;
+        m_lastMs = now;
+        if (dt > m_thresholdMs) {
+            ++m_stallCount;
+            m_maxStallMs = std::max(m_maxStallMs, dt);
+            if (m_log) {
+                qWarning() << "[ui-stall]" << dt << "ms (max" << m_maxStallMs << "ms) count" << m_stallCount;
+            }
+        }
+    }
+
+private:
+    QTimer m_timer;
+    QElapsedTimer m_elapsed;
+    qint64 m_lastMs = 0;
+    int m_thresholdMs = 40;
+    bool m_log = false;
+    qint64 m_stallCount = 0;
+    qint64 m_maxStallMs = 0;
+};
 
 static QStringList toStringList(const QList<int> &sizes)
 {
@@ -1088,6 +1136,10 @@ static QString fusionLogFilePath()
 
 static void logToFile(const QString &msg)
 {
+    static const bool enabled = qEnvironmentVariableIntValue("FUSION_FILE_LOG") > 0;
+    if (!enabled) {
+        return;
+    }
     const QString path = fusionLogFilePath();
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) return;
@@ -1097,6 +1149,10 @@ static void logToFile(const QString &msg)
 
 static void appendSpamLogToFile(const QString &msg)
 {
+    static const bool enabled = qEnvironmentVariableIntValue("FUSION_FILE_LOG") > 0;
+    if (!enabled) {
+        return;
+    }
     const QString path = fusionLogFilePath();
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) return;
@@ -1232,6 +1288,10 @@ MainWindow::MainWindow(const QString &backendPath,
     , m_maxButton(nullptr)
     , m_closeButton(nullptr)
 {
+    if (qEnvironmentVariableIntValue("FUSION_STALL_MONITOR") > 0) {
+        new UiStallMonitor(this);
+    }
+
     // Default splitter ratios (treated as weights and scaled by QSplitter).
     m_savedClustersPrintsSplitterSizes = {110, 220};
     m_savedDomPrintsSplitterSizes = {200, 600};
@@ -1482,6 +1542,22 @@ MainWindow::MainWindow(const QString &backendPath,
                 this,
                 &MainWindow::handleLocalOrdersUpdated);
         connect(m_tradeManager,
+                &TradeManager::privatePingUpdated,
+                this,
+                [this](const QString &accountName, int ms) {
+                    const QString accountKey = normalizedAccountKey(accountName);
+                    for (auto &tab : m_tabs) {
+                        for (auto &col : tab.columnsData) {
+                            if (!accountKey.isEmpty()
+                                && normalizedAccountKey(col.accountName) != accountKey) {
+                                continue;
+                            }
+                            col.lastOrderPingMs = ms;
+                            updatePerfOverlay(col);
+                        }
+                    }
+                });
+        connect(m_tradeManager,
                 &TradeManager::lighterStopOrdersUpdated,
                 this,
                 [this](const QString &accountName,
@@ -1685,6 +1761,10 @@ void MainWindow::buildUi()
     m_timeTimer->start();
     updateTimeLabel();
 
+    if (!m_perfFpsTimer.isValid()) {
+        m_perfFpsTimer.start();
+    }
+
     // Window buttons style + TitleBar bottom border, ?????? ? VSCode.
     // ????? ?????? ???? ??????? ? ????????? ????? ?? ?????? ? ??????? ??????.
     setStyleSheet(
@@ -1711,6 +1791,10 @@ void MainWindow::buildUi()
         "QFrame#TitleBar {"
         "  background-color: #252526;"
         "  border-bottom: none;" /* ??????? ?????? ??????? ? TitleBar */
+        "}"
+        "QLabel#PerfOverlayLine {"
+        "  color: #9aa2b1;"
+        "  font-size: 10px;"
         "}"
         "QFrame#SideToolbar {"
         "  background-color: transparent;"
@@ -1797,25 +1881,6 @@ void MainWindow::buildUi()
         "}"
         "QFrame#DomColumnFrame[active=\"true\"] {"
         "  border: 2px solid #007acc;"
-        "}"
-        "QWidget#DomResizeHandle {"
-        "  background-color: #2b2b2b;"
-        "}"
-        "QWidget#DomResizeHandle:hover {"
-        "  background-color: #3a3a3a;"
-        "}"
-        "QWidget#DomColumnResizeHandle {"
-        "  background-color: #2b2b2b;"
-        "}"
-        "QWidget#DomColumnResizeHandle:hover {"
-        "  background-color: #3a3a3a;"
-        "}"
-        "QSplitter#DomPrintsSplitter::handle:horizontal {"
-        "  background: #323232;"
-        "  width: 2px;"
-        "}"
-        "QSplitter#DomPrintsSplitter::handle:horizontal:hover {"
-        "  background: #4f4f4f;"
         "}"
         "QScrollBar:vertical {"
         "  background: transparent;"
@@ -2247,6 +2312,49 @@ void MainWindow::buildUi()
     m_timeLabel->installEventFilter(this);
 
     return top;
+}
+
+void MainWindow::updatePerfOverlay(DomColumn &col)
+{
+    if (!col.perfOverlay) {
+        return;
+    }
+
+    auto setText = [](QLabel *label, const QString &text) {
+        if (!label) {
+            return;
+        }
+        if (label->text() != text) {
+            label->setText(text);
+        }
+    };
+
+    const QString pingText =
+        (col.lastPingMs >= 0) ? QStringLiteral("Ping: %1 ms").arg(col.lastPingMs)
+                              : QStringLiteral("Ping: -");
+    const QString ordersText =
+        (col.lastOrderPingMs >= 0) ? QStringLiteral("Orders: %1 ms").arg(col.lastOrderPingMs)
+                                   : QStringLiteral("Orders: -");
+    const QString fpsText =
+        (m_lastUiFps > 0.0) ? QStringLiteral("FPS: %1").arg(m_lastUiFps, 0, 'f', 1)
+                            : QStringLiteral("FPS: -");
+    const QString domText =
+        (col.lastFpsHz > 0.0) ? QStringLiteral("DOM Hz: %1").arg(col.lastFpsHz, 0, 'f', 1)
+                              : QStringLiteral("DOM Hz: -");
+
+    setText(col.perfPingLabel, pingText);
+    setText(col.perfOrderPingLabel, ordersText);
+    setText(col.perfFpsLabel, fpsText);
+    setText(col.perfDomHzLabel, domText);
+}
+
+void MainWindow::updateAllPerfOverlays()
+{
+    for (auto &tab : m_tabs) {
+        for (auto &col : tab.columnsData) {
+            updatePerfOverlay(col);
+        }
+    }
 }
 
 void MainWindow::toggleSettingsSearchDrawer(bool open, bool focusEdit)
@@ -3165,14 +3273,10 @@ MainWindow::WorkspaceTab MainWindow::createWorkspaceTab(const QVector<SavedColum
     columnsRow->setContentsMargins(0, 0, 0, 0);
     columnsRow->setSpacing(0);
 
-    auto *columnsSplitter = new QSplitter(Qt::Horizontal, columnsContainer);
+    auto *columnsSplitter = new AnimatedSplitter(Qt::Horizontal, columnsContainer);
     columnsSplitter->setObjectName(QStringLiteral("WorkspaceColumnsSplitter"));
     columnsSplitter->setChildrenCollapsible(false);
-    columnsSplitter->setHandleWidth(8);
-    columnsSplitter->setStyleSheet(QStringLiteral(
-        "QSplitter#WorkspaceColumnsSplitter::handle { margin: 0px -4px 0px -4px; padding: 0px; background-color: #444444; }"
-        "QSplitter#WorkspaceColumnsSplitter::handle:horizontal:hover { background-color: #5a5a5a; }"
-        "QSplitter#WorkspaceColumnsSplitter::handle:horizontal:pressed { background-color: #777777; }"));
+    columnsSplitter->setHandleWidth(2);
     columnsSplitter->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     columnsRow->addWidget(columnsSplitter, 1);
 
@@ -3404,24 +3508,11 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     columnRowLayout->setContentsMargins(0, 0, 0, 0);
     columnRowLayout->setSpacing(0);
 
-    auto *columnSplitter = new QSplitter(Qt::Horizontal, column);
-    columnSplitter->setObjectName(QStringLiteral("DomColumnInnerSplitter"));
-    columnSplitter->setChildrenCollapsible(false);
-    columnSplitter->setHandleWidth(3);
-    columnSplitter->setStyleSheet(QStringLiteral(
-        "QSplitter#DomColumnInnerSplitter::handle {"
-        "  background-color: #2b2b2b;"
-        "}"
-        "QSplitter#DomColumnInnerSplitter::handle:hover {"
-        "  background-color: #3a3a3a;"
-        "}"));
-    columnRowLayout->addWidget(columnSplitter);
-
-    auto *columnContent = new QWidget(columnSplitter);
+    auto *columnContent = new QWidget(column);
     auto *layout = new QVBoxLayout(columnContent);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
-    columnSplitter->addWidget(columnContent);
+    columnRowLayout->addWidget(columnContent, 1);
 
     auto *header = new QFrame(column);
     header->setObjectName(QStringLiteral("DomTitleBar"));
@@ -3528,6 +3619,39 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     prints->setProperty("domContainerPtr",
                         QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(column)));
 
+    auto *printsWrap = new QWidget(column);
+    printsWrap->setProperty("domContainerPtr",
+                            QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(column)));
+    printsWrap->setMinimumWidth(0);
+    printsWrap->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+    auto *printsWrapLayout = new QGridLayout(printsWrap);
+    printsWrapLayout->setContentsMargins(0, 0, 0, 0);
+    printsWrapLayout->setSpacing(0);
+    printsWrapLayout->addWidget(prints, 0, 0);
+
+    auto *perfOverlay = new QWidget(printsWrap);
+    perfOverlay->setObjectName(QStringLiteral("PerfOverlay"));
+    perfOverlay->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    perfOverlay->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Minimum);
+    auto *perfLayout = new QVBoxLayout(perfOverlay);
+    perfLayout->setContentsMargins(6, 4, 6, 4);
+    perfLayout->setSpacing(2);
+
+    auto makePerfLine = [perfOverlay, perfLayout](const QString &text) {
+        auto *label = new QLabel(text, perfOverlay);
+        label->setObjectName(QStringLiteral("PerfOverlayLine"));
+        label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        perfLayout->addWidget(label);
+        return label;
+    };
+
+    auto *perfPing = makePerfLine(QStringLiteral("Ping: -"));
+    auto *perfOrders = makePerfLine(QStringLiteral("Orders: -"));
+    auto *perfFps = makePerfLine(QStringLiteral("FPS: -"));
+    auto *perfDomHz = makePerfLine(QStringLiteral("DOM Hz: -"));
+
+    printsWrapLayout->addWidget(perfOverlay, 0, 0, Qt::AlignTop | Qt::AlignLeft);
+
     auto *clusters = new ClustersWidget(column);
     clusters->setProperty("domContainerPtr",
                           QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(column)));
@@ -3541,19 +3665,19 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     prints->setRowHeightOnly(dom->rowHeight());
     clusters->setRowLayout(0, dom->rowHeight(), dom->infoAreaHeight());
 
-    auto *printsDomSplitter = new QSplitter(Qt::Horizontal, column);
+    auto *printsDomSplitter = new AnimatedSplitter(Qt::Horizontal, column);
     printsDomSplitter->setObjectName(QStringLiteral("DomPrintsSplitter"));
     printsDomSplitter->setChildrenCollapsible(false);
     printsDomSplitter->setHandleWidth(2);
     printsDomSplitter->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 
-    auto *printsContainer = new QSplitter(Qt::Horizontal, printsDomSplitter);
+    auto *printsContainer = new AnimatedSplitter(Qt::Horizontal, printsDomSplitter);
     printsContainer->setObjectName(QStringLiteral("ClustersPrintsSplitter"));
     printsContainer->setChildrenCollapsible(true);
     printsContainer->setHandleWidth(2);
     printsContainer->setOpaqueResize(true);
     printsContainer->addWidget(clusters);
-    printsContainer->addWidget(prints);
+    printsContainer->addWidget(printsWrap);
     printsContainer->setStretchFactor(0, 0);
     printsContainer->setStretchFactor(1, 1);
     printsContainer->setCollapsible(0, true);
@@ -3589,16 +3713,6 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
         handle->setCursor(Qt::SizeHorCursor);
     }
 
-    // Match DOM splitter handle styling.
-    printsContainer->setStyleSheet(QStringLiteral(
-        "QSplitter#ClustersPrintsSplitter::handle:horizontal {"
-        "  background: #303030;"
-        "}"
-        "QSplitter#ClustersPrintsSplitter::handle:horizontal:hover {"
-        "  background: #3a3a3a;"
-        "}"
-    ));
-
     auto *scroll = new QScrollArea(column);
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setWidgetResizable(true);
@@ -3632,7 +3746,7 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     notionalOverlay->setAttribute(Qt::WA_TranslucentBackground, true);
     notionalOverlay->setStyleSheet(QStringLiteral("background: transparent;"));
     auto *notionalLayout = new QVBoxLayout(notionalOverlay);
-    notionalLayout->setContentsMargins(1, 0, 1, 6);
+    notionalLayout->setContentsMargins(0, 0, 0, 6);
     notionalLayout->setSpacing(6);
     notionalLayout->addStretch();
 
@@ -3841,10 +3955,24 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     }
     notionalOverlay->adjustSize();
 
-    auto repositionOverlay = [scroll, notionalOverlay]() {
+    auto repositionOverlay = [scroll, notionalOverlay, printsWrap]() {
         if (!notionalOverlay || !scroll) return;
         notionalOverlay->adjustSize();
-        const int x = 2;
+        const int pad = 0;
+        int x = pad;
+        if (auto *vp = scroll->viewport()) {
+            if (printsWrap) {
+                const QPoint printsPos = printsWrap->mapTo(vp, QPoint(0, 0));
+                x = printsPos.x() + pad;
+                const int maxInPrints =
+                    printsPos.x() + std::max(0, printsWrap->width() - notionalOverlay->width() - pad);
+                if (x > maxInPrints) {
+                    x = maxInPrints;
+                }
+            }
+            const int maxX = std::max(pad, vp->width() - notionalOverlay->width() - pad);
+            x = std::clamp(x, pad, maxX);
+        }
         const int bottomMargin = 36;
         int y = scroll->viewport()->height() - notionalOverlay->height() - bottomMargin;
         if (y < 8) y = 8;
@@ -3966,23 +4094,6 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
         m_tradeManager->closePositionMarket(col->symbol, col->accountName, priceHint);
     });
 
-    auto *resizeStub = new QWidget(columnSplitter);
-    resizeStub->setMinimumWidth(0);
-    resizeStub->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
-    resizeStub->setAttribute(Qt::WA_TransparentForMouseEvents, true);
-    columnSplitter->addWidget(resizeStub);
-    columnSplitter->setStretchFactor(columnSplitter->indexOf(columnContent), 1);
-    columnSplitter->setStretchFactor(columnSplitter->indexOf(resizeStub), 0);
-    columnSplitter->setSizes({columnContent->sizeHint().width(), 0});
-
-    if (auto *handle = columnSplitter->handle(1)) {
-        handle->setObjectName(QStringLiteral("DomColumnResizeHandle"));
-        handle->setProperty("domContainerPtr",
-                            QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(column)));
-        handle->setCursor(Qt::SizeHorCursor);
-        handle->installEventFilter(this);
-    }
-
     result.tickCompression = 1;
     const QString symbolUpper = result.symbol;
     const auto source = symbolSourceForAccount(result.accountName.isEmpty() ? QStringLiteral("MEXC Spot")
@@ -4063,6 +4174,59 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
                 }
                 handleColumnBufferRange(columnGuard.data(), minTick, maxTick, centerTick, tickSize);
             });
+    connect(client,
+            &LadderClient::bookUpdated,
+            this,
+            [this, columnGuard](quint64) {
+                if (!columnGuard) {
+                    return;
+                }
+                WorkspaceTab *tab = nullptr;
+                DomColumn *colPtr = nullptr;
+                int idx = -1;
+                if (!locateColumn(columnGuard.data(), tab, colPtr, idx) || !colPtr) {
+                    return;
+                }
+                // Mark that the book changed even when the window didn't; this drives DOM Hz.
+                ++colPtr->bufferRevision;
+
+                if (m_domTargetFps > 0) {
+                    return;
+                }
+                // Event-driven mode: coalesce snapshot pulls via the existing pending viewport queue.
+                if (!colPtr->hasBuffer || !colPtr->dom || !colPtr->client) {
+                    return;
+                }
+                if (!colPtr->container || !colPtr->container->isVisible()) {
+                    return;
+                }
+                if (colPtr->lastViewportTop < colPtr->lastViewportBottom) {
+                    return;
+                }
+                if (colPtr->pendingViewportUpdate) {
+                    return;
+                }
+                colPtr->pendingViewportUpdate = true;
+                colPtr->pendingViewportBottom = colPtr->lastViewportBottom;
+                colPtr->pendingViewportTop = colPtr->lastViewportTop;
+                colPtr->pendingViewportRevision = colPtr->bufferRevision;
+                QTimer::singleShot(0, this, [this, columnGuard]() {
+                    if (!columnGuard) {
+                        return;
+                    }
+                    WorkspaceTab *tab2 = nullptr;
+                    DomColumn *col2 = nullptr;
+                    int idx2 = -1;
+                    if (!locateColumn(columnGuard.data(), tab2, col2, idx2) || !col2) {
+                        return;
+                    }
+                    flushPendingColumnViewport(*col2);
+                });
+            });
+    connect(client,
+            &LadderClient::bucketTicksUpdated,
+            dom,
+            &DomWidget::notifyBucketTicksUpdated);
 
     connect(dom,
             &DomWidget::rowClicked,
@@ -4158,7 +4322,13 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     result.container = column;
     result.dom = dom;
     result.prints = prints;
+    result.printsWrap = printsWrap;
     result.clusters = clusters;
+    result.perfOverlay = perfOverlay;
+    result.perfPingLabel = perfPing;
+    result.perfOrderPingLabel = perfOrders;
+    result.perfFpsLabel = perfFps;
+    result.perfDomHzLabel = perfDomHz;
     result.printsDomSplitter = printsDomSplitter;
     result.clustersPrintsSplitter = printsContainer;
     result.scrollArea = scroll;
@@ -4171,14 +4341,30 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
             handleDomScroll(columnGuard.data(), value);
         });
     }
-    connect(printsDomSplitter, &QSplitter::splitterMoved, this, [this, printsDomSplitter]() {
+    connect(printsDomSplitter, &QSplitter::splitterMoved, this, [this, printsDomSplitter, columnGuard]() {
         m_savedDomPrintsSplitterSizes = printsDomSplitter->sizes();
+        if (columnGuard) {
+            WorkspaceTab *tab = nullptr;
+            DomColumn *col = nullptr;
+            int idx = -1;
+            if (locateColumn(columnGuard.data(), tab, col, idx) && col) {
+                repositionNotionalOverlay(*col);
+            }
+        }
         scheduleSaveUserSettings(600);
     });
-    connect(printsContainer, &QSplitter::splitterMoved, this, [this, printsContainer]() {
+    connect(printsContainer, &QSplitter::splitterMoved, this, [this, printsContainer, columnGuard]() {
         m_savedClustersPrintsSplitterSizes = printsContainer->sizes();
         if (m_savedClustersPrintsSplitterSizes.size() >= 2 && m_savedClustersPrintsSplitterSizes.at(0) > 0) {
             m_clustersPrintsSplitterEverShown = true;
+        }
+        if (columnGuard) {
+            WorkspaceTab *tab = nullptr;
+            DomColumn *col = nullptr;
+            int idx = -1;
+            if (locateColumn(columnGuard.data(), tab, col, idx) && col) {
+                repositionNotionalOverlay(*col);
+            }
         }
         scheduleSaveUserSettings(600);
     });
@@ -4200,6 +4386,7 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
         result.prints->setLocalOrders(empty);
     }
     updateColumnStatusLabel(result);
+    updatePerfOverlay(result);
     return result;
 }
 
@@ -4425,7 +4612,20 @@ void MainWindow::appendConnectionsLog(const QString &msg)
 
 void MainWindow::handleLadderPingUpdated(int ms)
 {
-    Q_UNUSED(ms);
+    auto *client = qobject_cast<LadderClient *>(sender());
+    if (!client) {
+        return;
+    }
+    for (auto &tab : m_tabs) {
+        for (auto &col : tab.columnsData) {
+            if (col.client != client) {
+                continue;
+            }
+            col.lastPingMs = ms;
+            updatePerfOverlay(col);
+            return;
+        }
+    }
 }
 
 void MainWindow::handleDomRowClicked(Qt::MouseButton button,
@@ -7374,17 +7574,10 @@ void MainWindow::applyDockDrop(WorkspaceTab &dragTab,
     }
 
     const bool vertical = (dropZone == DockZone::Top || dropZone == DockZone::Bottom);
-    auto *splitter = new QSplitter(vertical ? Qt::Vertical : Qt::Horizontal, targetSplitter);
+    auto *splitter = new AnimatedSplitter(vertical ? Qt::Vertical : Qt::Horizontal, targetSplitter);
     splitter->setObjectName(QStringLiteral("DomDockSplitter"));
     splitter->setChildrenCollapsible(false);
-    splitter->setHandleWidth(3);
-    splitter->setStyleSheet(QStringLiteral(
-        "QSplitter#DomDockSplitter::handle {"
-        "  background-color: #2b2b2b;"
-        "}"
-        "QSplitter#DomDockSplitter::handle:hover {"
-        "  background-color: #3a3a3a;"
-        "}"));
+    splitter->setHandleWidth(2);
 
     if (dropZone == DockZone::Left || dropZone == DockZone::Top) {
         splitter->addWidget(dragCol.container);
@@ -7438,17 +7631,10 @@ void MainWindow::applyDockDropWidget(QWidget *dragWidget,
     }
 
     const bool vertical = (dropZone == DockZone::Top || dropZone == DockZone::Bottom);
-    auto *splitter = new QSplitter(vertical ? Qt::Vertical : Qt::Horizontal, targetSplitter);
+    auto *splitter = new AnimatedSplitter(vertical ? Qt::Vertical : Qt::Horizontal, targetSplitter);
     splitter->setObjectName(QStringLiteral("DomDockSplitter"));
     splitter->setChildrenCollapsible(false);
-    splitter->setHandleWidth(3);
-    splitter->setStyleSheet(QStringLiteral(
-        "QSplitter#DomDockSplitter::handle {"
-        "  background-color: #2b2b2b;"
-        "}"
-        "QSplitter#DomDockSplitter::handle:hover {"
-        "  background-color: #3a3a3a;"
-        "}"));
+    splitter->setHandleWidth(2);
 
     if (dropZone == DockZone::Left || dropZone == DockZone::Top) {
         splitter->addWidget(dragWidget);
@@ -9315,16 +9501,24 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
         if (auto *w = qobject_cast<QWidget *>(obj)) {
             QVariant ov = w->property("notionalOverlayPtr");
             if (ov.isValid()) {
-                auto *overlay = reinterpret_cast<QWidget *>(ov.value<quintptr>());
-                if (overlay) {
-                    const int x = 2;
-                    const int bottomMargin = 36;
-                    int y = w->height() - overlay->sizeHint().height() - bottomMargin;
-                    const int maxY = std::max(0, w->height() - overlay->sizeHint().height() - 6);
-                    if (y < 8) y = 8;
-                    if (y > maxY) y = maxY;
-                    overlay->move(x, y);
-                    overlay->raise();
+                QWidget *column = columnContainerForObject(w);
+                WorkspaceTab *tab = nullptr;
+                DomColumn *col = nullptr;
+                int idx = -1;
+                if (column && locateColumn(column, tab, col, idx) && col) {
+                    repositionNotionalOverlay(*col);
+                } else {
+                    auto *overlay = reinterpret_cast<QWidget *>(ov.value<quintptr>());
+                    if (overlay) {
+                        const int x = 0;
+                        const int bottomMargin = 36;
+                        int y = w->height() - overlay->sizeHint().height() - bottomMargin;
+                        const int maxY = std::max(0, w->height() - overlay->sizeHint().height() - 6);
+                        if (y < 8) y = 8;
+                        if (y > maxY) y = maxY;
+                        overlay->move(x, y);
+                        overlay->raise();
+                    }
                 }
             }
             QVariant pov = w->property("positionOverlayPtr");
@@ -10895,10 +11089,27 @@ void MainWindow::handleDomFrameTick()
     if (m_domTargetFps <= 0) {
         return;
     }
-    for (auto &tab : m_tabs) {
-        for (auto &col : tab.columnsData) {
-            refreshDomColumnFrame(col);
-        }
+    if (!isVisible()) {
+        return;
+    }
+    if (!m_perfFpsTimer.isValid()) {
+        m_perfFpsTimer.start();
+        m_perfFpsFrames = 0;
+    }
+    ++m_perfFpsFrames;
+    const qint64 elapsedMs = m_perfFpsTimer.elapsed();
+    if (elapsedMs >= 1000) {
+        m_lastUiFps = (m_perfFpsFrames * 1000.0) / static_cast<double>(elapsedMs);
+        m_perfFpsFrames = 0;
+        m_perfFpsTimer.restart();
+        updateAllPerfOverlays();
+    }
+    WorkspaceTab *tab = currentWorkspaceTab();
+    if (!tab) {
+        return;
+    }
+    for (auto &col : tab->columnsData) {
+        refreshDomColumnFrame(col);
     }
 }
 
@@ -10932,11 +11143,19 @@ void MainWindow::refreshDomColumnFrame(DomColumn &col)
     if (!col.client || !col.dom || !col.hasBuffer) {
         return;
     }
+    if (!col.container || !col.container->isVisible()) {
+        return;
+    }
     if (col.pendingViewportUpdate) {
         flushPendingColumnViewport(col);
         return;
     }
     if (col.lastViewportTop < col.lastViewportBottom) {
+        return;
+    }
+    // Avoid rebuilding snapshots every frame when nothing changed: snapshots are already pulled
+    // on buffer updates (via bookRangeUpdated -> handleColumnBufferRange -> updateColumnViewport).
+    if (col.lastViewportRevision == col.bufferRevision) {
         return;
     }
     pullSnapshotForColumn(col, col.lastViewportBottom, col.lastViewportTop);
@@ -10951,10 +11170,10 @@ bool MainWindow::pullSnapshotForColumn(DomColumn &col, qint64 bottomTick, qint64
     if (snap.tickSize > 0.0) {
         col.bufferTickSize = snap.tickSize;
     }
-    if (snap.levels.isEmpty()) {
-        return false;
-    }
+    // Always push the snapshot to the DOM widget, even if empty.
+    // Otherwise the GPU DOM can keep stale rows visible until user scroll triggers a rebuild.
     col.dom->updateSnapshot(snap);
+    const bool hasLevels = !snap.levels.isEmpty();
     // We do not use QScrollArea's native pixel scroll (we render a fixed window in ticks).
     // If it ever drifts (e.g. due to geometry changes), it can create a persistent 1-row offset.
     if (col.scrollArea) {
@@ -11043,10 +11262,11 @@ bool MainWindow::pullSnapshotForColumn(DomColumn &col, qint64 bottomTick, qint64
             col.lastFpsHz = fps;
             col.lastFpsLabelUpdateMs = nowMs;
             updateColumnStatusLabel(col);
+            updatePerfOverlay(col);
         }
         // Avoid spamming logs with FPS; the status label already shows the value when enabled.
     }
-    return true;
+    return hasLevels;
 }
 
 void MainWindow::maybeTriggerSltpForColumn(DomColumn &col, const DomSnapshot &snap)
@@ -13874,27 +14094,75 @@ SymbolPickerDialog *MainWindow::createSymbolPicker(const QString &title,
     return dlg;
 }
 
+void MainWindow::repositionNotionalOverlay(DomColumn &col)
+{
+    if (!col.notionalOverlay) {
+        return;
+    }
+    QWidget *vp = nullptr;
+    if (col.scrollArea) {
+        vp = col.scrollArea->viewport();
+    }
+    if (!vp) {
+        vp = qobject_cast<QWidget *>(col.notionalOverlay->parentWidget());
+    }
+    if (!vp) {
+        return;
+    }
+
+    col.notionalOverlay->adjustSize();
+
+    const int pad = 0;
+    int x = pad;
+
+    // Anchor to the clusters/prints splitter handle so the overlay stays "glued" while dragging,
+    // even if child widget geometries haven't been laid out yet for this event tick.
+    if (col.clustersPrintsSplitter) {
+        if (auto *h = col.clustersPrintsSplitter->handle(1)) {
+            const QPoint handlePos = h->mapTo(vp, QPoint(0, 0));
+            const int printsLeft = handlePos.x() + h->width(); // first pixel of prints side
+            x = printsLeft + pad;
+
+            const QList<int> sizes = col.clustersPrintsSplitter->sizes();
+            const int printsWidth = sizes.size() >= 2 ? std::max(0, sizes.at(1)) : 0;
+            const int maxInPrints = printsLeft + std::max(0, printsWidth - col.notionalOverlay->width() - pad);
+            if (x > maxInPrints) {
+                x = maxInPrints;
+            }
+        }
+    } else if (col.printsWrap) {
+        const QPoint printsPos = col.printsWrap->mapTo(vp, QPoint(0, 0));
+        x = printsPos.x() + pad;
+        const int maxInPrints =
+            printsPos.x() + std::max(0, col.printsWrap->width() - col.notionalOverlay->width() - pad);
+        if (x > maxInPrints) {
+            x = maxInPrints;
+        }
+    }
+
+    const int maxX = std::max(pad, vp->width() - col.notionalOverlay->width() - pad);
+    x = std::clamp(x, pad, maxX);
+
+    const int bottomMargin = 36;
+    int y = vp->height() - col.notionalOverlay->height() - bottomMargin;
+    if (y < 8) {
+        y = 8;
+    }
+    const int maxY = std::max(0, vp->height() - col.notionalOverlay->height() - 6);
+    if (y > maxY) {
+        y = maxY;
+    }
+
+    col.notionalOverlay->move(x, y);
+    col.notionalOverlay->raise();
+    col.notionalOverlay->show();
+}
+
 void MainWindow::applySymbolToColumn(DomColumn &col,
                                      const QString &symbol,
                                      const QString &accountName)
 {
-    auto refreshNotionalOverlay = [&col]() {
-        if (!col.notionalOverlay) {
-            return;
-        }
-        col.notionalOverlay->adjustSize();
-        if (auto *vp = qobject_cast<QWidget *>(col.notionalOverlay->parentWidget())) {
-            const int x = 2;
-            const int bottomMargin = 36;
-            int y = vp->height() - col.notionalOverlay->height() - bottomMargin;
-            if (y < 8) y = 8;
-            const int maxY = std::max(0, vp->height() - col.notionalOverlay->height() - 6);
-            if (y > maxY) y = maxY;
-            col.notionalOverlay->move(x, y);
-            col.notionalOverlay->raise();
-            col.notionalOverlay->show();
-        }
-    };
+    auto refreshNotionalOverlay = [this, &col]() { repositionNotionalOverlay(col); };
 
     const QString sym = symbol.trimmed().toUpper();
     if (sym.isEmpty()) {

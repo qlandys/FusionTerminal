@@ -110,6 +110,7 @@ signals:
                                   double slTriggerPrice,
                                   bool hasTp,
                                   double tpTriggerPrice);
+    void privatePingUpdated(const QString &accountName, int ms);
 
 private:
     struct BalanceState {
@@ -183,6 +184,8 @@ private:
         QTimer lighterAccountTimer;
         QTimer lighterTradesTimer;
         QTimer lighterBurstTimer;
+        qint64 lastPrivatePingSentMs{0};
+        int lastPrivatePingMs{0};
         int lighterBurstRemaining{0};
         QString listenKey;
         QString lighterAuthToken;

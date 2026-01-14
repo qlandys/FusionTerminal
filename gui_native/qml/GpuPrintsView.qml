@@ -1,10 +1,12 @@
 import QtQuick 2.15
+import Fusion 1.0
 
 Item {
     id: root
     property var circlesModel: null
     property var ordersModel: null
     property var printsBridge: null
+    property bool useGpuPrints: false
     property int rowCount: 0
     property int rowHeight: 20
     property color backgroundColor: "#151515"
@@ -228,10 +230,11 @@ Item {
         height: rowCount * rowHeight
         z: 1
         Canvas {
-            id: gridCanvas
+            id: gridCanvasFallback
             anchors.fill: parent
             antialiasing: false
             renderTarget: Canvas.Image
+            visible: !root.useGpuPrints
             onPaint: {
                 var ctx = getContext("2d");
                 ctx.reset();
@@ -248,25 +251,48 @@ Item {
                     ctx.stroke();
                 }
             }
-            onWidthChanged: requestPaint();
-            onHeightChanged: requestPaint();
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
             Connections {
                 target: root
-                function onRowCountChanged() { gridCanvas.requestPaint(); }
-                function onRowHeightChanged() { gridCanvas.requestPaint(); }
-                function onGridColorChanged() { gridCanvas.requestPaint(); }
+                function onRowCountChanged() { gridCanvasFallback.requestPaint(); }
+                function onRowHeightChanged() { gridCanvasFallback.requestPaint(); }
+                function onGridColorChanged() { gridCanvasFallback.requestPaint(); }
             }
-            Component.onCompleted: requestPaint();
+            Component.onCompleted: requestPaint()
+        }
+        GpuGridItem {
+            anchors.fill: parent
+            vertical: false
+            count: Math.max(0, root.rowCount)
+            step: Math.max(1, root.rowHeight)
+            color: root.gridColor
+            opacity: 0.35
+            visible: root.useGpuPrints
         }
     }
 
     // Trail under circles: draw as a simple polyline so it always connects centers correctly.
+    GpuTrailItem {
+        id: trailGpu
+        anchors.fill: parent
+        z: 2.6
+        circlesModel: root.circlesModel
+        sidePadding: root.sidePadding
+        maxSegments: 256
+        color: root.trailColor
+        opacity: root.trailOpacity
+        lineWidth: root.trailWidth
+        visible: root.useGpuPrints
+    }
+
     Canvas {
-        id: trailCanvas
+        id: trailCanvasFallback
         anchors.fill: parent
         z: 2.6
         antialiasing: true
         renderTarget: Canvas.Image
+        visible: !root.useGpuPrints
         onPaint: {
             var ctx = getContext("2d");
             ctx.reset();
@@ -279,8 +305,7 @@ Item {
             ctx.lineCap = "round";
             ctx.lineJoin = "round";
 
-            // Iterate using `get(i)` until it returns an invalid map.
-            for (var i = 0; i < 512; ++i) {
+            for (var i = 0; i < 256; ++i) {
                 var a = root.circlesModel.get(i);
                 if (!a || a.xRatio === undefined || a.y === undefined) break;
                 var b = root.circlesModel.get(i + 1);
@@ -305,17 +330,17 @@ Item {
         onHeightChanged: requestPaint()
         Connections {
             target: root.circlesModel
-            function onModelReset() { trailCanvas.requestPaint(); }
-            function onDataChanged() { trailCanvas.requestPaint(); }
-            function onRowsInserted() { trailCanvas.requestPaint(); }
-            function onRowsRemoved() { trailCanvas.requestPaint(); }
-            function onLayoutChanged() { trailCanvas.requestPaint(); }
+            function onModelReset() { trailCanvasFallback.requestPaint(); }
+            function onDataChanged() { trailCanvasFallback.requestPaint(); }
+            function onRowsInserted() { trailCanvasFallback.requestPaint(); }
+            function onRowsRemoved() { trailCanvasFallback.requestPaint(); }
+            function onLayoutChanged() { trailCanvasFallback.requestPaint(); }
         }
         Connections {
             target: root
-            function onTrailColorChanged() { trailCanvas.requestPaint(); }
-            function onTrailOpacityChanged() { trailCanvas.requestPaint(); }
-            function onTrailWidthChanged() { trailCanvas.requestPaint(); }
+            function onTrailColorChanged() { trailCanvasFallback.requestPaint(); }
+            function onTrailOpacityChanged() { trailCanvasFallback.requestPaint(); }
+            function onTrailWidthChanged() { trailCanvasFallback.requestPaint(); }
         }
         Component.onCompleted: requestPaint()
     }
@@ -323,8 +348,44 @@ Item {
     Item {
         anchors.fill: parent
         z: 3
+
+        // GPU-rendered circles (geometry only).
+        GpuCirclesItem {
+            anchors.fill: parent
+            circlesModel: root.circlesModel
+            sidePadding: root.sidePadding
+            printsSquare: root.printsSquare
+            maxCircles: 96
+            circleSegments: 72
+            visible: root.useGpuPrints
+        }
+
+        // Text overlay remains in QML for now (small count).
         Repeater {
             model: root.circlesModel ? root.circlesModel : 0
+            visible: true
+            delegate: Item {
+                property real circleRadius: typeof model.radius !== "undefined" ? model.radius : 0
+                width: circleRadius * 2
+                height: width
+                x: xForRatio(model.xRatio) - width / 2
+                y: yForValue(model.y) - height / 2
+                visible: root.useGpuPrints && circleRadius > 0.5
+                Text {
+                    anchors.centerIn: parent
+                    text: typeof model.text !== "undefined" ? model.text : ""
+                    color: "#f4f7fb"
+                    font.family: fontFamily
+                    font.bold: true
+                    font.pixelSize: Math.max(6, Math.min(parent.width * 0.55, fontPixelSize))
+                }
+            }
+        }
+
+        // Full fallback (old path) when GPU prints is disabled.
+        Repeater {
+            model: root.circlesModel ? root.circlesModel : 0
+            visible: !root.useGpuPrints
             delegate: Item {
                 property real circleRadius: typeof model.radius !== "undefined" ? model.radius : 0
                 width: circleRadius * 2
@@ -359,6 +420,7 @@ Item {
             model: root.ordersModel ? root.ordersModel : 0
             delegate: Item {
                 objectName: "orderMarker"
+                id: markerRoot
                 property string textValue: typeof model.text !== "undefined" ? model.text : ""
                 property bool buy: typeof model.buy !== "undefined" ? model.buy : true
                 property color fillColor: typeof model.fillColor !== "undefined" ? model.fillColor : (buy ? "#4caf50" : "#ef5350")
@@ -382,88 +444,17 @@ Item {
                 width: Math.max(textItem.contentWidth + 22 + tipSize, 70)
                 x: root.width - width - 4
                 y: row * root.rowHeight + root.rowHeight / 2 - height / 2
-                onFillColorChanged: markerCanvas.requestPaint()
-                onBorderColorChanged: markerCanvas.requestPaint()
                 property real animPhase: 0.0
-                onAnimPhaseChanged: markerCanvas.requestPaint()
                 property bool hovered: false
                 property real hoverT: hovered ? 1.0 : 0.0
                 Behavior on hoverT { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
                 clip: true
 
-                Canvas {
-                    id: markerCanvas
+                GpuMarkerItem {
                     anchors.fill: parent
-                    // Small canvas, but keep it on Image to avoid any driver/FBO issues.
-                    renderTarget: Canvas.Image
-                    antialiasing: true
-                    onPaint: {
-                        var ctx = getContext("2d");
-                        ctx.reset();
-                        ctx.clearRect(0, 0, width, height);
-
-                        // Longer tip makes the pointer feel sharper.
-                        var tip = Math.max(9, Math.min(parent.tipSize + 3, width * 0.55));
-                        var w = width;
-                        var h = height;
-
-                        function buildPath() {
-                            // Left: 2 straight corners; Right: sharp tip ("envelope" pointer).
-                            ctx.beginPath();
-                            ctx.moveTo(0, 0);
-                            ctx.lineTo(w - tip, 0);
-                            ctx.lineTo(w, h / 2);
-                            ctx.lineTo(w - tip, h);
-                            ctx.lineTo(0, h);
-                            ctx.closePath();
-                        }
-
-                        // Main fill.
-                        buildPath();
-                        ctx.globalAlpha = 1.0;
-                        ctx.fillStyle = fillColor;
-                        ctx.fill();
-
-                        // Outline: darker under-stroke + colored stroke (no drop shadow).
-                        ctx.lineJoin = "miter";
-                        ctx.miterLimit = 12;
-                        ctx.lineCap = "butt";
-                        buildPath();
-                        ctx.globalAlpha = 0.55;
-                        ctx.lineWidth = 3.0;
-                        ctx.strokeStyle = Qt.darker(borderColor, 3.2);
-                        ctx.stroke();
-                        buildPath();
-                        ctx.globalAlpha = 1.0;
-                        ctx.lineWidth = 1.8;
-                        ctx.strokeStyle = borderColor;
-                        ctx.stroke();
-
-                        // Left highlight edge (keeps the left side clean).
-                        ctx.save();
-                        ctx.clip();
-                        ctx.globalAlpha = 0.12;
-                        ctx.fillStyle = "#ffffff";
-                        ctx.fillRect(0, 0, 2, h);
-                        ctx.restore();
-
-                        // Animated "shine" band for visibility (no scaling).
-                        ctx.save();
-                        ctx.clip();
-                        var phase = parent.animPhase || 0.0;
-                        var bandW = Math.max(18, w * 0.18);
-                        var startX = -bandW + (w + bandW) * phase;
-                        ctx.translate(startX, 0);
-                        ctx.rotate(-0.35);
-                        ctx.globalAlpha = 0.16;
-                        ctx.fillStyle = "#ffffff";
-                        ctx.fillRect(0, 0, bandW, h * 2);
-                        ctx.restore();
-                    }
-                    onWidthChanged: requestPaint();
-                    onHeightChanged: requestPaint();
-                    onVisibleChanged: if (visible) requestPaint();
-                    Component.onCompleted: requestPaint();
+                    fillColor: markerRoot.fillColor
+                    borderColor: markerRoot.borderColor
+                    phase: markerRoot.animPhase
                 }
 
                 Text {
@@ -570,57 +561,11 @@ Item {
         y: root.dragRow * root.rowHeight + root.rowHeight / 2 - height / 2
         clip: true
 
-        Canvas {
-            id: ghostCanvas
+        GpuMarkerItem {
             anchors.fill: parent
-            renderTarget: Canvas.Image
-            antialiasing: true
-            onPaint: {
-                var ctx = getContext("2d");
-                ctx.reset();
-                ctx.clearRect(0, 0, width, height);
-
-                var tip = Math.max(9, Math.min(dragGhost.tipSize + 3, width * 0.55));
-                var w = width;
-                var h = height;
-
-                ctx.beginPath();
-                ctx.moveTo(0, 0);
-                ctx.lineTo(w - tip, 0);
-                ctx.lineTo(w, h / 2);
-                ctx.lineTo(w - tip, h);
-                ctx.lineTo(0, h);
-                ctx.closePath();
-
-                ctx.globalAlpha = 0.92;
-                ctx.fillStyle = root.dragFillColor;
-                ctx.fill();
-
-                ctx.lineJoin = "miter";
-                ctx.miterLimit = 12;
-                ctx.lineCap = "butt";
-                ctx.globalAlpha = 0.55;
-                ctx.lineWidth = 3.0;
-                ctx.strokeStyle = Qt.darker(root.dragBorderColor, 3.2);
-                ctx.stroke();
-                ctx.globalAlpha = 1.0;
-                ctx.lineWidth = 1.8;
-                ctx.strokeStyle = root.dragBorderColor;
-                ctx.stroke();
-
-                ctx.globalAlpha = 0.12;
-                ctx.fillStyle = "#ffffff";
-                ctx.fillRect(0, 0, 2, h);
-            }
-            Connections {
-                target: root
-                function onDragFillColorChanged() { ghostCanvas.requestPaint(); }
-                function onDragBorderColorChanged() { ghostCanvas.requestPaint(); }
-                function onDragTextChanged() { ghostCanvas.requestPaint(); }
-            }
-            onWidthChanged: requestPaint()
-            onHeightChanged: requestPaint()
-            Component.onCompleted: requestPaint()
+            fillColor: root.dragFillColor
+            borderColor: root.dragBorderColor
+            phase: 0.0
         }
 
         Text {

@@ -51,11 +51,62 @@ QString formatQty(double v)
 }
 } // namespace
 
+static bool printsUseQml()
+{
+    // Default: use QML (old visuals).
+    // Compatibility: allow explicit enable/disable via env.
+    if (qEnvironmentVariableIsSet("PRINTS_USE_QML") || qEnvironmentVariableIsSet("GPU_PRINTS_QML")) {
+        return qEnvironmentVariableIntValue("PRINTS_USE_QML") > 0
+            || qEnvironmentVariableIntValue("GPU_PRINTS_QML") > 0;
+    }
+    return !(qEnvironmentVariableIntValue("PRINTS_DISABLE_QML") > 0
+             || qEnvironmentVariableIntValue("GPU_PRINTS_DISABLE_QML") > 0);
+}
+
 PrintsWidget::PrintsWidget(QWidget *parent)
     : QWidget(parent)
 {
+    m_useGpuPrints = (qEnvironmentVariableIntValue("PRINTS_GPU") > 0)
+                     || (qEnvironmentVariableIntValue("DOM_GPU") > 0);
+    bool ok = false;
+    const int capFromEnv = qEnvironmentVariableIntValue("PRINTS_MAX_VISIBLE", &ok);
+    if (ok && capFromEnv > 0) {
+        m_maxVisiblePrints = std::max(4, std::min(capFromEnv, 256));
+    } else {
+        // Slightly lower default to reduce scene graph load on heavy symbols.
+        m_maxVisiblePrints = 48;
+    }
+    m_disableAnimations = qEnvironmentVariableIsSet("PRINTS_DISABLE_ANIM")
+                          || qEnvironmentVariableIsSet("PRINTS_NO_ANIM");
+
+    const int bucketMsEnv = qEnvironmentVariableIntValue("CLUSTERS_BUCKET_MS", &ok);
+    if (ok && bucketMsEnv > 0) {
+        m_clusterBucketMs = std::clamp(bucketMsEnv, 100, 300000);
+    }
+    ok = false;
+    const int bucketCntEnv = qEnvironmentVariableIntValue("CLUSTERS_BUCKETS", &ok);
+    if (ok && bucketCntEnv > 0) {
+        m_clusterBucketCount = std::clamp(bucketCntEnv, 1, 12);
+    }
+    if (qEnvironmentVariableIsSet("CLUSTERS_LIGHT")) {
+        m_clusterBucketMs = std::max(200, m_clusterBucketMs);
+        m_clusterBucketCount = std::min(3, m_clusterBucketCount);
+    }
+
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    ensureQuickInitialized();
+    if (printsUseQml()) {
+        ensureQuickInitialized();
+    } else {
+        // QWidget paint path: keep background transparent (same as QQuickWidget clearColor).
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        setAutoFillBackground(false);
+        // In QWidget mode, animations are expensive; keep them off unless explicitly enabled.
+        if (qEnvironmentVariableIntValue("PRINTS_ENABLE_ANIM") > 0) {
+            m_disableAnimations = false;
+        } else {
+            m_disableAnimations = true;
+        }
+    }
     connect(ThemeManager::instance(), &ThemeManager::themeChanged, this, [this]() {
         syncQuickProperties();
         updatePrintsQml();
@@ -67,6 +118,141 @@ PrintsWidget::PrintsWidget(QWidget *parent)
     connect(&m_clusterBoundaryTimer, &QTimer::timeout, this, [this]() {
         updateClustersQml(true);
     });
+}
+
+void PrintsWidget::resetClusterAgg()
+{
+    m_clusterCurrentBucket = 0;
+    m_clusterAggBucketMs = 0;
+    m_clusterAggBucketCount = 0;
+    m_clusterAggByCol.clear();
+    m_clusterAggTotalsByCol.clear();
+    m_clusterAggBuiltRevision = 0;
+    m_clusterCells.clear();
+    m_clustersModel.setEntries({});
+    m_clusterBucketTotals.clear();
+    m_clusterBucketStartMs.clear();
+}
+
+void PrintsWidget::advanceClusterBuckets(qint64 nowMs)
+{
+    const int bucketMs = std::clamp(m_clusterBucketMs, 100, 300000);
+    const int bucketCount = std::clamp(m_clusterBucketCount, 1, 12);
+    const qint64 currentBucket = nowMs / static_cast<qint64>(bucketMs);
+
+    if (m_clusterCurrentBucket == 0 || m_clusterAggBucketMs != bucketMs || m_clusterAggBucketCount != bucketCount) {
+        m_clusterCurrentBucket = currentBucket;
+        m_clusterAggBucketMs = bucketMs;
+        m_clusterAggBucketCount = bucketCount;
+        m_clusterAggByCol = QVector<QHash<qint64, ClusterAgg>>(bucketCount);
+        m_clusterAggTotalsByCol = QVector<double>(bucketCount, 0.0);
+        m_clusterBucketTotals = QVector<double>(bucketCount, 0.0);
+        m_clusterBucketStartMs = QVector<qint64>(bucketCount, 0);
+        for (int col = 0; col < bucketCount; ++col) {
+            const qint64 b = currentBucket - (bucketCount - 1 - col);
+            m_clusterBucketStartMs[col] = b * static_cast<qint64>(bucketMs);
+        }
+        return;
+    }
+
+    if (currentBucket <= m_clusterCurrentBucket) {
+        return;
+    }
+
+    qint64 shift = currentBucket - m_clusterCurrentBucket;
+    if (shift >= bucketCount) {
+        for (auto &m : m_clusterAggByCol) {
+            m.clear();
+        }
+        std::fill(m_clusterAggTotalsByCol.begin(), m_clusterAggTotalsByCol.end(), 0.0);
+        std::fill(m_clusterBucketTotals.begin(), m_clusterBucketTotals.end(), 0.0);
+        for (int col = 0; col < bucketCount; ++col) {
+            const qint64 b = currentBucket - (bucketCount - 1 - col);
+            m_clusterBucketStartMs[col] = b * static_cast<qint64>(bucketMs);
+        }
+        m_clusterCurrentBucket = currentBucket;
+        return;
+    }
+
+    // Shift left by `shift` columns (oldest buckets drop off), clear new buckets on the right.
+    for (int col = 0; col < bucketCount - static_cast<int>(shift); ++col) {
+        m_clusterAggByCol[col] = std::move(m_clusterAggByCol[col + static_cast<int>(shift)]);
+        m_clusterAggTotalsByCol[col] = m_clusterAggTotalsByCol[col + static_cast<int>(shift)];
+    }
+    for (int col = bucketCount - static_cast<int>(shift); col < bucketCount; ++col) {
+        m_clusterAggByCol[col].clear();
+        m_clusterAggTotalsByCol[col] = 0.0;
+    }
+
+    for (int col = 0; col < bucketCount; ++col) {
+        const qint64 b = currentBucket - (bucketCount - 1 - col);
+        m_clusterBucketStartMs[col] = b * static_cast<qint64>(bucketMs);
+        m_clusterBucketTotals[col] = m_clusterAggTotalsByCol[col];
+    }
+
+    m_clusterCurrentBucket = currentBucket;
+}
+
+void PrintsWidget::ingestClusterTrade(const ClusterTrade &t, qint64 nowMs)
+{
+    if (m_prices.isEmpty()) {
+        return;
+    }
+    if (m_tickSize <= 0.0 && m_rawTickSize <= 0.0) {
+        return;
+    }
+    if (t.qty <= 0.0) {
+        return;
+    }
+
+    advanceClusterBuckets(nowMs);
+    const int bucketMs = m_clusterAggBucketMs;
+    const int bucketCount = m_clusterAggBucketCount;
+    if (bucketMs <= 0 || bucketCount <= 0 || m_clusterCurrentBucket == 0) {
+        return;
+    }
+
+    const qint64 bucket = t.timeMs / static_cast<qint64>(bucketMs);
+    const qint64 offset = m_clusterCurrentBucket - bucket;
+    if (offset < 0 || offset >= bucketCount) {
+        return;
+    }
+    const int col = (bucketCount - 1) - static_cast<int>(offset);
+    if (col < 0 || col >= bucketCount) {
+        return;
+    }
+
+    const qint64 rawTick = (t.tick != 0) ? t.tick : tickForPrice(t.price);
+    const qint64 tick = bucketizeTick(rawTick);
+    if (rowForTick(tick) < 0) {
+        return;
+    }
+
+    auto &map = m_clusterAggByCol[col];
+    auto it = map.find(tick);
+    if (it == map.end()) {
+        ClusterAgg agg;
+        agg.total = t.qty;
+        agg.delta = t.buy ? t.qty : -t.qty;
+        map.insert(tick, agg);
+    } else {
+        it->total += t.qty;
+        it->delta += t.buy ? t.qty : -t.qty;
+    }
+    m_clusterAggTotalsByCol[col] += t.qty;
+}
+
+void PrintsWidget::rebuildClusterAggFromTrades(qint64 nowMs)
+{
+    resetClusterAgg();
+    advanceClusterBuckets(nowMs);
+    if (m_clusterAggBucketCount <= 0) {
+        return;
+    }
+    for (const auto &t : m_clusterTrades) {
+        ingestClusterTrade(t, nowMs);
+    }
+    m_clusterAggBuiltRevision = m_clusterMappingRevision;
 }
 
 void PrintsWidget::setPrints(const QVector<PrintItem> &items)
@@ -86,35 +272,41 @@ void PrintsWidget::setPrints(const QVector<PrintItem> &items)
             t.seq = it.seq;
             m_clusterTrades.push_back(t);
             m_lastClusterSeq = it.seq;
+            ingestClusterTrade(t, QDateTime::currentMSecsSinceEpoch());
         }
     }
 
-    QHash<QString, double> nextProgress;
-    nextProgress.reserve(items.size());
-    bool hasNew = false;
-    for (const auto &it : m_items) {
-        const QString key = makeKey(it);
-        if (m_spawnProgress.contains(key)) {
-            nextProgress.insert(key, m_spawnProgress.value(key));
-        } else {
-            nextProgress.insert(key, 0.0);
-            hasNew = true;
-        }
-    }
-    m_spawnProgress = nextProgress;
-    bool needTimer = false;
-    for (auto it = m_spawnProgress.cbegin(); it != m_spawnProgress.cend(); ++it) {
-        if (it.value() < 0.999) {
-            needTimer = true;
-            break;
-        }
-    }
-    if (needTimer) {
-        if (!m_animTimer.isActive()) {
-            m_animTimer.start(16, this);
-        }
-    } else {
+    if (m_disableAnimations) {
+        m_spawnProgress.clear();
         m_animTimer.stop();
+    } else {
+        QHash<QString, double> nextProgress;
+        nextProgress.reserve(items.size());
+        bool hasNew = false;
+        for (const auto &it : m_items) {
+            const QString key = makeKey(it);
+            if (m_spawnProgress.contains(key)) {
+                nextProgress.insert(key, m_spawnProgress.value(key));
+            } else {
+                nextProgress.insert(key, 0.0);
+                hasNew = true;
+            }
+        }
+        m_spawnProgress = nextProgress;
+        bool needTimer = false;
+        for (auto it = m_spawnProgress.cbegin(); it != m_spawnProgress.cend(); ++it) {
+            if (it.value() < 0.999) {
+                needTimer = true;
+                break;
+            }
+        }
+        if (needTimer) {
+            if (!m_animTimer.isActive()) {
+                m_animTimer.start(16, this);
+            }
+        } else {
+            m_animTimer.stop();
+        }
     }
     updatePrintsQml();
     updateClustersQml();
@@ -137,7 +329,13 @@ void PrintsWidget::setLadderPrices(const QVector<double> &prices,
     m_minTick = minTick;
     m_maxTick = maxTick;
     m_compressionTicks = std::max<qint64>(1, compressionTicks);
-    m_rawTickSize = rawTickSize > 0.0 ? rawTickSize : 0.0;
+    // IMPORTANT: keep the last known raw tick size if the new mapping doesn't provide one
+    // (some transient frames can arrive without tickSize during volatility).
+    if (rawTickSize > 0.0 && std::isfinite(rawTickSize)) {
+        m_rawTickSize = rawTickSize;
+    } else if (m_prices.isEmpty()) {
+        m_rawTickSize = 0.0;
+    }
 
     if (rowTickSize > 0.0) {
         m_tickSize = rowTickSize;
@@ -165,6 +363,7 @@ void PrintsWidget::setLadderPrices(const QVector<double> &prices,
         }
     }
     m_rowHeight = std::max(10, std::min(rowHeight, 40));
+    ++m_clusterMappingRevision;
 
     const int totalHeight = m_prices.size() * m_rowHeight + m_domInfoAreaHeight;
     // The visible ladder mapping changed (scroll/zoom/compression). Reset row offset so
@@ -184,7 +383,8 @@ void PrintsWidget::setLadderPrices(const QVector<double> &prices,
     updatePrintsQml();
     updateOrdersQml();
     updateHoverQml();
-    publishClustersModel();
+    rebuildClusterAggFromTrades(QDateTime::currentMSecsSinceEpoch());
+    updateClustersQml(true);
 }
 
 void PrintsWidget::setRowHeightOnly(int rowHeight)
@@ -250,6 +450,71 @@ void PrintsWidget::setHoverInfo(int row, double price, const QString &text)
 void PrintsWidget::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
+    if (m_quickWidget) {
+        return;
+    }
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    ThemeManager *theme = ThemeManager::instance();
+    if (m_hoverRow >= 0 && m_rowHeight > 0) {
+        const QRectF r(0.0,
+                       m_hoverRow * m_rowHeight,
+                       width(),
+                       m_rowHeight);
+        QColor hc = theme->selectionColor();
+        hc.setAlpha(60);
+        p.fillRect(r, hc);
+    }
+
+    const QFont fnt = font();
+    p.setFont(fnt);
+    const QFontMetrics fm(fnt);
+
+    // Draw prints bubbles
+    for (const auto &e : m_circlesModel.entries()) {
+        const double x = std::clamp(e.xRatio, 0.0, 1.0) * std::max(1, width());
+        const double y = e.y;
+        const double r = e.radius;
+        if (!(r > 0.0)) {
+            continue;
+        }
+        const QRectF circle(x - r, y - r, 2 * r, 2 * r);
+        p.setPen(QPen(e.borderColor, 1.0));
+        p.setBrush(e.fillColor);
+        p.drawEllipse(circle);
+        p.setPen(Qt::white);
+        const QString text = e.text;
+        if (!text.isEmpty()) {
+            QRectF tr = circle;
+            // Slightly shrink to avoid clipping at high DPI.
+            tr.adjust(1, 1, -1, -1);
+            const int flags = Qt::AlignCenter | Qt::TextSingleLine;
+            // If text doesn't fit, elide.
+            const QString elided = fm.elidedText(text, Qt::ElideRight, static_cast<int>(tr.width() - 2));
+            p.drawText(tr, flags, elided);
+        }
+    }
+
+    // Draw local order markers as small pills on the right edge.
+    const int markerW = std::clamp(width() / 3, 44, 84);
+    const int markerPad = 2;
+    for (const auto &e : m_ordersModel.entries()) {
+        if (e.row < 0 || e.row >= m_prices.size()) {
+            continue;
+        }
+        const double y = e.row * m_rowHeight;
+        const QRectF rr(width() - markerW - markerPad,
+                        y + markerPad,
+                        markerW,
+                        std::max(1, m_rowHeight - 2 * markerPad));
+        p.setPen(QPen(e.borderColor, 1.0));
+        p.setBrush(e.fillColor);
+        p.drawRoundedRect(rr, 4.0, 4.0);
+        p.setPen(theme->textPrimary());
+        const QString elided = fm.elidedText(e.text, Qt::ElideRight, static_cast<int>(rr.width() - 6));
+        p.drawText(rr.adjusted(3, 0, -3, 0), Qt::AlignVCenter | Qt::AlignLeft, elided);
+    }
 }
 
 void PrintsWidget::timerEvent(QTimerEvent *event)
@@ -393,6 +658,9 @@ void PrintsWidget::resizeEvent(QResizeEvent *event)
 
 void PrintsWidget::ensureQuickInitialized()
 {
+    if (!printsUseQml()) {
+        return;
+    }
     if (m_quickWidget) {
         return;
     }
@@ -453,6 +721,7 @@ void PrintsWidget::syncQuickProperties()
         root->setProperty("rowHeight", m_rowHeight);
         root->setProperty("rowCount", m_prices.size());
         root->setProperty("infoAreaHeight", m_domInfoAreaHeight);
+        root->setProperty("useGpuPrints", m_useGpuPrints);
         root->setProperty("backgroundColor", theme->panelBackground());
         root->setProperty("gridColor", theme->gridColor());
         root->setProperty("connectionColor", theme->borderColor());
@@ -589,9 +858,7 @@ bool PrintsWidget::isLeftMouseDown() const
 
 void PrintsWidget::updatePrintsQml()
 {
-    if (!m_quickWidget || !m_quickReady) {
-        return;
-    }
+    const bool qmlActive = (m_quickWidget && m_quickReady);
     bool throttled = false;
     if (m_quickUpdateThrottle.isValid()) {
         if (m_quickUpdateThrottle.nsecsElapsed() < kMinQuickUpdateIntervalNs) {
@@ -644,16 +911,58 @@ void PrintsWidget::updatePrintsQml()
         }
     }
     m_circlesModel.setEntries(std::move(entries));
+    if (!qmlActive) {
+        update();
+    }
 }
 
 void PrintsWidget::updateOrdersQml()
 {
-    if (!m_quickWidget || !m_quickReady) {
-        return;
-    }
+    const bool qmlActive = (m_quickWidget && m_quickReady);
     QVector<PrintOrdersModel::Entry> entries;
     ThemeManager *theme = ThemeManager::instance();
     if (!m_orderMarkers.isEmpty() && !m_prices.isEmpty()) {
+        const qint64 compression = std::max<qint64>(1, m_compressionTicks);
+        auto floorBucketTickSigned = [&](qint64 tick) -> qint64 {
+            if (compression == 1) {
+                return tick;
+            }
+            if (tick >= 0) {
+                return (tick / compression) * compression;
+            }
+            const qint64 absTick = -tick;
+            const qint64 buckets = (absTick + compression - 1) / compression;
+            return -buckets * compression;
+        };
+        auto ceilBucketTickSigned = [&](qint64 tick) -> qint64 {
+            if (compression == 1) {
+                return tick;
+            }
+            if (tick >= 0) {
+                return ((tick + compression - 1) / compression) * compression;
+            }
+            const qint64 absTick = -tick;
+            const qint64 buckets = absTick / compression;
+            return -buckets * compression;
+        };
+        auto rowForBucketTick = [&](qint64 bucketTick) -> int {
+            const auto it = m_tickToRow.constFind(bucketTick);
+            return (it != m_tickToRow.constEnd()) ? it.value() : -1;
+        };
+        auto tryRowForOrder = [&](double price, bool buy) -> int {
+            if (!(m_rawTickSize > 0.0) || !std::isfinite(m_rawTickSize) || !std::isfinite(price)) {
+                return -1;
+            }
+            const double scaled = price / m_rawTickSize;
+            if (!std::isfinite(scaled)) {
+                return -1;
+            }
+            const double nudged = scaled + (scaled >= 0.0 ? 1e-9 : -1e-9);
+            const qint64 rawTick = static_cast<qint64>(std::llround(nudged));
+            const qint64 bucketTick = buy ? floorBucketTickSigned(rawTick) : ceilBucketTickSigned(rawTick);
+            return rowForBucketTick(bucketTick);
+        };
+
         struct Agg {
             double qty = 0.0;
             qint64 createdMs = 0;
@@ -669,7 +978,13 @@ void PrintsWidget::updateOrdersQml()
         QHash<QString, Agg> aggregated;
         aggregated.reserve(m_orderMarkers.size());
         for (const auto &ord : m_orderMarkers) {
-            int rowIdx = rowForPrice(ord.price);
+            // IMPORTANT: Map orders using the raw tick size (absolute tick) and side-aware bucketing.
+            // Rounding by the bucket row size (or by an anchor price) can shift markers by 1 row and
+            // create apparent duplicates (e.g. two bids/asks) that "fix themselves" on scroll.
+            int rowIdx = tryRowForOrder(ord.price, ord.buy);
+            if (rowIdx < 0) {
+                rowIdx = rowForPrice(ord.price);
+            }
             if (rowIdx >= 0) {
                 rowIdx = applyRowOffset(rowIdx);
             }
@@ -757,11 +1072,15 @@ void PrintsWidget::updateOrdersQml()
         return a.orderIds.join(QStringLiteral(",")).compare(b.orderIds.join(QStringLiteral(","))) < 0;
     });
     m_ordersModel.setEntries(std::move(entries));
+    if (!qmlActive) {
+        update();
+    }
 }
 
 void PrintsWidget::updateHoverQml()
 {
     if (!m_quickWidget || !m_quickReady) {
+        update();
         return;
     }
     if (auto *root = m_quickWidget->rootObject()) {
@@ -783,59 +1102,38 @@ void PrintsWidget::updateClustersQml(bool force)
         return;
     }
     m_lastClusterUpdateMs = nowMs;
-    const int bucketMs = std::clamp(m_clusterBucketMs, 100, 300000);
-    const int bucketCount = std::clamp(m_clusterBucketCount, 1, 12);
+
+    // If mapping or cluster config changed, rebuild from the retained trade tail (bounded window).
+    if (m_clusterAggBuiltRevision != m_clusterMappingRevision
+        || m_clusterAggBucketMs != std::clamp(m_clusterBucketMs, 100, 300000)
+        || m_clusterAggBucketCount != std::clamp(m_clusterBucketCount, 1, 12)) {
+        rebuildClusterAggFromTrades(nowMs);
+    } else {
+        advanceClusterBuckets(nowMs);
+    }
+
+    const int bucketMs = m_clusterAggBucketMs;
+    const int bucketCount = m_clusterAggBucketCount;
     const qint64 cutoff = nowMs - static_cast<qint64>(bucketMs) * static_cast<qint64>(bucketCount);
     while (!m_clusterTrades.empty() && m_clusterTrades.front().timeMs < cutoff) {
         m_clusterTrades.pop_front();
     }
 
-    struct Agg {
-        double total = 0.0;
-        double delta = 0.0;
-    };
-    QHash<QPair<qint64, int>, Agg> aggByCell;
-    aggByCell.reserve(static_cast<int>(m_clusterTrades.size()));
-    const qint64 currentBucket = nowMs / bucketMs;
-    QVector<double> totalsByCol(bucketCount, 0.0);
-    QVector<qint64> startMsByCol(bucketCount, 0);
-    for (int col = 0; col < bucketCount; ++col) {
-        const qint64 bucket = currentBucket - (bucketCount - 1 - col);
-        startMsByCol[col] = bucket * static_cast<qint64>(bucketMs);
-    }
-    for (const auto &t : m_clusterTrades) {
-        const qint64 priceTick = t.tick != 0 ? bucketizeTick(t.tick) : tickForPrice(t.price);
-        const qint64 bucket = t.timeMs / bucketMs;
-        const qint64 offset = currentBucket - bucket;
-        if (offset < 0 || offset >= bucketCount) {
-            continue;
-        }
-        const int col = (bucketCount - 1) - static_cast<int>(offset); // newest on the right
-        const QPair<qint64, int> key(priceTick, col);
-        Agg agg = aggByCell.value(key, Agg{});
-        agg.total += t.qty;
-        agg.delta += t.buy ? t.qty : -t.qty;
-        aggByCell.insert(key, agg);
-    }
-
     m_clusterCells.clear();
-    m_clusterCells.reserve(aggByCell.size());
-    for (auto it = aggByCell.constBegin(); it != aggByCell.constEnd(); ++it) {
-        const qint64 tick = it.key().first;
-        const int col = it.key().second;
-        const Agg agg = it.value();
-        if (!(agg.total > 0.0)) {
-            continue;
-        }
-        ClusterCellAgg cell;
-        cell.tick = tick;
-        cell.price = (m_tickSize > 0.0) ? (static_cast<double>(tick) * m_tickSize) : 0.0;
-        cell.col = col;
-        cell.total = agg.total;
-        cell.delta = agg.delta;
-        m_clusterCells.push_back(cell);
-        if (col >= 0 && col < totalsByCol.size()) {
-            totalsByCol[col] += agg.total;
+    for (int col = 0; col < bucketCount; ++col) {
+        const auto &map = m_clusterAggByCol[col];
+        for (auto it = map.constBegin(); it != map.constEnd(); ++it) {
+            const ClusterAgg &agg = it.value();
+            if (!(agg.total > 0.0)) {
+                continue;
+            }
+            ClusterCellAgg cell;
+            cell.tick = it.key();
+            cell.price = (m_tickSize > 0.0) ? (static_cast<double>(cell.tick) * m_tickSize) : 0.0;
+            cell.col = col;
+            cell.total = agg.total;
+            cell.delta = agg.delta;
+            m_clusterCells.push_back(cell);
         }
     }
     std::sort(m_clusterCells.begin(), m_clusterCells.end(), [](const auto &a, const auto &b) {
@@ -844,9 +1142,12 @@ void PrintsWidget::updateClustersQml(bool force)
     });
     publishClustersModel();
 
-    const bool bucketsChanged = (m_clusterBucketStartMs != startMsByCol)
-                                || (m_clusterBucketTotals != totalsByCol);
-    m_clusterBucketStartMs = std::move(startMsByCol);
+    // Publish per-bucket totals for header/footer UI.
+    QVector<double> totalsByCol(bucketCount, 0.0);
+    for (int i = 0; i < bucketCount; ++i) {
+        totalsByCol[i] = (i < m_clusterAggTotalsByCol.size()) ? m_clusterAggTotalsByCol[i] : 0.0;
+    }
+    const bool bucketsChanged = (m_clusterBucketTotals != totalsByCol);
     m_clusterBucketTotals = std::move(totalsByCol);
     if (bucketsChanged) {
         emit clusterBucketsChanged();
@@ -921,6 +1222,7 @@ void PrintsWidget::setClusterWindowMs(int ms)
     }
     m_clusterBucketMs = clamped;
     emit clusterLabelChanged(clusterLabel());
+    resetClusterAgg();
     updateClustersQml(true);
 }
 
@@ -941,5 +1243,6 @@ void PrintsWidget::clearClusters()
 {
     m_clusterTrades.clear();
     m_lastClusterSeq = 0;
+    resetClusterAgg();
     updateClustersQml(true);
 }

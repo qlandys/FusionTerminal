@@ -11,6 +11,15 @@
 #include <QSettings>
 #include <QStyleFactory>
 #include <QSurfaceFormat>
+#include <QQuickWindow>
+#include <QSGRendererInterface>
+#include <QtQml/qqml.h>
+
+#include "GpuDomItem.h"
+#include "GpuGridItem.h"
+#include "GpuTrailItem.h"
+#include "GpuCirclesItem.h"
+#include "GpuMarkerItem.h"
 
 #ifdef Q_OS_WIN
 #include <ShObjIdl.h>
@@ -157,19 +166,81 @@ static void maybeRefreshShellIconCache()
 
 int main(int argc, char **argv)
 {
+#ifdef Q_OS_WIN
+    // Default to GPU paths unless the user explicitly overrides via env.
+    // This keeps "GPU mode" on by default, but still allows toggling per-session:
+    // `set DOM_GPU=0`, `set PRINTS_GPU=0`, `set CLUSTERS_GPU=0`.
+    if (!qEnvironmentVariableIsSet("DOM_GPU")
+        && !qEnvironmentVariableIsSet("PRINTS_GPU")
+        && !qEnvironmentVariableIsSet("CLUSTERS_GPU")) {
+        qputenv("DOM_GPU", "1");
+        qputenv("PRINTS_GPU", "1");
+        qputenv("CLUSTERS_GPU", "1");
+    }
+
+    // Defaults tuned for smoothness on Windows:
+    // - Prefer D3D11 RHI (avoid accidental software OpenGL paths).
+    // - Use threaded render loop for Qt Quick where possible.
+    // - Keep VSYNC enabled by default for stable frame pacing (can be disabled via env).
+    if (!qEnvironmentVariableIsSet("QSG_RHI_BACKEND")) {
+        qputenv("QSG_RHI_BACKEND", "d3d11");
+    }
+    if (!qEnvironmentVariableIsSet("QSG_RENDER_LOOP")) {
+        qputenv("QSG_RENDER_LOOP", "threaded");
+    }
+    // Enable MSAA in GPU-heavy mode to avoid jagged edges on custom geometry.
+    // Can be overridden via `QSG_SAMPLES` or `FUSION_MSAA`.
+    if (!qEnvironmentVariableIsSet("QSG_SAMPLES")) {
+        int samples = qEnvironmentVariableIntValue("FUSION_MSAA");
+        if (samples <= 0) {
+            const bool gpuMode =
+                (qEnvironmentVariableIntValue("DOM_GPU") > 0)
+                || (qEnvironmentVariableIntValue("PRINTS_GPU") > 0)
+                || (qEnvironmentVariableIntValue("CLUSTERS_GPU") > 0);
+            samples = gpuMode ? 8 : 0;
+        }
+        if (samples > 0) {
+            qputenv("QSG_SAMPLES", QByteArray::number(samples));
+        }
+    }
+    if (!qEnvironmentVariableIsSet("FUSION_VSYNC")) {
+        qputenv("FUSION_VSYNC", "1");
+    }
+    const int fusionVsync = qEnvironmentVariableIntValue("FUSION_VSYNC");
+    if (fusionVsync == 0 && !qEnvironmentVariableIsSet("QSG_NO_VSYNC")) {
+        qputenv("QSG_NO_VSYNC", "1");
+    }
+    if (qEnvironmentVariableIntValue("FUSION_FORCE_OPENGL") <= 0) {
+        QQuickWindow::setGraphicsApi(QSGRendererInterface::Direct3D11);
+    }
+#endif
+
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
     QCoreApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
     QCoreApplication::setAttribute(Qt::AA_UseStyleSheetPropagationInWidgetStyles);
     QGuiApplication::setHighDpiScaleFactorRoundingPolicy(
         Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
 
-    QSurfaceFormat fmt;
-    fmt.setRenderableType(QSurfaceFormat::OpenGL);
-    fmt.setProfile(QSurfaceFormat::NoProfile);
-    fmt.setSwapBehavior(QSurfaceFormat::DoubleBuffer);
-    fmt.setSamples(4);
-    fmt.setSwapInterval(0);
-    QSurfaceFormat::setDefaultFormat(fmt);
+    qmlRegisterType<GpuDomItem>("Fusion", 1, 0, "GpuDomItem");
+    qmlRegisterType<GpuGridItem>("Fusion", 1, 0, "GpuGridItem");
+    qmlRegisterType<GpuTrailItem>("Fusion", 1, 0, "GpuTrailItem");
+    qmlRegisterType<GpuCirclesItem>("Fusion", 1, 0, "GpuCirclesItem");
+    qmlRegisterType<GpuMarkerItem>("Fusion", 1, 0, "GpuMarkerItem");
+
+    // Only force an OpenGL surface format when explicitly requested.
+    // For Qt 6 Quick on Windows, forcing OpenGL can accidentally route through slow paths.
+    {
+        QSurfaceFormat fmt;
+        if (qEnvironmentVariableIntValue("FUSION_FORCE_OPENGL") > 0) {
+            fmt.setRenderableType(QSurfaceFormat::OpenGL);
+            fmt.setProfile(QSurfaceFormat::NoProfile);
+            fmt.setSwapBehavior(QSurfaceFormat::DoubleBuffer);
+            fmt.setSamples(4);
+        }
+        const int fusionVsync = qEnvironmentVariableIntValue("FUSION_VSYNC");
+        fmt.setSwapInterval(fusionVsync == 0 ? 0 : 1);
+        QSurfaceFormat::setDefaultFormat(fmt);
+    }
 
     QApplication app(argc, argv);
 
@@ -199,7 +270,7 @@ int main(int argc, char **argv)
     QCoreApplication::setOrganizationName(QStringLiteral("Fusion"));
     QCoreApplication::setApplicationName(QStringLiteral("FusionTerminal"));
     QGuiApplication::setApplicationDisplayName(QStringLiteral("Fusion Terminal"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.29-a"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.31-a"));
 
 #ifdef Q_OS_WIN
     // Make Windows use a stable AppUserModelID so pinned/taskbar identity and icon refresh are consistent.
@@ -338,6 +409,8 @@ int main(int argc, char **argv)
     win.show();
     return app.exec();
 }
+
+
 
 
 

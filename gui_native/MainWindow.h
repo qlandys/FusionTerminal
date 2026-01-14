@@ -19,6 +19,7 @@
 #include <QPointer>
 #include <QByteArray>
 #include <QUrl>
+#include <QElapsedTimer>
 #include <array>
 
 class QLabel;
@@ -160,6 +161,7 @@ private:
         DomWidget *dom = nullptr;
         LadderClient *client = nullptr;
         PrintsWidget *prints = nullptr;
+        QWidget *printsWrap = nullptr;
         class ClustersWidget *clusters = nullptr;
         QSplitter *printsDomSplitter = nullptr;
         QSplitter *clustersPrintsSplitter = nullptr;
@@ -217,6 +219,13 @@ private:
         QToolButton *compressionButton = nullptr;
         QToolButton *chatButton = nullptr;
         QToolButton *closeButton = nullptr;
+        QWidget *perfOverlay = nullptr;
+        QLabel *perfPingLabel = nullptr;
+        QLabel *perfOrderPingLabel = nullptr;
+        QLabel *perfFpsLabel = nullptr;
+        QLabel *perfDomHzLabel = nullptr;
+        qint64 lastPingMs = -1;
+        qint64 lastOrderPingMs = -1;
         ChatWindow *chatWindow = nullptr;
         QString accountName;
         QColor accountColor;
@@ -261,6 +270,7 @@ private:
         bool backendManualPinned = false;
     };
 
+    void repositionNotionalOverlay(DomColumn &col);
     void applyDomHighlightPrices(DomColumn &col);
 
     struct WorkspaceTab {
@@ -284,6 +294,8 @@ private:
     void buildUi();
     QWidget *buildTopBar(QWidget *parent);
     QWidget *buildMainArea(QWidget *parent);
+    void updatePerfOverlay(DomColumn &col);
+    void updateAllPerfOverlays();
 
     void createInitialWorkspace();
     void updateTabUnderline(int index);
@@ -580,6 +592,9 @@ private:
 
     QLabel *m_statusLabel;
     QLabel *m_pingLabel;
+    QElapsedTimer m_perfFpsTimer;
+    int m_perfFpsFrames = 0;
+    double m_lastUiFps = 0.0;
     QToolButton *m_alertsButton = nullptr;
     QLabel *m_alertsBadge = nullptr;
     QWidget *m_alertsPanel = nullptr;

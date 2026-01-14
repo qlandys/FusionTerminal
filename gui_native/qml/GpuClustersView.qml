@@ -1,4 +1,5 @@
 import QtQuick 2.15
+import Fusion 1.0
 
 Item {
     id: root
@@ -15,6 +16,7 @@ Item {
     property string fontFamily: "JetBrains Mono"
     property int fontPixelSize: 12
     property string label: ""
+    property bool useGpuClusters: false
 
     Rectangle {
         anchors.fill: parent
@@ -26,10 +28,11 @@ Item {
         anchors.right: parent.right
         height: rowCount * rowHeight
         Canvas {
-            id: hGridCanvas
+            id: hGridCanvasFallback
             anchors.fill: parent
             antialiasing: false
             renderTarget: Canvas.FramebufferObject
+            visible: !root.useGpuClusters
             onPaint: {
                 var ctx = getContext("2d");
                 ctx.reset();
@@ -50,11 +53,20 @@ Item {
             onHeightChanged: requestPaint();
             Connections {
                 target: root
-                function onRowCountChanged() { hGridCanvas.requestPaint(); }
-                function onRowHeightChanged() { hGridCanvas.requestPaint(); }
-                function onGridColorChanged() { hGridCanvas.requestPaint(); }
+                function onRowCountChanged() { hGridCanvasFallback.requestPaint(); }
+                function onRowHeightChanged() { hGridCanvasFallback.requestPaint(); }
+                function onGridColorChanged() { hGridCanvasFallback.requestPaint(); }
             }
             Component.onCompleted: requestPaint();
+        }
+        GpuGridItem {
+            anchors.fill: parent
+            vertical: false
+            count: Math.max(0, root.rowCount)
+            step: Math.max(1, root.rowHeight)
+            color: root.gridColor
+            opacity: 0.35
+            visible: root.useGpuClusters
         }
     }
 
@@ -63,10 +75,11 @@ Item {
         anchors.right: parent.right
         height: rowCount * rowHeight + infoAreaHeight
         Canvas {
-            id: vGridCanvas
+            id: vGridCanvasFallback
             anchors.fill: parent
             antialiasing: false
             renderTarget: Canvas.FramebufferObject
+            visible: !root.useGpuClusters
             onPaint: {
                 var ctx = getContext("2d");
                 ctx.reset();
@@ -88,12 +101,21 @@ Item {
             onHeightChanged: requestPaint();
             Connections {
                 target: root
-                function onColumnCountChanged() { vGridCanvas.requestPaint(); }
-                function onColumnWidthChanged() { vGridCanvas.requestPaint(); }
-                function onGridColorChanged() { vGridCanvas.requestPaint(); }
-                function onInfoAreaHeightChanged() { vGridCanvas.requestPaint(); }
+                function onColumnCountChanged() { vGridCanvasFallback.requestPaint(); }
+                function onColumnWidthChanged() { vGridCanvasFallback.requestPaint(); }
+                function onGridColorChanged() { vGridCanvasFallback.requestPaint(); }
+                function onInfoAreaHeightChanged() { vGridCanvasFallback.requestPaint(); }
             }
             Component.onCompleted: requestPaint();
+        }
+        GpuGridItem {
+            anchors.fill: parent
+            vertical: true
+            count: Math.max(0, root.columnCount)
+            step: Math.max(1, root.columnWidth)
+            color: root.gridColor
+            opacity: 0.6
+            visible: root.useGpuClusters
         }
     }
 

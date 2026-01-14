@@ -251,32 +251,85 @@ static qint64 ceilBucketTick(qint64 tick, qint64 compression)
 
 static BestBucketTicks bestBucketTicksForSnapshot(const DomSnapshot &snap)
 {
-    BestBucketTicks out;
-    if (!(snap.tickSize > 0.0) || !std::isfinite(snap.tickSize)) {
-        return out;
-    }
-
+    BestBucketTicks fromRows;
+    BestBucketTicks fromPrice;
     const qint64 compression = std::max<qint64>(1, snap.compression);
 
-    qint64 bestBidTick = 0;
-    if (snap.bestBid > 0.0 && priceToTick(snap.bestBid, snap.tickSize, bestBidTick)) {
-        out.hasBid = true;
-        out.bidBucketTick = floorBucketTick(bestBidTick, compression);
+    // Prefer deriving best buckets from the actual ladder rows: during volatility the backend can
+    // publish bestBid/bestAsk out-of-sync with the aggregated depth updates, and in GPU mode we
+    // update incrementally. Using row-derived ticks avoids duplicated "best" rows.
+    qint64 bestBidBucket = 0;
+    qint64 bestAskBucket = 0;
+    bool haveBid = false;
+    bool haveAsk = false;
+    for (const auto &lvl : snap.levels) {
+        if (lvl.tick == 0) {
+            continue;
+        }
+        if (lvl.bidQty > 0.0) {
+            if (!haveBid || lvl.tick > bestBidBucket) {
+                bestBidBucket = lvl.tick;
+                haveBid = true;
+            }
+        }
+        if (lvl.askQty > 0.0) {
+            if (!haveAsk || lvl.tick < bestAskBucket) {
+                bestAskBucket = lvl.tick;
+                haveAsk = true;
+            }
+        }
+    }
+    if (haveBid) {
+        fromRows.hasBid = true;
+        fromRows.bidBucketTick = floorBucketTick(bestBidBucket, compression);
+    }
+    if (haveAsk) {
+        fromRows.hasAsk = true;
+        fromRows.askBucketTick = ceilBucketTick(bestAskBucket, compression);
     }
 
-    qint64 bestAskTick = 0;
-    if (snap.bestAsk > 0.0 && priceToTick(snap.bestAsk, snap.tickSize, bestAskTick)) {
-        out.hasAsk = true;
-        out.askBucketTick = ceilBucketTick(bestAskTick, compression);
+    if (snap.bestBid > 0.0 && (snap.tickSize > 0.0) && std::isfinite(snap.tickSize)) {
+        qint64 bestBidTick = 0;
+        if (priceToTick(snap.bestBid, snap.tickSize, bestBidTick)) {
+            fromPrice.hasBid = true;
+            fromPrice.bidBucketTick = floorBucketTick(bestBidTick, compression);
+        }
+    }
+    if (snap.bestAsk > 0.0 && (snap.tickSize > 0.0) && std::isfinite(snap.tickSize)) {
+        qint64 bestAskTick = 0;
+        if (priceToTick(snap.bestAsk, snap.tickSize, bestAskTick)) {
+            fromPrice.hasAsk = true;
+            fromPrice.askBucketTick = ceilBucketTick(bestAskTick, compression);
+        }
     }
 
-    return out;
+    const bool rowsOk =
+        fromRows.hasBid && fromRows.hasAsk && fromRows.bidBucketTick < fromRows.askBucketTick;
+    const bool priceOk =
+        fromPrice.hasBid && fromPrice.hasAsk && fromPrice.bidBucketTick < fromPrice.askBucketTick;
+
+    if (rowsOk) {
+        return fromRows;
+    }
+    if (priceOk) {
+        return fromPrice;
+    }
+    if (fromRows.hasBid || fromRows.hasAsk) {
+        return fromRows;
+    }
+    return fromPrice;
 }
 } // namespace
 
 DomWidget::DomWidget(QWidget *parent)
     : QWidget(parent)
 {
+    m_quickAllowed = !qEnvironmentVariableIsSet("DOM_DISABLE_QML")
+                     && !qEnvironmentVariableIsSet("DOM_FORCE_WIDGET");
+    m_disableIncremental = qEnvironmentVariableIsSet("DOM_DISABLE_INCREMENTAL")
+                           || qEnvironmentVariableIsSet("DOM_FORCE_FULL");
+    m_useGpuDom = qEnvironmentVariableIntValue("DOM_GPU") > 0;
+
     setAutoFillBackground(false);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
@@ -292,8 +345,10 @@ DomWidget::DomWidget(QWidget *parent)
         setStyle(theme->domStyle());
     });
 
-    ensureQuickInitialized();
-    syncQuickProperties();
+    if (m_quickAllowed) {
+        ensureQuickInitialized();
+        syncQuickProperties();
+    }
 }
 
 void DomWidget::updateSnapshot(const DomSnapshot &snapshot)
@@ -316,6 +371,9 @@ void DomWidget::applyPendingSnapshot()
     }
     m_hasPendingSnapshot = false;
     m_snapshot = m_pendingSnapshot;
+    // Force a full per-row recompute for this snapshot. This avoids any chance of stale
+    // GPU incremental rows "sticking" during volatility when deltas are out-of-order.
+    m_forceFullRecalc = true;
 
     const int rows = m_snapshot.levels.size();
     const int rowHeight = m_rowHeight;
@@ -555,8 +613,34 @@ void DomWidget::paintEvent(QPaintEvent *event)
         const QRect priceRect(priceLeft, y, priceColWidth, rowIntHeight);
 
         // Simple side coloring based on which side is larger.
-        const double bidQty = lvl.bidQty;
-        const double askQty = lvl.askQty;
+        double bidQty = lvl.bidQty;
+        double askQty = lvl.askQty;
+        // Extra safety: never render liquidity on the wrong side of the spread buckets.
+        const bool lockedSpread =
+            bestTicks.hasBid && bestTicks.hasAsk && (bestTicks.bidBucketTick == bestTicks.askBucketTick);
+        if (bestTicks.hasBid && lvl.tick != 0) {
+            if (lockedSpread) {
+                if (lvl.tick < bestTicks.bidBucketTick) {
+                    askQty = 0.0;
+                }
+            } else if (lvl.tick <= bestTicks.bidBucketTick) {
+                askQty = 0.0;
+            }
+        }
+        if (bestTicks.hasAsk && lvl.tick != 0) {
+            if (lockedSpread) {
+                if (lvl.tick > bestTicks.askBucketTick) {
+                    bidQty = 0.0;
+                }
+            } else if (lvl.tick >= bestTicks.askBucketTick) {
+                bidQty = 0.0;
+            }
+        }
+        if (!lockedSpread && bestTicks.hasBid && bestTicks.hasAsk && lvl.tick != 0
+            && lvl.tick > bestTicks.bidBucketTick && lvl.tick < bestTicks.askBucketTick) {
+            bidQty = 0.0;
+            askQty = 0.0;
+        }
         const bool hasBid = bidQty > 0.0;
         const bool hasAsk = askQty > 0.0;
         const bool isBestBidRow =
@@ -1059,15 +1143,19 @@ void DomWidget::setVolumeHighlightRules(const QVector<VolumeHighlightRule> &rule
     std::sort(m_volumeRules.begin(), m_volumeRules.end(), [](const VolumeHighlightRule &a, const VolumeHighlightRule &b) {
         return a.threshold < b.threshold;
     });
+    m_forceFullRecalc = true;
+    if (m_quickWidget && m_quickReady) {
+        scheduleQuickSnapshotUpdate();
+    }
     update();
 }
 
 void DomWidget::setLocalOrders(const QVector<LocalOrderMarker> &orders)
 {
     m_localOrders = orders;
+    m_forceFullRecalc = true;
     if (m_quickWidget && m_quickReady) {
-        m_snapshotThrottle.invalidate();
-        updateQuickSnapshot();
+        scheduleQuickSnapshotUpdate();
     }
     update();
 }
@@ -1075,9 +1163,9 @@ void DomWidget::setLocalOrders(const QVector<LocalOrderMarker> &orders)
 void DomWidget::setHighlightPrices(const QVector<double> &prices)
 {
     m_highlightPrices = prices;
+    m_forceFullRecalc = true;
     if (m_quickWidget && m_quickReady) {
-        m_snapshotThrottle.invalidate();
-        updateQuickSnapshot();
+        scheduleQuickSnapshotUpdate();
     }
     update();
 }
@@ -1085,11 +1173,28 @@ void DomWidget::setHighlightPrices(const QVector<double> &prices)
 void DomWidget::setPriceTextMarkers(const QVector<PriceTextMarker> &markers)
 {
     m_priceTextMarkers = markers;
+    m_forceFullRecalc = true;
     if (m_quickWidget && m_quickReady) {
-        m_snapshotThrottle.invalidate();
-        updateQuickSnapshot();
+        scheduleQuickSnapshotUpdate();
     }
     update();
+}
+
+void DomWidget::notifyBucketTicksUpdated(const QVector<qint64> &bucketTicks)
+{
+    if (bucketTicks.isEmpty()) {
+        return;
+    }
+    if (bucketTicks.size() > 4096) {
+        m_dirtyBucketTicks.clear();
+        m_forceFullRecalc = true;
+        return;
+    }
+    for (qint64 t : bucketTicks) {
+        if (t != 0) {
+            m_dirtyBucketTicks.insert(t);
+        }
+    }
 }
 
 void DomWidget::setActionOverlayText(const QString &text)
@@ -1282,6 +1387,7 @@ void DomWidget::syncQuickProperties()
     if (auto *root = m_quickWidget->rootObject()) {
         root->setProperty("rowHeight", m_rowHeight);
         root->setProperty("hoverRow", m_hoverRow);
+        root->setProperty("useGpuDom", m_useGpuDom);
         root->setProperty("backgroundColor", m_style.background);
         root->setProperty("gridColor", m_style.grid);
         root->setProperty("textColor", m_style.text);
@@ -1293,17 +1399,65 @@ void DomWidget::syncQuickProperties()
         root->setProperty("domBridge", QVariant::fromValue(static_cast<QObject *>(this)));
         root->setProperty("levelsModel", QVariant::fromValue(static_cast<QObject *>(&m_levelsModel)));
         updateQuickOverlayProperties();
+        resolveGpuDomItem();
     }
+}
+
+void DomWidget::resolveGpuDomItem()
+{
+    if (!m_useGpuDom || !m_quickWidget || !m_quickReady) {
+        m_gpuDomItem = nullptr;
+        return;
+    }
+    if (m_gpuDomItem) {
+        return;
+    }
+    if (auto *root = m_quickWidget->rootObject()) {
+        if (QObject *obj = root->findChild<QObject *>(QStringLiteral("gpuDom"))) {
+            m_gpuDomItem = qobject_cast<GpuDomItem *>(obj);
+        }
+    }
+}
+
+void DomWidget::scheduleQuickSnapshotUpdate()
+{
+    if (!m_quickAllowed || !m_quickWidget || !m_quickReady) {
+        return;
+    }
+    if (m_quickSnapshotScheduled) {
+        return;
+    }
+    m_quickSnapshotScheduled = true;
+    QTimer::singleShot(0, this, [this]() {
+        m_quickSnapshotScheduled = false;
+        m_snapshotThrottle.invalidate();
+        updateQuickSnapshot();
+    });
 }
 
 void DomWidget::updateQuickSnapshot()
 {
+    if (!m_quickAllowed) {
+        return;
+    }
     if (!m_quickWidget || !m_quickReady) {
         return;
     }
+    resolveGpuDomItem();
     if (auto *root = m_quickWidget->rootObject()) {
+        static const bool profile = qEnvironmentVariableIntValue("FUSION_PROFILE_DOM") > 0;
+        static const int profileThresholdMs = []() {
+            const int v = qEnvironmentVariableIntValue("FUSION_PROFILE_DOM_MS");
+            return v > 0 ? v : 4;
+        }();
+        QElapsedTimer prof;
+        if (profile) {
+            prof.start();
+        }
+
         if (m_snapshotThrottle.isValid()) {
-            if (m_snapshotThrottle.nsecsElapsed() < kMinSnapshotIntervalNs) {
+            const qint64 minNs = m_useGpuDom ? 16000000 : kMinSnapshotIntervalNs; // ~60Hz for GPU DOM, ~120Hz otherwise
+            if (m_snapshotThrottle.nsecsElapsed() < minNs) {
                 return;
             }
             m_snapshotThrottle.restart();
@@ -1314,88 +1468,114 @@ void DomWidget::updateQuickSnapshot()
         const int rowsCount = levels.size();
         if (rowsCount <= 0) {
             m_levelsModel.setRows(QVector<DomLevelsModel::Row>());
+            if (auto *rootObj = m_quickWidget->rootObject()) {
+                if (m_qmlHasOrderHighlights) {
+                    m_qmlHasOrderHighlights = false;
+                    rootObj->setProperty("hasOrderHighlights", false);
+                }
+            }
+            m_orderHighlightCount = 0;
+            m_cachedLayoutValid = false;
+            m_cachedLevelTickSize = 0.0;
             return;
         }
 
-        QFontMetrics fm(font());
-        int maxPriceWidth = 0;
-        for (const auto &lvl : levels) {
-            const QString text =
-                (lvl.tick != 0) ? formatPriceForDisplayFromTick(lvl.tick, m_snapshot.tickSize)
-                                : formatPriceForDisplay(lvl.price, m_snapshot.tickSize);
-            maxPriceWidth = std::max(maxPriceWidth, fm.horizontalAdvance(text));
-        }
-        const QString tinySample = QStringLiteral("(5)12345");
-        maxPriceWidth = std::max(maxPriceWidth, fm.horizontalAdvance(tinySample));
-        const int w = std::max(1, width());
-        const int priceColWidth = std::clamp(maxPriceWidth + 8, 52, std::max(60, w / 3));
-        if (priceColWidth != m_cachedPriceColumnWidth) {
-            root->setProperty("priceColumnWidth", priceColWidth);
-            m_cachedPriceColumnWidth = priceColWidth;
-        }
-
-        QVector<DomLevelsModel::Row> rows;
-        rows.reserve(rowsCount);
         const double bestPriceTolerance = priceTolerance(m_snapshot.tickSize);
         const double tick = m_snapshot.tickSize > 0.0 ? m_snapshot.tickSize : 0.0;
         const BestBucketTicks bestTicks = bestBucketTicksForSnapshot(m_snapshot);
         const qint64 compression = std::max<qint64>(1, m_snapshot.compression);
 
-        struct MarkerAgg {
-            double notional = 0.0;
-            bool buy = true;
-            qint64 createdMs = 0;
-        };
-        QHash<qint64, MarkerAgg> markerByTick;
-        if (!m_localOrders.isEmpty() && tick > 0.0) {
-            markerByTick.reserve(m_localOrders.size());
-            for (const auto &m : m_localOrders) {
-                if (!(m.price > 0.0) || !(m.quantity > 0.0)) {
-                    continue;
-                }
-                qint64 rawTick = 0;
-                if (!priceToTick(m.price, tick, rawTick)) {
-                    continue;
-                }
-                const bool buy = (m.side == OrderSide::Buy);
-                const qint64 bucketTick =
-                    buy ? floorBucketTick(rawTick, compression) : ceilBucketTick(rawTick, compression);
-                MarkerAgg agg = markerByTick.value(bucketTick, MarkerAgg{});
-                agg.notional += std::abs(m.quantity);
-                agg.buy = buy;
-                if (agg.createdMs == 0) {
-                    agg.createdMs = m.createdMs;
-                } else if (m.createdMs > 0) {
-                    agg.createdMs = std::min<qint64>(agg.createdMs, m.createdMs);
-                }
-                markerByTick.insert(bucketTick, agg);
+        // Recompute price column width only when font/tick/width changes.
+        const int w = std::max(1, width());
+        const int fontPx = (font().pixelSize() > 0) ? font().pixelSize() : (font().pointSize() + 2);
+        const QString fontKey = font().family() + QLatin1Char('#') + QString::number(fontPx);
+        const bool priceNeedsRecalc =
+            (m_cachedWidthForPrice != w)
+            || (m_cachedTickForPrice <= 0.0 || std::abs(m_cachedTickForPrice - tick) > 1e-12)
+            || (m_cachedFontKeyForPrice != fontKey);
+        if (priceNeedsRecalc) {
+            QFontMetrics fm(font());
+            int maxPriceWidth = 0;
+            const QString tinySample = QStringLiteral("(5)12345");
+            maxPriceWidth = std::max(maxPriceWidth, fm.horizontalAdvance(tinySample));
+
+            auto updateMaxWidthForLevel = [&](const DomLevel &lvl) {
+                const QString text =
+                    (lvl.tick != 0) ? formatPriceForDisplayFromTick(lvl.tick, tick)
+                                    : formatPriceForDisplay(lvl.price, tick);
+                maxPriceWidth = std::max(maxPriceWidth, fm.horizontalAdvance(text));
+            };
+            if (m_snapshot.bestBid > 0.0) {
+                maxPriceWidth =
+                    std::max(maxPriceWidth,
+                             fm.horizontalAdvance(formatPriceForDisplay(m_snapshot.bestBid, tick)));
             }
+            if (m_snapshot.bestAsk > 0.0) {
+                maxPriceWidth =
+                    std::max(maxPriceWidth,
+                             fm.horizontalAdvance(formatPriceForDisplay(m_snapshot.bestAsk, tick)));
+            }
+            updateMaxWidthForLevel(levels.front());
+            updateMaxWidthForLevel(levels.back());
+            updateMaxWidthForLevel(levels[rowsCount / 2]);
+            const int priceColWidth = std::clamp(maxPriceWidth + 8, 52, std::max(60, w / 3));
+            if (priceColWidth != m_cachedPriceColumnWidth) {
+                root->setProperty("priceColumnWidth", priceColWidth);
+                m_cachedPriceColumnWidth = priceColWidth;
+            }
+            m_cachedWidthForPrice = w;
+            m_cachedFontKeyForPrice = fontKey;
+            m_cachedTickForPrice = tick;
         }
 
-        QSet<qint64> highlightTicks;
-        if (!m_highlightPrices.isEmpty() && tick > 0.0) {
-            highlightTicks.reserve(m_highlightPrices.size() * 2);
-            for (const double p : m_highlightPrices) {
-                if (!(p > 0.0)) continue;
-                qint64 rawTick = 0;
-                if (!priceToTick(p, tick, rawTick)) continue;
-                highlightTicks.insert(floorBucketTick(rawTick, compression));
-                highlightTicks.insert(ceilBucketTick(rawTick, compression));
-            }
-        }
+        const bool tickSizeStable = (m_cachedLevelTickSize > 0.0 && std::abs(m_cachedLevelTickSize - tick) <= 1e-12);
+        const bool layoutStable =
+            !m_disableIncremental
+            && tickSizeStable
+            && m_cachedLayoutValid
+            && (m_cachedLayoutRowsCount == rowsCount)
+            && (m_cachedLayoutCompression == compression)
+            && (m_cachedLayoutMinTick == m_snapshot.minTick)
+            && (m_cachedLayoutMaxTick == m_snapshot.maxTick);
 
-        for (const auto &lvl : levels) {
+        auto computeRow = [&](const DomLevel &lvl, const DomLevelsModel::Row *reuse) -> DomLevelsModel::Row {
             DomLevelsModel::Row row;
-            const double bidQty = lvl.bidQty;
-            const double askQty = lvl.askQty;
+            double bidQty = lvl.bidQty;
+            double askQty = lvl.askQty;
+            // Extra safety: never render liquidity on the wrong side of the spread buckets.
+            const bool lockedSpread =
+                bestTicks.hasBid && bestTicks.hasAsk && (bestTicks.bidBucketTick == bestTicks.askBucketTick);
+            if (bestTicks.hasBid && lvl.tick != 0) {
+                if (lockedSpread) {
+                    if (lvl.tick < bestTicks.bidBucketTick) {
+                        askQty = 0.0;
+                    }
+                } else if (lvl.tick <= bestTicks.bidBucketTick) {
+                    askQty = 0.0;
+                }
+            }
+            if (bestTicks.hasAsk && lvl.tick != 0) {
+                if (lockedSpread) {
+                    if (lvl.tick > bestTicks.askBucketTick) {
+                        bidQty = 0.0;
+                    }
+                } else if (lvl.tick >= bestTicks.askBucketTick) {
+                    bidQty = 0.0;
+                }
+            }
+            if (!lockedSpread && bestTicks.hasBid && bestTicks.hasAsk && lvl.tick != 0
+                && lvl.tick > bestTicks.bidBucketTick && lvl.tick < bestTicks.askBucketTick) {
+                bidQty = 0.0;
+                askQty = 0.0;
+            }
             const bool hasBid = bidQty > 0.0;
             const bool hasAsk = askQty > 0.0;
-            const bool isBestBidRow =
-                (bestTicks.hasBid && lvl.tick == bestTicks.bidBucketTick)
-                || (m_snapshot.bestBid > 0.0 && std::abs(lvl.price - m_snapshot.bestBid) <= bestPriceTolerance);
-            const bool isBestAskRow =
-                (bestTicks.hasAsk && lvl.tick == bestTicks.askBucketTick)
-                || (m_snapshot.bestAsk > 0.0 && std::abs(lvl.price - m_snapshot.bestAsk) <= bestPriceTolerance);
+            // In GPU mode we rely on incremental bucket updates. During volatility a top-of-book
+            // change can briefly be out-of-sync with the per-level deltas. If we use a fuzzy
+            // price tolerance here, multiple adjacent rows can be considered "best" and appear
+            // as duplicated bids/asks until a full rebuild.
+            const bool isBestBidRow = bestTicks.hasBid && (lvl.tick != 0 && lvl.tick == bestTicks.bidBucketTick);
+            const bool isBestAskRow = bestTicks.hasAsk && (lvl.tick != 0 && lvl.tick == bestTicks.askBucketTick);
 
             QColor rowColor = m_style.background;
             if (hasBid || hasAsk) {
@@ -1489,9 +1669,13 @@ void DomWidget::updateQuickSnapshot()
             }
 
             row.price = lvl.price;
-            row.priceText =
-                (lvl.tick != 0) ? formatPriceForDisplayFromTick(lvl.tick, tick)
-                                : formatPriceForDisplay(lvl.price, tick);
+            if (reuse && !reuse->priceText.isEmpty() && tickSizeStable) {
+                row.priceText = reuse->priceText;
+            } else {
+                row.priceText =
+                    (lvl.tick != 0) ? formatPriceForDisplayFromTick(lvl.tick, tick)
+                                    : formatPriceForDisplay(lvl.price, tick);
+            }
             row.bidQty = bidQty;
             row.askQty = askQty;
             row.bookColor = bookColor;
@@ -1501,9 +1685,9 @@ void DomWidget::updateQuickSnapshot()
             row.volumeFillRatio = volumeRatio;
             row.volumeFillColor = volumeFillColor;
 
-            if (!markerByTick.isEmpty()) {
-                const auto it = markerByTick.constFind(lvl.tick);
-                if (it != markerByTick.constEnd() && it->notional > 0.0) {
+            if (!m_cachedMarkersByTick.isEmpty()) {
+                const auto it = m_cachedMarkersByTick.constFind(lvl.tick);
+                if (it != m_cachedMarkersByTick.constEnd() && it->notional > 0.0) {
                     row.markerText = formatQty(it->notional);
                     row.markerBuy = it->buy;
                     QColor fill = it->buy ? m_style.bid : m_style.ask;
@@ -1515,10 +1699,227 @@ void DomWidget::updateQuickSnapshot()
                     row.markerBorderColor = border;
                 }
             }
-            row.orderHighlight = (!row.markerText.isEmpty()) || (!highlightTicks.isEmpty() && highlightTicks.contains(lvl.tick));
+            row.orderHighlight = (!row.markerText.isEmpty()) || (!m_cachedHighlightTicks.isEmpty() && m_cachedHighlightTicks.contains(lvl.tick));
 
-            rows.append(row);
+            return row;
+        };
+
+        auto rebuildCachedMarkersIfNeeded = [&]() {
+            if (tick <= 0.0 || compression <= 0) {
+                m_cachedMarkersByTick.clear();
+                m_cachedMarkersOrdersHash = 0;
+                m_cachedMarkersCompression = compression;
+                m_cachedMarkersTickSize = tick;
+                return;
+            }
+            int h = 0;
+            for (const auto &m : m_localOrders) {
+                h ^= qHash(m.orderId);
+                h ^= qHash(static_cast<qint64>(std::llround(m.price * 100000.0)));
+                h ^= qHash(static_cast<qint64>(std::llround(m.quantity * 100000.0)));
+                h ^= qHash(static_cast<int>(m.side));
+            }
+            if (h == m_cachedMarkersOrdersHash
+                && m_cachedMarkersCompression == compression
+                && (m_cachedMarkersTickSize > 0.0 && std::abs(m_cachedMarkersTickSize - tick) <= 1e-12)) {
+                return;
+            }
+            m_cachedMarkersOrdersHash = h;
+            m_cachedMarkersCompression = compression;
+            m_cachedMarkersTickSize = tick;
+            m_cachedMarkersByTick.clear();
+            if (m_localOrders.isEmpty()) {
+                return;
+            }
+            m_cachedMarkersByTick.reserve(m_localOrders.size());
+            for (const auto &m : m_localOrders) {
+                if (!(m.price > 0.0) || !(m.quantity > 0.0)) {
+                    continue;
+                }
+                qint64 rawTick = 0;
+                if (!priceToTick(m.price, tick, rawTick)) {
+                    continue;
+                }
+                const bool buy = (m.side == OrderSide::Buy);
+                const qint64 bucketTick =
+                    buy ? floorBucketTick(rawTick, compression) : ceilBucketTick(rawTick, compression);
+                MarkerAgg agg = m_cachedMarkersByTick.value(bucketTick, MarkerAgg{});
+                agg.notional += std::abs(m.quantity);
+                agg.buy = buy;
+                if (agg.createdMs == 0) {
+                    agg.createdMs = m.createdMs;
+                } else if (m.createdMs > 0) {
+                    agg.createdMs = std::min<qint64>(agg.createdMs, m.createdMs);
+                }
+                m_cachedMarkersByTick.insert(bucketTick, agg);
+            }
+        };
+
+        auto rebuildCachedHighlightsIfNeeded = [&]() {
+            if (tick <= 0.0 || compression <= 0) {
+                m_cachedHighlightTicks.clear();
+                m_cachedHighlightHash = 0;
+                m_cachedHighlightCompression = compression;
+                m_cachedHighlightTickSize = tick;
+                return;
+            }
+            int h = 0;
+            for (double p : m_highlightPrices) {
+                h ^= qHash(static_cast<qint64>(std::llround(p * 100000.0)));
+            }
+            if (h == m_cachedHighlightHash
+                && m_cachedHighlightCompression == compression
+                && (m_cachedHighlightTickSize > 0.0 && std::abs(m_cachedHighlightTickSize - tick) <= 1e-12)) {
+                return;
+            }
+            m_cachedHighlightHash = h;
+            m_cachedHighlightCompression = compression;
+            m_cachedHighlightTickSize = tick;
+            m_cachedHighlightTicks.clear();
+            if (m_highlightPrices.isEmpty()) {
+                return;
+            }
+            m_cachedHighlightTicks.reserve(m_highlightPrices.size() * 2);
+            for (const double p : m_highlightPrices) {
+                if (!(p > 0.0)) continue;
+                qint64 rawTick = 0;
+                if (!priceToTick(p, tick, rawTick)) continue;
+                m_cachedHighlightTicks.insert(floorBucketTick(rawTick, compression));
+                m_cachedHighlightTicks.insert(ceilBucketTick(rawTick, compression));
+            }
+        };
+
+        auto tickToIndex = [&](qint64 tickKey) -> int {
+            if (!m_cachedLayoutValid || compression <= 0 || rowsCount <= 0) {
+                return -1;
+            }
+            if (tickKey < m_snapshot.minTick || tickKey > m_snapshot.maxTick) {
+                return -1;
+            }
+            const qint64 delta = m_snapshot.maxTick - tickKey;
+            if (delta < 0) {
+                return -1;
+            }
+            if ((delta % compression) != 0) {
+                return -1;
+            }
+            const qint64 idx = delta / compression;
+            if (idx < 0 || idx >= rowsCount) {
+                return -1;
+            }
+            return static_cast<int>(idx);
+        };
+
+        if (!layoutStable) {
+            rebuildCachedMarkersIfNeeded();
+            rebuildCachedHighlightsIfNeeded();
+            QVector<DomLevelsModel::Row> rows;
+            rows.reserve(rowsCount);
+            int highlightCount = 0;
+            for (int i = 0; i < rowsCount; ++i) {
+                DomLevelsModel::Row row = computeRow(levels[i], nullptr);
+                if (row.orderHighlight) {
+                    ++highlightCount;
+                }
+                rows.append(std::move(row));
+            }
+            m_orderHighlightCount = highlightCount;
+            {
+                const bool has = highlightCount > 0;
+                if (has != m_qmlHasOrderHighlights) {
+                    m_qmlHasOrderHighlights = has;
+                    root->setProperty("hasOrderHighlights", has);
+                }
+            }
+            m_cachedLevelTickSize = tick;
+            m_cachedLayoutMinTick = m_snapshot.minTick;
+            m_cachedLayoutMaxTick = m_snapshot.maxTick;
+            m_cachedLayoutCompression = compression;
+            m_cachedLayoutRowsCount = rowsCount;
+            m_cachedLayoutValid = true;
+            m_dirtyBucketTicks.clear();
+            m_forceFullRecalc = false;
+            if (m_gpuDomItem) {
+                m_gpuDomItem->setRows(rows);
+            }
+            m_levelsModel.setRows(std::move(rows));
+            if (profile) {
+                const int elapsed = static_cast<int>(prof.elapsed());
+                if (elapsed >= profileThresholdMs) {
+                    qWarning() << "[DomWidget] full rebuild" << rowsCount << "rows in" << elapsed << "ms";
+                }
+            }
+            return;
         }
-        m_levelsModel.setRows(std::move(rows));
+
+        if (!m_forceFullRecalc && m_dirtyBucketTicks.isEmpty()) {
+            if (profile) {
+                const int elapsed = static_cast<int>(prof.elapsed());
+                if (elapsed >= profileThresholdMs) {
+                    qWarning() << "[DomWidget] noop frame took" << elapsed << "ms";
+                }
+            }
+            return;
+        }
+
+        rebuildCachedMarkersIfNeeded();
+        rebuildCachedHighlightsIfNeeded();
+
+        QVector<int> changedIndices;
+        QVector<DomLevelsModel::Row> changedRows;
+        changedIndices.reserve(64);
+        changedRows.reserve(64);
+        int highlightDelta = 0;
+        if (m_forceFullRecalc) {
+            for (int i = 0; i < rowsCount; ++i) {
+                const DomLevelsModel::Row &oldRow = m_levelsModel.rowAt(i);
+                const DomLevelsModel::Row next = computeRow(levels[i], &oldRow);
+                if (next != oldRow) {
+                    if (oldRow.orderHighlight != next.orderHighlight) {
+                        highlightDelta += next.orderHighlight ? 1 : -1;
+                    }
+                    changedIndices.push_back(i);
+                    changedRows.push_back(next);
+                }
+            }
+        } else {
+            for (qint64 tickKey : std::as_const(m_dirtyBucketTicks)) {
+                const int i = tickToIndex(tickKey);
+                if (i < 0 || i >= rowsCount) {
+                    continue;
+                }
+                const DomLevelsModel::Row &oldRow = m_levelsModel.rowAt(i);
+                const DomLevelsModel::Row next = computeRow(levels[i], &oldRow);
+                if (next != oldRow) {
+                    if (oldRow.orderHighlight != next.orderHighlight) {
+                        highlightDelta += next.orderHighlight ? 1 : -1;
+                    }
+                    changedIndices.push_back(i);
+                    changedRows.push_back(next);
+                }
+            }
+        }
+        const int dirtyCount = m_dirtyBucketTicks.size();
+        m_dirtyBucketTicks.clear();
+        m_forceFullRecalc = false;
+        if (highlightDelta != 0) {
+            m_orderHighlightCount = std::max(0, m_orderHighlightCount + highlightDelta);
+            const bool has = m_orderHighlightCount > 0;
+            if (has != m_qmlHasOrderHighlights) {
+                m_qmlHasOrderHighlights = has;
+                root->setProperty("hasOrderHighlights", has);
+            }
+        }
+        m_levelsModel.updateRows(changedIndices, changedRows);
+        if (m_gpuDomItem) {
+            m_gpuDomItem->updateRows(changedIndices, changedRows);
+        }
+        if (profile) {
+            const int elapsed = static_cast<int>(prof.elapsed());
+            if (elapsed >= profileThresholdMs) {
+                qWarning() << "[DomWidget] update rowsChanged=" << changedIndices.size()
+                           << "dirty=" << dirtyCount << "in" << elapsed << "ms";
+            }
+        }
     }
 }

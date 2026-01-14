@@ -65,6 +65,10 @@ static QString fusionLogFilePath()
 
 static void logToFile(const QString &msg)
 {
+    static const bool enabled = qEnvironmentVariableIntValue("FUSION_FILE_LOG") > 0;
+    if (!enabled) {
+        return;
+    }
     const QString path = fusionLogFilePath();
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) return;

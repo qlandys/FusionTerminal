@@ -45,6 +45,7 @@ public:
     QHash<int, QByteArray> roleNames() const override;
 
     void setEntries(QVector<Entry> entries);
+    const QVector<Entry> &entries() const { return m_entries; }
 
     Q_INVOKABLE QVariantMap get(int index) const;
 
@@ -94,6 +95,7 @@ public:
     QHash<int, QByteArray> roleNames() const override;
 
     void setEntries(QVector<Entry> entries);
+    const QVector<Entry> &entries() const { return m_entries; }
 
 private:
     QVector<Entry> m_entries;
@@ -135,6 +137,7 @@ public:
     QHash<int, QByteArray> roleNames() const override;
 
     void setEntries(QVector<Entry> entries);
+    const QVector<Entry> &entries() const { return m_entries; }
 
 private:
     QVector<Entry> m_entries;

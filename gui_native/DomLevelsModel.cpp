@@ -1,5 +1,6 @@
 #include "DomLevelsModel.h"
 
+#include <algorithm>
 #include <utility>
 
 DomLevelsModel::DomLevelsModel(QObject *parent)
@@ -95,6 +96,9 @@ void DomLevelsModel::setRows(QVector<Row> rows)
             changed.append(i);
         }
     }
+    if (changed.isEmpty()) {
+        return;
+    }
     int rangeStart = -1;
     int last = -1;
     const QVector<int> roles = {
@@ -113,6 +117,81 @@ void DomLevelsModel::setRows(QVector<Row> rows)
         MarkerBorderColorRole,
         MarkerBuyRole,
         OrderHighlightRole};
+    for (int idx : changed) {
+        if (rangeStart < 0) {
+            rangeStart = last = idx;
+        } else if (idx == last + 1) {
+            last = idx;
+        } else {
+            const QModelIndex top = createIndex(rangeStart, 0);
+            const QModelIndex bottom = createIndex(last, 0);
+            emit dataChanged(top, bottom, roles);
+            rangeStart = last = idx;
+        }
+    }
+    if (rangeStart >= 0) {
+        const QModelIndex top = createIndex(rangeStart, 0);
+        const QModelIndex bottom = createIndex(last, 0);
+        emit dataChanged(top, bottom, roles);
+    }
+}
+
+const DomLevelsModel::Row &DomLevelsModel::rowAt(int index) const
+{
+    static const Row empty;
+    if (index < 0 || index >= m_rows.size()) {
+        return empty;
+    }
+    return m_rows.at(index);
+}
+
+void DomLevelsModel::updateRows(const QVector<int> &indices, const QVector<Row> &rows)
+{
+    if (indices.isEmpty() || rows.isEmpty() || indices.size() != rows.size()) {
+        return;
+    }
+    if (m_rows.isEmpty()) {
+        return;
+    }
+
+    QVector<int> changed;
+    changed.reserve(indices.size());
+    for (int i = 0; i < indices.size(); ++i) {
+        const int idx = indices[i];
+        if (idx < 0 || idx >= m_rows.size()) {
+            continue;
+        }
+        if (rows[i] != m_rows[idx]) {
+            m_rows[idx] = rows[i];
+            changed.push_back(idx);
+        }
+    }
+    if (changed.isEmpty()) {
+        return;
+    }
+
+    std::sort(changed.begin(), changed.end());
+    changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
+
+    int rangeStart = -1;
+    int last = -1;
+    const QVector<int> roles = {
+        PriceRole,
+        BidQtyRole,
+        AskQtyRole,
+        PriceTextRole,
+        BookColorRole,
+        PriceBgColorRole,
+        VolumeTextRole,
+        VolumeTextColorRole,
+        VolumeFillColorRole,
+        VolumeFillRatioRole,
+        MarkerTextRole,
+        MarkerFillColorRole,
+        MarkerBorderColorRole,
+        MarkerBuyRole,
+        OrderHighlightRole};
+
     for (int idx : changed) {
         if (rangeStart < 0) {
             rangeStart = last = idx;

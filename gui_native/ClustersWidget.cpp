@@ -23,9 +23,23 @@ QString formatQtyShort(double v)
 }
 } // namespace
 
+static bool clustersUseQml()
+{
+    // Default: use QML (old visuals).
+    // Compatibility: allow explicit enable/disable via env.
+    if (qEnvironmentVariableIsSet("CLUSTERS_USE_QML") || qEnvironmentVariableIsSet("GPU_CLUSTERS_QML")) {
+        return qEnvironmentVariableIntValue("CLUSTERS_USE_QML") > 0
+            || qEnvironmentVariableIntValue("GPU_CLUSTERS_QML") > 0;
+    }
+    return !(qEnvironmentVariableIntValue("CLUSTERS_DISABLE_QML") > 0
+             || qEnvironmentVariableIntValue("GPU_CLUSTERS_DISABLE_QML") > 0);
+}
+
 ClustersWidget::ClustersWidget(QWidget *parent)
     : QWidget(parent)
 {
+    m_useGpuClusters = (qEnvironmentVariableIntValue("CLUSTERS_GPU") > 0)
+                       || (qEnvironmentVariableIntValue("DOM_GPU") > 0);
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
     setMinimumWidth(0);
     setMaximumWidth(4000);
@@ -36,6 +50,7 @@ ClustersWidget::ClustersWidget(QWidget *parent)
         setStyleSheet(QStringLiteral("background-color: %1;")
                           .arg(theme->windowBackground().name(QColor::HexRgb)));
         syncQuickProperties();
+        update();
     });
     ensureQuickInitialized();
 }
@@ -89,6 +104,87 @@ QSize ClustersWidget::minimumSizeHint() const
 void ClustersWidget::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
+    if (m_quickWidget) {
+        return;
+    }
+    QPainter p(this);
+    ThemeManager *theme = ThemeManager::instance();
+    p.fillRect(rect(), theme->panelBackground());
+
+    if (!m_prints) {
+        return;
+    }
+
+    const int bucketCount = std::clamp(m_prints->clusterBucketCount(), 1, 12);
+    const int colWidth = std::max(18, width() / std::max(1, bucketCount));
+    const int gridHeight = m_rowCount * m_rowHeight;
+    const QRect gridRect(0, 0, width(), gridHeight);
+
+    // Grid lines
+    p.setPen(QPen(theme->gridColor(), 1.0));
+    for (int r = 0; r <= m_rowCount; ++r) {
+        const int y = r * m_rowHeight;
+        p.drawLine(0, y, width(), y);
+    }
+    for (int c = 0; c <= bucketCount; ++c) {
+        const int x = c * colWidth;
+        p.drawLine(x, 0, x, gridHeight);
+    }
+
+    // Cells
+    const auto &cells = static_cast<PrintClustersModel *>(m_prints->clustersModelObject())->entries();
+    QFont f = font();
+    p.setFont(f);
+    const QFontMetrics fm(f);
+    for (const auto &e : cells) {
+        if (e.row < 0 || e.row >= m_rowCount) {
+            continue;
+        }
+        if (e.col < 0 || e.col >= bucketCount) {
+            continue;
+        }
+        const QRect cellRect(e.col * colWidth,
+                             e.row * m_rowHeight,
+                             colWidth,
+                             m_rowHeight);
+        p.fillRect(cellRect, e.bgColor);
+        if (!e.text.isEmpty()) {
+            p.setPen(e.textColor);
+            const QString elided = fm.elidedText(e.text, Qt::ElideRight, std::max(0, colWidth - 4));
+            p.drawText(cellRect.adjusted(2, 0, -2, 0), Qt::AlignVCenter | Qt::AlignLeft, elided);
+        }
+    }
+
+    // Footer labels/totals
+    const int footerY = gridHeight;
+    const int footerH = std::max(0, height() - footerY);
+    if (footerH > 0) {
+        p.fillRect(QRect(0, footerY, width(), footerH), theme->panelBackground());
+        p.setPen(theme->gridColor());
+        p.drawLine(0, footerY, width(), footerY);
+
+        const int ms = std::max(100, m_prints->clusterWindowMs());
+        const QVector<qint64> startMs = m_prints->clusterBucketStartMs();
+        const QVector<double> totals = m_prints->clusterBucketTotals();
+        const bool showSeconds = ms < 60000;
+        for (int c = 0; c < bucketCount; ++c) {
+            const QRect colRect(c * colWidth, footerY, colWidth, footerH);
+            QString timeText;
+            const qint64 ts = (c < startMs.size()) ? startMs[c] : 0;
+            if (ts > 0) {
+                const QDateTime dt = QDateTime::fromMSecsSinceEpoch(ts);
+                timeText = dt.toString(showSeconds ? QStringLiteral("HH:mm:ss")
+                                                   : QStringLiteral("HH:mm"));
+            }
+            const double tv = (c < totals.size()) ? totals[c] : 0.0;
+            const QString totText = tv > 0.0 ? formatQtyShort(tv) : QString();
+
+            p.setPen(theme->textSecondary());
+            p.drawText(colRect.adjusted(2, 2, -2, -2), Qt::AlignTop | Qt::AlignLeft, timeText);
+            p.setPen(theme->textPrimary());
+            p.drawText(colRect.adjusted(2, 2, -2, -2), Qt::AlignBottom | Qt::AlignLeft, totText);
+        }
+    }
 }
 
 void ClustersWidget::resizeEvent(QResizeEvent *event)
@@ -97,6 +193,7 @@ void ClustersWidget::resizeEvent(QResizeEvent *event)
         m_quickWidget->setGeometry(rect());
     }
     syncQuickProperties();
+    update();
     QWidget::resizeEvent(event);
 }
 
@@ -136,6 +233,9 @@ void ClustersWidget::contextMenuEvent(QContextMenuEvent *event)
 
 void ClustersWidget::ensureQuickInitialized()
 {
+    if (!clustersUseQml()) {
+        return;
+    }
     if (m_quickWidget) {
         return;
     }
@@ -167,6 +267,7 @@ void ClustersWidget::ensureQuickInitialized()
 void ClustersWidget::syncQuickProperties()
 {
     if (!m_quickWidget || !m_quickReady) {
+        update();
         return;
     }
     if (auto *root = m_quickWidget->rootObject()) {
@@ -174,6 +275,7 @@ void ClustersWidget::syncQuickProperties()
         root->setProperty("rowHeight", m_rowHeight);
         root->setProperty("rowCount", m_rowCount);
         root->setProperty("infoAreaHeight", m_infoAreaHeight);
+        root->setProperty("useGpuClusters", m_useGpuClusters);
         root->setProperty("backgroundColor", theme->panelBackground());
         root->setProperty("gridColor", theme->gridColor());
         const int bucketCount = m_prints ? std::clamp(m_prints->clusterBucketCount(), 1, 12) : 1;

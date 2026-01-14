@@ -1,8 +1,10 @@
 import QtQuick 2.15
+import Fusion 1.0
 
 Item {
     id: root
     property var levelsModel: null
+    property bool useGpuDom: false
     property int rowHeight: 14
     property color backgroundColor: "#121212"
     property color gridColor: "#1f1f1f"
@@ -23,10 +25,12 @@ Item {
     property string actionOverlayText: ""
     // Shared phase. Keep it synced with the marker "shine" animation in `GpuPrintsView.qml`.
     property real orderHighlightPhase: 0.0
+    // Set by C++ (`DomWidget`) so we don't animate every DOM 60fps when there's nothing to highlight.
+    property bool hasOrderHighlights: false
 
     NumberAnimation on orderHighlightPhase {
         loops: Animation.Infinite
-        running: true
+        running: root.useGpuDom && root.hasOrderHighlights
         from: 0.0
         to: 1.0
         duration: 1100
@@ -48,6 +52,98 @@ Item {
         color: backgroundColor
     }
 
+    Item {
+        id: gpuLayer
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: actionOverlay.visible
+                        ? actionOverlay.top
+                        : (positionBar.visible ? positionBar.top : parent.bottom)
+        clip: true
+        visible: root.useGpuDom
+
+        GpuDomItem {
+            id: gpuDom
+            objectName: "gpuDom"
+            anchors.fill: parent
+            rowHeight: root.rowHeight
+            priceColumnWidth: root.priceColumnWidth
+            backgroundColor: root.backgroundColor
+            gridColor: root.gridColor
+            hoverColor: "#2860ff"
+            priceBorderColor: root.priceBorderColor
+            hoverRow: root.hoverRow
+            orderHighlightPhase: root.orderHighlightPhase
+            positionActive: root.positionActive
+            positionEntryPrice: root.positionEntryPrice
+            positionMarkPrice: root.positionMarkPrice
+            tickSize: root.tickSize
+            positionPnlColor: root.positionPnlColor
+        }
+
+        // Text overlay (virtualized): keep QML node count low in GPU mode.
+        // Repeater would instantiate thousands of delegates and cause periodic freezes when volatility spikes.
+        ListView {
+            id: gpuTextView
+            anchors.fill: parent
+            clip: true
+            interactive: false
+            spacing: 0
+            model: root.levelsModel
+            reuseItems: true
+            cacheBuffer: root.rowHeight * 40
+            visible: true
+
+            delegate: Item {
+                width: ListView.view ? ListView.view.width : root.width
+                height: root.rowHeight
+                property double levelPrice: typeof price !== "undefined" ? price : 0
+                property string levelPriceText: typeof priceText !== "undefined" ? priceText : ""
+                property string levelVolumeText: typeof volumeText !== "undefined" ? volumeText : ""
+                property color levelVolumeTextColor: typeof volumeTextColor !== "undefined" ? volumeTextColor : root.textColor
+
+                property real positionTol: Math.max(1e-8, root.tickSize > 0 ? root.tickSize * 0.25 : 1e-8)
+                property real positionRangeMin: Math.min(root.positionEntryPrice, root.positionMarkPrice)
+                property real positionRangeMax: Math.max(root.positionEntryPrice, root.positionMarkPrice)
+                property bool inPositionRange: root.positionActive
+                                    && root.positionEntryPrice > 0 && root.positionMarkPrice > 0
+                                    && (levelPrice + positionTol >= positionRangeMin)
+                                    && (levelPrice - positionTol <= positionRangeMax)
+                property bool isMarkRow: root.positionActive
+                               && root.positionMarkPrice > 0
+                               && Math.abs(levelPrice - root.positionMarkPrice) <= positionTol
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.left: parent.left
+                    anchors.leftMargin: 4
+                    width: Math.max(0, parent.width - root.priceColumnWidth - 8)
+                    text: levelVolumeText
+                    color: levelVolumeTextColor
+                    visible: levelVolumeText.length > 0
+                    font.pixelSize: Math.max(10, root.rowHeight - 4)
+                    font.bold: true
+                    elide: Text.ElideRight
+                }
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.right: parent.right
+                    anchors.rightMargin: 6
+                    width: root.priceColumnWidth - 12
+                    horizontalAlignment: Text.AlignRight
+                    text: levelPriceText
+                    color: inPositionRange ? root.positionPnlColor : root.textColor
+                    font.pixelSize: Math.max(10, root.priceFontPixelSize)
+                    font.family: root.priceFontFamily
+                    font.bold: isMarkRow
+                    elide: Text.ElideLeft
+                }
+            }
+        }
+    }
+
     ListView {
         id: levelsView
         anchors.left: parent.left
@@ -60,6 +156,7 @@ Item {
         clip: true
         model: root.levelsModel
         interactive: false
+        visible: !root.useGpuDom
 
         delegate: Item {
             id: rowItem

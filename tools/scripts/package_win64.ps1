@@ -14,17 +14,21 @@ function Assert-LastExitCode([string]$step) {
 }
 
 Write-Host "[1/4] Configure (CMake)..." -ForegroundColor Cyan
-cmake -S . -B $buildDir | Out-Host
+cmake -S . -B $buildDir
 Assert-LastExitCode "CMake configure"
 
 Write-Host "[2/4] Build (Release)..." -ForegroundColor Cyan
-cmake --build $buildDir --config Release --target FusionTerminal orderbook_backend FusionUpdater | Out-Host
+cmake --build $buildDir --config Release --target FusionTerminal orderbook_backend FusionUpdater
 Assert-LastExitCode "CMake build"
 
 Write-Host "[3/4] Copy EXEs..." -ForegroundColor Cyan
+$fusionExe = Join-Path $buildDir "Release/FusionTerminal.exe"
+$backendExe = Join-Path $buildDir "Release/orderbook_backend.exe"
+if (-not (Test-Path $fusionExe)) { throw "Build did not produce $fusionExe" }
+if (-not (Test-Path $backendExe)) { throw "Build did not produce $backendExe" }
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-Copy-Item -Force "$buildDir/Release/FusionTerminal.exe" "$releaseDir/FusionTerminal.exe"
-Copy-Item -Force "$buildDir/Release/orderbook_backend.exe" "$releaseDir/orderbook_backend.exe"
+Copy-Item -Force $fusionExe "$releaseDir/FusionTerminal.exe"
+Copy-Item -Force $backendExe "$releaseDir/orderbook_backend.exe"
 if (Test-Path "$buildDir/Release/FusionUpdater.exe") {
   Copy-Item -Force "$buildDir/Release/FusionUpdater.exe" "$releaseDir/FusionUpdater.exe"
 }
@@ -53,7 +57,7 @@ if (-not $windeployqt) {
   throw "windeployqt.exe not found (add Qt bin to PATH or install Qt)."
 }
 
-& $windeployqt --release --no-translations --no-system-d3d-compiler --dir $releaseDir "$buildDir/Release/FusionTerminal.exe" | Out-Host
+& $windeployqt --release --no-translations --no-system-d3d-compiler --dir $releaseDir $fusionExe
 Assert-LastExitCode "windeployqt"
 
 # MSVC runtime DLLs (so it runs on clean Windows without VC++ redist installed)

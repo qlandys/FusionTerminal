@@ -270,7 +270,7 @@ int main(int argc, char **argv)
     QCoreApplication::setOrganizationName(QStringLiteral("Fusion"));
     QCoreApplication::setApplicationName(QStringLiteral("FusionTerminal"));
     QGuiApplication::setApplicationDisplayName(QStringLiteral("Fusion Terminal"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.32-a"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.33-a"));
 
 #ifdef Q_OS_WIN
     // Make Windows use a stable AppUserModelID so pinned/taskbar identity and icon refresh are consistent.
@@ -409,6 +409,7 @@ int main(int argc, char **argv)
     win.show();
     return app.exec();
 }
+
 
 
 

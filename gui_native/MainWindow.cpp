@@ -5026,10 +5026,12 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
             .arg(QString::number(price, 'f', 5)),
         2000);
 
-    // UX: when clicking at/through the top-of-book on Lighter perps, the order usually fills immediately
-    // but private position updates can arrive with a short delay. Show an optimistic position overlay
+    // Optional UX: when clicking at/through the top-of-book on Lighter perps, the order usually fills immediately
+    // but private position updates can arrive with a short delay. When enabled, show an optimistic position overlay
     // and let the true WS position update override it.
-    if (lighterPerp && column->dom) {
+    const bool allowOptimisticPositionHint =
+        qEnvironmentVariableIntValue("DOM_OPTIMISTIC_POSITION_HINT") > 0;
+    if (allowOptimisticPositionHint && lighterPerp && column->dom) {
         const double bestAsk = column->dom->bestAsk();
         const double bestBid = column->dom->bestBid();
         const double tick = std::max(1e-12, column->dom->tickSize());

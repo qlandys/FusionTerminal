@@ -59,6 +59,7 @@
 #include <QSignalBlocker>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QPointer>
 #include <QSizeGrip>
 #include <QVariant>
 #include <QVBoxLayout>
@@ -81,6 +82,136 @@
 #include <QEasingCurve>
 
 namespace {
+QString formatClusterQtyShort(double v)
+{
+    const double av = std::abs(v);
+    if (av >= 1000000.0) {
+        const double m = av / 1000000.0;
+        const int prec = (m >= 100.0) ? 0 : (m >= 10.0 ? 1 : 2);
+        return QString::number(m, 'f', prec) + "M";
+    }
+    if (av >= 1000.0) {
+        const double k = av / 1000.0;
+        const int prec = (k >= 100.0) ? 0 : (k >= 10.0 ? 1 : 2);
+        return QString::number(k, 'f', prec) + "K";
+    }
+    const int prec = (av >= 100.0) ? 0 : (av >= 10.0 ? 1 : 2);
+    return QString::number(av, 'f', prec);
+}
+
+class ClustersFooterOverlay final : public QWidget {
+public:
+    explicit ClustersFooterOverlay(QWidget *parent, PrintsWidget *prints, ClustersWidget *clusters)
+        : QWidget(parent)
+        , m_prints(prints)
+        , m_clusters(clusters)
+    {
+        setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        setAttribute(Qt::WA_NoSystemBackground, true);
+        setAutoFillBackground(false);
+        setFixedHeight(26);
+    }
+
+protected:
+    void paintEvent(QPaintEvent *event) override
+    {
+        Q_UNUSED(event);
+        auto *theme = ThemeManager::instance();
+        QPainter p(this);
+        p.fillRect(rect(), theme->panelBackground());
+        p.setPen(theme->gridColor());
+        p.drawLine(0, 0, width(), 0);
+        p.drawLine(0, height() / 2, width(), height() / 2);
+
+        if (!m_prints) {
+            return;
+        }
+
+        const int bucketCount = std::clamp(m_prints->clusterBucketCount(), 1, PrintsWidget::kMaxClusterBuckets);
+        int colWidth = std::max(18, width() / std::max(1, bucketCount));
+        int visibleCount = bucketCount;
+        int bucketOffset = 0;
+        int xOrigin = 0;
+        if (m_clusters) {
+            colWidth = std::max(18, m_clusters->effectiveColumnWidth());
+            visibleCount = std::clamp(m_clusters->visibleBucketCount(), 1, bucketCount);
+            bucketOffset = std::clamp(m_clusters->bucketOffset(), 0, std::max(0, bucketCount - visibleCount));
+            xOrigin = m_clusters->xOrigin();
+        }
+        const int ms = std::max(100, m_prints->clusterWindowMs());
+        const QVector<qint64> startMs = m_prints->clusterBucketStartMs();
+        const QVector<double> totals = m_prints->clusterBucketTotals();
+        const bool showSeconds = ms < 60000;
+
+        QFont f = font();
+        const int basePx = f.pixelSize() > 0 ? f.pixelSize() : std::max(10, f.pointSize() + 2);
+        const int maxPx = std::max(8, basePx - 2);
+
+        auto drawFit = [&](const QRect &r, const QString &text, const QColor &color, bool bold) {
+            if (text.isEmpty() || r.width() <= 2 || r.height() <= 2) {
+                return;
+            }
+            int px = maxPx;
+            QFont tf = font();
+            tf.setBold(bold);
+            for (; px >= 5; --px) {
+                tf.setPixelSize(px);
+                const QFontMetrics m(tf);
+                if (m.horizontalAdvance(text) <= r.width() && m.height() <= r.height()) {
+                    break;
+                }
+            }
+            tf.setPixelSize(std::max(5, px));
+            p.setFont(tf);
+            p.setPen(color);
+            p.drawText(r, Qt::AlignCenter, text);
+        };
+
+        for (int c = 0; c < visibleCount; ++c) {
+            const int srcCol = bucketOffset + c;
+            const QRect colRect(xOrigin + c * colWidth, 0, colWidth, height());
+            p.save();
+            p.setClipRect(colRect);
+
+            const double tv = (srcCol < totals.size()) ? totals[srcCol] : 0.0;
+            const QString totText = tv > 0.0 ? formatClusterQtyShort(tv) : QString();
+
+            QString timeText;
+            const qint64 ts = (srcCol < startMs.size()) ? startMs[srcCol] : 0;
+            if (ts > 0) {
+                const QDateTime dt = QDateTime::fromMSecsSinceEpoch(ts);
+                if (ms >= 86400000) {
+                    timeText = dt.toString(QStringLiteral("dd.MM"));
+                } else {
+                    if (showSeconds) {
+                        timeText = (colWidth < 44) ? dt.toString(QStringLiteral("mm:ss"))
+                                                   : dt.toString(QStringLiteral("HH:mm:ss"));
+                    } else {
+                        timeText = dt.toString(QStringLiteral("HH:mm"));
+                    }
+                }
+            }
+
+            const QRect topRect(colRect.left() + 1, 1, colRect.width() - 2, (height() / 2) - 2);
+            const QRect botRect(colRect.left() + 1, (height() / 2) + 1, colRect.width() - 2, (height() / 2) - 2);
+
+            drawFit(topRect, totText, theme->textPrimary(), true);
+            drawFit(botRect, timeText, theme->textSecondary(), false);
+            p.restore();
+        }
+
+        p.setPen(theme->gridColor());
+        for (int c = 0; c <= visibleCount; ++c) {
+            const qreal x = static_cast<qreal>(xOrigin + c * colWidth) + 0.5;
+            p.drawLine(QPointF(x, 0.0), QPointF(x, static_cast<qreal>(height())));
+        }
+    }
+
+private:
+    QPointer<PrintsWidget> m_prints;
+    QPointer<ClustersWidget> m_clusters;
+};
+
 Qt::Edges resizeEdgesForPos(QWidget *window, const QPoint &globalPos, int borderWidth)
 {
     if (!window || borderWidth <= 0) {
@@ -3729,6 +3860,52 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
 
     layout->addWidget(scroll, 1);
 
+    // Pinned clusters footer (totals + time labels), fixed to viewport bottom.
+    auto *clustersFooterOverlay = new ClustersFooterOverlay(scroll->viewport(), prints, clusters);
+    clustersFooterOverlay->setProperty("domContainerPtr",
+                                       QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(column)));
+    scroll->viewport()->setProperty(
+        "clustersFooterOverlayPtr",
+        QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(clustersFooterOverlay)));
+    clustersFooterOverlay->show();
+
+    auto repositionClustersFooter =
+        [this,
+         columnGuard = QPointer<QWidget>(column),
+         clustersFooterOverlay,
+         scroll,
+         clusters]() {
+        if (!columnGuard) {
+            return;
+        }
+        WorkspaceTab *tab = nullptr;
+        DomColumn *col = nullptr;
+        int idx = -1;
+        if (locateColumn(columnGuard.data(), tab, col, idx) && col) {
+            repositionClustersFooterOverlay(*col);
+        } else if (clustersFooterOverlay && scroll && scroll->viewport() && clusters) {
+            const int footerH = clustersFooterOverlay->height() > 0 ? clustersFooterOverlay->height() : 34;
+            const int y = std::max(0, scroll->viewport()->height() - footerH);
+            const QPoint clustersPos = clusters->mapTo(scroll->viewport(), QPoint(0, 0));
+            int x = clustersPos.x();
+            int w = clusters->width();
+            const int maxW = std::max(0, scroll->viewport()->width() - x);
+            w = std::clamp(w, 0, maxW);
+            if (x < 0) {
+                x = 0;
+            }
+            clustersFooterOverlay->setGeometry(x, y, w, footerH);
+            clustersFooterOverlay->raise();
+            clustersFooterOverlay->show();
+        }
+    };
+    connect(prints, &PrintsWidget::clusterBucketsChanged, clustersFooterOverlay, qOverload<>(&QWidget::update));
+    connect(prints, &PrintsWidget::clusterBucketsChanged, this, repositionClustersFooter);
+    connect(clusters, &ClustersWidget::layoutChanged, clustersFooterOverlay, qOverload<>(&QWidget::update));
+    connect(clusters, &ClustersWidget::layoutChanged, this, repositionClustersFooter);
+    repositionClustersFooter();
+    QTimer::singleShot(0, this, repositionClustersFooter);
+
     // Notional presets pinned to viewport (always visible regardless of scroll position).
     const QString notionalPresetKey =
         result.accountName.trimmed().toLower() + QLatin1Char('|') + result.symbol.trimmed().toUpper();
@@ -4349,6 +4526,7 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
             int idx = -1;
             if (locateColumn(columnGuard.data(), tab, col, idx) && col) {
                 repositionNotionalOverlay(*col);
+                repositionClustersFooterOverlay(*col);
             }
         }
         scheduleSaveUserSettings(600);
@@ -4363,7 +4541,9 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
             DomColumn *col = nullptr;
             int idx = -1;
             if (locateColumn(columnGuard.data(), tab, col, idx) && col) {
+                enforceNotionalPrintsMinWidth(*col);
                 repositionNotionalOverlay(*col);
+                repositionClustersFooterOverlay(*col);
             }
         }
         scheduleSaveUserSettings(600);
@@ -4373,6 +4553,7 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     result.accountColor = accountColorFor(result.accountName);
     result.notionalOverlay = notionalOverlay;
     result.notionalGroup = notionalGroup;
+    result.clustersFooterOverlay = clustersFooterOverlay;
     result.positionOverlay = positionOverlay;
     result.positionAvgLabel = avgLabel;
     result.positionValueLabel = valueLabel;
@@ -4387,6 +4568,8 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     }
     updateColumnStatusLabel(result);
     updatePerfOverlay(result);
+    enforceNotionalPrintsMinWidth(result);
+    repositionNotionalOverlay(result);
     return result;
 }
 
@@ -9521,6 +9704,24 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
                     }
                 }
             }
+            QVariant cov = w->property("clustersFooterOverlayPtr");
+            if (cov.isValid()) {
+                QWidget *column = columnContainerForObject(w);
+                WorkspaceTab *tab = nullptr;
+                DomColumn *col = nullptr;
+                int idx = -1;
+                if (column && locateColumn(column, tab, col, idx) && col) {
+                    repositionClustersFooterOverlay(*col);
+                } else {
+                    auto *overlay = reinterpret_cast<QWidget *>(cov.value<quintptr>());
+                    if (overlay) {
+                        const int h = overlay->height() > 0 ? overlay->height() : 34;
+                        const int y = std::max(0, w->height() - h);
+                        overlay->setGeometry(0, y, w->width(), h);
+                        overlay->raise();
+                    }
+                }
+            }
             QVariant pov = w->property("positionOverlayPtr");
             if (pov.isValid()) {
                 auto *overlay = reinterpret_cast<QWidget *>(pov.value<quintptr>());
@@ -9584,6 +9785,54 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
 
     if (event->type() == QEvent::Wheel && !m_capsAdjustMode) {
         QWidget *column = columnContainerForObject(obj);
+        // If the wheel is over the clusters column, use it to zoom cluster bucket widths instead
+        // of scrolling the ladder. Do not rely on QWidget::childAt/widgetAt since QQuick can
+        // deliver wheel events via QWindow without a QWidget parent chain.
+        if (auto *wheel = dynamic_cast<QWheelEvent *>(event)) {
+            QPoint globalPos = wheel->globalPosition().toPoint();
+            if (globalPos.isNull()) {
+                globalPos = QCursor::pos();
+            }
+            int steps = wheel->angleDelta().y() / 120;
+            if (wheel->inverted()) {
+                steps = -steps;
+            }
+
+            auto tryClustersZoom = [&](DomColumn &colRef) -> bool {
+                if (steps == 0 || !colRef.clusters || !colRef.clusters->isVisible()) {
+                    return false;
+                }
+                const QPoint topLeft = colRef.clusters->mapToGlobal(QPoint(0, 0));
+                const QRect globalRect(topLeft, colRef.clusters->size());
+                if (!globalRect.contains(globalPos)) {
+                    return false;
+                }
+                if (colRef.clusters->adjustColumnWidthByWheelSteps(steps)) {
+                    repositionClustersFooterOverlay(colRef);
+                    return true;
+                }
+                return false;
+            };
+
+            // Fast path: if we can identify the column container for the event target, check that first.
+            if (column) {
+                WorkspaceTab *tab = nullptr;
+                DomColumn *col = nullptr;
+                int idx = -1;
+                if (locateColumn(column, tab, col, idx) && col && tryClustersZoom(*col)) {
+                    return true;
+                }
+            }
+
+            // Fallback: scan all columns using global cursor position (covers QQuick/QWindow wheel routing).
+            for (WorkspaceTab &tab : m_tabs) {
+                for (DomColumn &colRef : tab.columnsData) {
+                    if (tryClustersZoom(colRef)) {
+                        return true;
+                    }
+                }
+            }
+        }
         // If the wheel event originates from another top-level window (e.g. symbol picker),
         // do not hijack it for the DOM ladder scrolling.
         if (!column) {
@@ -14099,6 +14348,7 @@ void MainWindow::repositionNotionalOverlay(DomColumn &col)
     if (!col.notionalOverlay) {
         return;
     }
+    enforceNotionalPrintsMinWidth(col);
     QWidget *vp = nullptr;
     if (col.scrollArea) {
         vp = col.scrollArea->viewport();
@@ -14114,6 +14364,16 @@ void MainWindow::repositionNotionalOverlay(DomColumn &col)
 
     const int pad = 0;
     int x = pad;
+    int maxX = std::max(pad, vp->width() - col.notionalOverlay->width() - pad);
+
+    // Right boundary: the prints/DOM splitter handle (do not overlap the DOM column).
+    if (col.printsDomSplitter) {
+        if (auto *h = col.printsDomSplitter->handle(1)) {
+            const QPoint handlePos = h->mapTo(vp, QPoint(0, 0));
+            const int domLeft = handlePos.x(); // first pixel of the handle
+            maxX = std::max(pad, domLeft - col.notionalOverlay->width() - pad);
+        }
+    }
 
     // Anchor to the clusters/prints splitter handle so the overlay stays "glued" while dragging,
     // even if child widget geometries haven't been laid out yet for this event tick.
@@ -14122,25 +14382,12 @@ void MainWindow::repositionNotionalOverlay(DomColumn &col)
             const QPoint handlePos = h->mapTo(vp, QPoint(0, 0));
             const int printsLeft = handlePos.x() + h->width(); // first pixel of prints side
             x = printsLeft + pad;
-
-            const QList<int> sizes = col.clustersPrintsSplitter->sizes();
-            const int printsWidth = sizes.size() >= 2 ? std::max(0, sizes.at(1)) : 0;
-            const int maxInPrints = printsLeft + std::max(0, printsWidth - col.notionalOverlay->width() - pad);
-            if (x > maxInPrints) {
-                x = maxInPrints;
-            }
         }
     } else if (col.printsWrap) {
         const QPoint printsPos = col.printsWrap->mapTo(vp, QPoint(0, 0));
         x = printsPos.x() + pad;
-        const int maxInPrints =
-            printsPos.x() + std::max(0, col.printsWrap->width() - col.notionalOverlay->width() - pad);
-        if (x > maxInPrints) {
-            x = maxInPrints;
-        }
     }
 
-    const int maxX = std::max(pad, vp->width() - col.notionalOverlay->width() - pad);
     x = std::clamp(x, pad, maxX);
 
     const int bottomMargin = 36;
@@ -14156,6 +14403,59 @@ void MainWindow::repositionNotionalOverlay(DomColumn &col)
     col.notionalOverlay->move(x, y);
     col.notionalOverlay->raise();
     col.notionalOverlay->show();
+}
+
+void MainWindow::enforceNotionalPrintsMinWidth(DomColumn &col)
+{
+    if (!col.clustersPrintsSplitter || !col.printsWrap || !col.notionalOverlay) {
+        return;
+    }
+
+    col.notionalOverlay->adjustSize();
+    const int overlayW = std::max(0, col.notionalOverlay->sizeHint().width());
+    // Prevent prints column from collapsing under the notional overlay.
+    const int minPrintsW = std::max(60, overlayW + 6);
+
+    col.printsWrap->setMinimumWidth(minPrintsW);
+    if (col.prints) {
+        col.prints->setMinimumWidth(minPrintsW);
+    }
+    col.clustersPrintsSplitter->setCollapsible(1, false);
+}
+
+void MainWindow::repositionClustersFooterOverlay(DomColumn &col)
+{
+    if (!col.clustersFooterOverlay) {
+        return;
+    }
+    if (!col.scrollArea || !col.scrollArea->viewport()) {
+        return;
+    }
+    QWidget *vp = col.scrollArea->viewport();
+
+    const int footerH = col.clustersFooterOverlay->height() > 0 ? col.clustersFooterOverlay->height() : 34;
+    int y = vp->height() - footerH;
+    if (y < 0) {
+        y = 0;
+    }
+
+    int x = 0;
+    int w = col.clusters ? col.clusters->width() : 0;
+    if (col.clusters) {
+        const QPoint clustersPos = col.clusters->mapTo(vp, QPoint(0, 0));
+        x = clustersPos.x();
+        w = col.clusters->width();
+    }
+
+    const int maxW = std::max(0, vp->width() - x);
+    w = std::clamp(w, 0, maxW);
+    if (x < 0) {
+        x = 0;
+    }
+
+    col.clustersFooterOverlay->setGeometry(x, y, w, footerH);
+    col.clustersFooterOverlay->raise();
+    col.clustersFooterOverlay->show();
 }
 
 void MainWindow::applySymbolToColumn(DomColumn &col,

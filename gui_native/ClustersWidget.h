@@ -16,16 +16,28 @@ public:
     int rowCountValue() const { return m_rowCount; }
     int rowHeightValue() const { return m_rowHeight; }
 
+    int effectiveColumnWidth() const { return m_cachedColumnWidth; }
+    int visibleBucketCount() const { return m_cachedVisibleBucketCount; }
+    int bucketOffset() const { return m_cachedBucketOffset; }
+    int xOrigin() const { return m_cachedXOrigin; }
+
+    bool adjustColumnWidthByWheelSteps(int steps);
+
+signals:
+    void layoutChanged();
+
 protected:
     void resizeEvent(QResizeEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
     void contextMenuEvent(QContextMenuEvent *event) override;
+    void wheelEvent(QWheelEvent *event) override;
     QSize sizeHint() const override;
     QSize minimumSizeHint() const override;
 
 private:
     void ensureQuickInitialized();
     void syncQuickProperties();
+    void recomputeLayout();
 
     PrintsWidget *m_prints = nullptr;
     QQuickWidget *m_quickWidget = nullptr;
@@ -34,4 +46,11 @@ private:
     int m_rowCount = 0;
     int m_rowHeight = 20;
     int m_infoAreaHeight = 26;
+
+    int m_userColumnWidth = 0; // 0 = auto
+    int m_cachedColumnWidth = 28;
+    int m_cachedVisibleBucketCount = 1;
+    int m_cachedBucketOffset = 0;
+    int m_cachedXOrigin = 0;
+    bool m_adjustingBucketCount = false;
 };

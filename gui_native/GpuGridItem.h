@@ -9,6 +9,7 @@ class GpuGridItem : public QQuickItem
     Q_PROPERTY(bool vertical READ vertical WRITE setVertical NOTIFY verticalChanged)
     Q_PROPERTY(int count READ count WRITE setCount NOTIFY countChanged)
     Q_PROPERTY(int step READ step WRITE setStep NOTIFY stepChanged)
+    Q_PROPERTY(int origin READ origin WRITE setOrigin NOTIFY originChanged)
     Q_PROPERTY(QColor color READ color WRITE setColor NOTIFY colorChanged)
     Q_PROPERTY(qreal opacity READ opacity WRITE setOpacity NOTIFY opacityChanged)
 
@@ -24,6 +25,9 @@ public:
     int step() const { return m_step; }
     void setStep(int v);
 
+    int origin() const { return m_origin; }
+    void setOrigin(int v);
+
     QColor color() const { return m_color; }
     void setColor(const QColor &c);
 
@@ -34,6 +38,7 @@ signals:
     void verticalChanged();
     void countChanged();
     void stepChanged();
+    void originChanged();
     void colorChanged();
     void opacityChanged();
 
@@ -44,7 +49,7 @@ private:
     bool m_vertical = false;
     int m_count = 0;
     int m_step = 20;
+    int m_origin = 0;
     QColor m_color = QColor("#303030");
     qreal m_opacity = 0.35;
 };
-

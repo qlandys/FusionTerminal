@@ -10,6 +10,7 @@
 #include <QQuickItem>
 #include <QQuickWidget>
 #include <QDateTime>
+#include <QWheelEvent>
 
 #include "ThemeManager.h"
 
@@ -41,7 +42,7 @@ ClustersWidget::ClustersWidget(QWidget *parent)
     m_useGpuClusters = (qEnvironmentVariableIntValue("CLUSTERS_GPU") > 0)
                        || (qEnvironmentVariableIntValue("DOM_GPU") > 0);
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
-    setMinimumWidth(0);
+    setMinimumWidth(48);
     setMaximumWidth(4000);
     auto *theme = ThemeManager::instance();
     setStyleSheet(QStringLiteral("background-color: %1;")
@@ -79,8 +80,7 @@ void ClustersWidget::setRowLayout(int rowCount, int rowHeight, int infoAreaHeigh
 {
     m_rowCount = std::max(0, rowCount);
     m_rowHeight = std::clamp(rowHeight, 10, 40);
-    // We need a footer for per-bucket totals + time labels even when DOM has no info area.
-    m_infoAreaHeight = std::max(26, std::clamp(infoAreaHeight, 0, 60));
+    m_infoAreaHeight = std::clamp(infoAreaHeight, 0, 60);
     const int totalHeight = m_rowCount * m_rowHeight + m_infoAreaHeight;
     setMinimumHeight(totalHeight);
     setMaximumHeight(totalHeight);
@@ -88,6 +88,7 @@ void ClustersWidget::setRowLayout(int rowCount, int rowHeight, int infoAreaHeigh
     if (m_quickWidget) {
         m_quickWidget->setGeometry(rect());
     }
+    recomputeLayout();
     syncQuickProperties();
 }
 
@@ -115,8 +116,12 @@ void ClustersWidget::paintEvent(QPaintEvent *event)
         return;
     }
 
-    const int bucketCount = std::clamp(m_prints->clusterBucketCount(), 1, 12);
-    const int colWidth = std::max(18, width() / std::max(1, bucketCount));
+    recomputeLayout();
+    const int bucketCount = std::clamp(m_prints->clusterBucketCount(), 1, PrintsWidget::kMaxClusterBuckets);
+    const int colWidth = std::max(18, m_cachedColumnWidth);
+    const int visibleCount = std::clamp(m_cachedVisibleBucketCount, 1, bucketCount);
+    const int bucketOffset = std::clamp(m_cachedBucketOffset, 0, std::max(0, bucketCount - visibleCount));
+    const int xOrigin = m_cachedXOrigin;
     const int gridHeight = m_rowCount * m_rowHeight;
     const QRect gridRect(0, 0, width(), gridHeight);
 
@@ -126,8 +131,8 @@ void ClustersWidget::paintEvent(QPaintEvent *event)
         const int y = r * m_rowHeight;
         p.drawLine(0, y, width(), y);
     }
-    for (int c = 0; c <= bucketCount; ++c) {
-        const int x = c * colWidth;
+    for (int c = 0; c <= visibleCount; ++c) {
+        const int x = xOrigin + c * colWidth;
         p.drawLine(x, 0, x, gridHeight);
     }
 
@@ -143,15 +148,16 @@ void ClustersWidget::paintEvent(QPaintEvent *event)
         if (e.col < 0 || e.col >= bucketCount) {
             continue;
         }
-        const QRect cellRect(e.col * colWidth,
-                             e.row * m_rowHeight,
-                             colWidth,
-                             m_rowHeight);
-        p.fillRect(cellRect, e.bgColor);
+        if (e.col < bucketOffset || e.col >= bucketOffset + visibleCount) {
+            continue;
+        }
+        const int localCol = e.col - bucketOffset;
+        const QRect shiftedRect(xOrigin + localCol * colWidth, e.row * m_rowHeight, colWidth, m_rowHeight);
+        p.fillRect(shiftedRect, e.bgColor);
         if (!e.text.isEmpty()) {
             p.setPen(e.textColor);
             const QString elided = fm.elidedText(e.text, Qt::ElideRight, std::max(0, colWidth - 4));
-            p.drawText(cellRect.adjusted(2, 0, -2, 0), Qt::AlignVCenter | Qt::AlignLeft, elided);
+            p.drawText(shiftedRect.adjusted(2, 0, -2, 0), Qt::AlignVCenter | Qt::AlignLeft, elided);
         }
     }
 
@@ -167,22 +173,27 @@ void ClustersWidget::paintEvent(QPaintEvent *event)
         const QVector<qint64> startMs = m_prints->clusterBucketStartMs();
         const QVector<double> totals = m_prints->clusterBucketTotals();
         const bool showSeconds = ms < 60000;
-        for (int c = 0; c < bucketCount; ++c) {
-            const QRect colRect(c * colWidth, footerY, colWidth, footerH);
+        for (int c = 0; c < visibleCount; ++c) {
+            const int srcCol = bucketOffset + c;
+            const QRect colRect(xOrigin + c * colWidth, footerY, colWidth, footerH);
             QString timeText;
-            const qint64 ts = (c < startMs.size()) ? startMs[c] : 0;
+            const qint64 ts = (srcCol < startMs.size()) ? startMs[srcCol] : 0;
             if (ts > 0) {
                 const QDateTime dt = QDateTime::fromMSecsSinceEpoch(ts);
-                timeText = dt.toString(showSeconds ? QStringLiteral("HH:mm:ss")
-                                                   : QStringLiteral("HH:mm"));
+                if (ms >= 86400000) {
+                    timeText = dt.toString(QStringLiteral("dd.MM"));
+                } else {
+                    timeText = dt.toString(showSeconds ? QStringLiteral("HH:mm:ss")
+                                                       : QStringLiteral("HH:mm"));
+                }
             }
-            const double tv = (c < totals.size()) ? totals[c] : 0.0;
+            const double tv = (srcCol < totals.size()) ? totals[srcCol] : 0.0;
             const QString totText = tv > 0.0 ? formatQtyShort(tv) : QString();
 
-            p.setPen(theme->textSecondary());
-            p.drawText(colRect.adjusted(2, 2, -2, -2), Qt::AlignTop | Qt::AlignLeft, timeText);
             p.setPen(theme->textPrimary());
-            p.drawText(colRect.adjusted(2, 2, -2, -2), Qt::AlignBottom | Qt::AlignLeft, totText);
+            p.drawText(colRect.adjusted(2, 2, -2, -2), Qt::AlignTop | Qt::AlignLeft, totText);
+            p.setPen(theme->textSecondary());
+            p.drawText(colRect.adjusted(2, 2, -2, -2), Qt::AlignBottom | Qt::AlignLeft, timeText);
         }
     }
 }
@@ -192,6 +203,7 @@ void ClustersWidget::resizeEvent(QResizeEvent *event)
     if (m_quickWidget) {
         m_quickWidget->setGeometry(rect());
     }
+    recomputeLayout();
     syncQuickProperties();
     update();
     QWidget::resizeEvent(event);
@@ -205,12 +217,22 @@ void ClustersWidget::contextMenuEvent(QContextMenuEvent *event)
     QMenu menu(this);
     menu.setStyleSheet(QStringLiteral("QMenu { background:#1f1f1f; color:#e0e0e0; }"
                                       "QMenu::item:selected { background:#2c2c2c; }"));
-    const QList<int> windows = {250, 500, 1000, 2000, 3000, 5000, 10000, 30000, 60000};
+    const QList<int> windows = {1000, 10000, 30000, 60000, 300000, 900000, 1800000, 3600000, 86400000};
     QActionGroup *group = new QActionGroup(&menu);
     group->setExclusive(true);
     for (int ms : windows) {
-        const QString label =
-            ms < 1000 ? QStringLiteral("%1 ms").arg(ms) : QStringLiteral("%1 s").arg(ms / 1000);
+        QString label;
+        if (ms < 1000) {
+            label = QStringLiteral("%1ms").arg(ms);
+        } else if (ms < 60000) {
+            label = QStringLiteral("%1s").arg(ms / 1000);
+        } else if (ms < 3600000) {
+            label = QStringLiteral("%1m").arg(ms / 60000);
+        } else if (ms < 86400000) {
+            label = QStringLiteral("%1m").arg(ms / 60000);
+        } else {
+            label = QStringLiteral("%1d").arg(ms / 86400000);
+        }
         QAction *a = menu.addAction(QStringLiteral("Clusters: %1").arg(label));
         a->setCheckable(true);
         a->setChecked(ms == m_prints->clusterWindowMs());
@@ -221,14 +243,45 @@ void ClustersWidget::contextMenuEvent(QContextMenuEvent *event)
             }
         });
     }
-    menu.addSeparator();
-    QAction *clear = menu.addAction(QStringLiteral("Clear clusters"));
-    connect(clear, &QAction::triggered, this, [this]() {
-        if (m_prints) {
-            m_prints->clearClusters();
-        }
-    });
     menu.exec(event->globalPos());
+}
+
+void ClustersWidget::wheelEvent(QWheelEvent *event)
+{
+    if (!event) {
+        return;
+    }
+    int steps = event->angleDelta().y() / 120;
+    if (event->inverted()) {
+        steps = -steps;
+    }
+    if (steps == 0) {
+        QWidget::wheelEvent(event);
+        return;
+    }
+
+    if (!adjustColumnWidthByWheelSteps(steps)) {
+        QWidget::wheelEvent(event);
+        return;
+    }
+    event->accept();
+}
+
+bool ClustersWidget::adjustColumnWidthByWheelSteps(int steps)
+{
+    // Don't let columns get too narrow to read.
+    const int minW = 34;
+    const int maxW = 160;
+    if (m_userColumnWidth <= 0) {
+        recomputeLayout();
+        m_userColumnWidth = std::clamp(m_cachedColumnWidth, minW, maxW);
+    }
+    m_userColumnWidth = std::clamp(m_userColumnWidth + steps * 4, minW, maxW);
+
+    recomputeLayout();
+    syncQuickProperties();
+    update();
+    return true;
 }
 
 void ClustersWidget::ensureQuickInitialized()
@@ -242,6 +295,7 @@ void ClustersWidget::ensureQuickInitialized()
     m_quickWidget = new QQuickWidget(this);
     m_quickWidget->setResizeMode(QQuickWidget::SizeRootObjectToView);
     m_quickWidget->setClearColor(Qt::transparent);
+    m_quickWidget->setAttribute(Qt::WA_TransparentForMouseEvents, true);
     connect(m_quickWidget, &QQuickWidget::statusChanged, this, [this](QQuickWidget::Status status) {
         m_quickReady = (status == QQuickWidget::Ready);
         if (m_quickReady) {
@@ -270,18 +324,26 @@ void ClustersWidget::syncQuickProperties()
         update();
         return;
     }
+    recomputeLayout();
     if (auto *root = m_quickWidget->rootObject()) {
         ThemeManager *theme = ThemeManager::instance();
         root->setProperty("rowHeight", m_rowHeight);
         root->setProperty("rowCount", m_rowCount);
-        root->setProperty("infoAreaHeight", m_infoAreaHeight);
+        // Footer is drawn by a viewport overlay (MainWindow) to keep it pinned to the bottom.
+        root->setProperty("infoAreaHeight", 0);
         root->setProperty("useGpuClusters", m_useGpuClusters);
         root->setProperty("backgroundColor", theme->panelBackground());
         root->setProperty("gridColor", theme->gridColor());
-        const int bucketCount = m_prints ? std::clamp(m_prints->clusterBucketCount(), 1, 12) : 1;
-        const int colWidth = std::max(18, width() / std::max(1, bucketCount));
-        root->setProperty("columnCount", bucketCount);
+        const int bucketCount =
+            m_prints ? std::clamp(m_prints->clusterBucketCount(), 1, PrintsWidget::kMaxClusterBuckets) : 1;
+        const int colWidth = std::max(18, m_cachedColumnWidth);
+        const int visibleCount = std::clamp(m_cachedVisibleBucketCount, 1, bucketCount);
+        const int bucketOffset = std::clamp(m_cachedBucketOffset, 0, std::max(0, bucketCount - visibleCount));
+        const int xOrigin = m_cachedXOrigin;
+        root->setProperty("columnCount", visibleCount);
         root->setProperty("columnWidth", colWidth);
+        root->setProperty("columnOffset", bucketOffset);
+        root->setProperty("xOrigin", xOrigin);
         const QFont fnt = font();
         const int px = fnt.pixelSize() > 0 ? fnt.pixelSize() : std::max(10, fnt.pointSize() + 2);
         root->setProperty("fontFamily", fnt.family());
@@ -305,8 +367,12 @@ void ClustersWidget::syncQuickProperties()
                 QString timeText;
                 if (ts > 0) {
                     const QDateTime dt = QDateTime::fromMSecsSinceEpoch(ts);
-                    timeText = dt.toString(showSeconds ? QStringLiteral("HH:mm:ss")
-                                                       : QStringLiteral("HH:mm"));
+                    if (ms >= 86400000) {
+                        timeText = dt.toString(QStringLiteral("dd.MM"));
+                    } else {
+                        timeText = dt.toString(showSeconds ? QStringLiteral("HH:mm:ss")
+                                                           : QStringLiteral("HH:mm"));
+                    }
                 } else {
                     timeText = QString();
                 }
@@ -320,5 +386,49 @@ void ClustersWidget::syncQuickProperties()
             root->setProperty("columnLabels", QVariantList{});
             root->setProperty("columnTotals", QVariantList{});
         }
+    }
+}
+
+void ClustersWidget::recomputeLayout()
+{
+    if (!m_prints) {
+        m_cachedColumnWidth = std::max(18, width());
+        m_cachedVisibleBucketCount = 1;
+        m_cachedBucketOffset = 0;
+        m_cachedXOrigin = 0;
+        emit layoutChanged();
+        return;
+    }
+
+    int bucketCount = std::clamp(m_prints->clusterBucketCount(), 1, PrintsWidget::kMaxClusterBuckets);
+    const int minW = 34;
+    const int autoW = std::max(minW, width() / std::max(1, bucketCount));
+    const int desiredW = std::max(minW, (m_userColumnWidth > 0 ? m_userColumnWidth : autoW));
+    const int desiredBuckets =
+        std::clamp((width() + desiredW - 1) / std::max(1, desiredW), 1, PrintsWidget::kMaxClusterBuckets);
+    // When the column is widened, add more time buckets so the empty space fills with new columns.
+    if (!m_adjustingBucketCount && desiredBuckets > bucketCount) {
+        m_adjustingBucketCount = true;
+        m_prints->setClusterBucketCount(desiredBuckets);
+        m_adjustingBucketCount = false;
+        bucketCount = std::clamp(m_prints->clusterBucketCount(), 1, PrintsWidget::kMaxClusterBuckets);
+    }
+
+    // Show the next (oldest) column partially if it doesn't fully fit.
+    const int visible =
+        std::clamp((width() + desiredW - 1) / std::max(1, desiredW), 1, bucketCount);
+    const int offset = std::max(0, bucketCount - visible);
+    // Keep the newest bucket pinned to the right edge; extra space (if any) goes to the left.
+    const int colW = desiredW;
+    const int xOrigin = width() - visible * colW;
+
+    const bool changed = (m_cachedColumnWidth != colW) || (m_cachedVisibleBucketCount != visible)
+                         || (m_cachedBucketOffset != offset) || (m_cachedXOrigin != xOrigin);
+    m_cachedColumnWidth = colW;
+    m_cachedVisibleBucketCount = visible;
+    m_cachedBucketOffset = offset;
+    m_cachedXOrigin = xOrigin;
+    if (changed) {
+        emit layoutChanged();
     }
 }

@@ -86,6 +86,16 @@ void GpuGridItem::setStep(int v)
     update();
 }
 
+void GpuGridItem::setOrigin(int v)
+{
+    if (m_origin == v) {
+        return;
+    }
+    m_origin = v;
+    emit originChanged();
+    update();
+}
+
 void GpuGridItem::setColor(const QColor &c)
 {
     if (m_color == c) return;
@@ -124,6 +134,7 @@ QSGNode *GpuGridItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     const float h = std::max(1.0f, static_cast<float>(height()));
     const int step = std::max(1, m_step);
     const int count = std::max(0, m_count);
+    const float origin = static_cast<float>(m_origin);
 
     QColor c = m_color;
     c.setAlphaF(std::clamp(c.alphaF() * m_opacity, 0.0, 1.0));
@@ -139,12 +150,12 @@ QSGNode *GpuGridItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
     int idx = 0;
     if (m_vertical) {
         for (int i = 0; i <= count; ++i) {
-            const float x = std::min(w - 1.0f, static_cast<float>(i * step) + 0.5f);
+            const float x = std::min(w - 1.0f, origin + static_cast<float>(i * step) + 0.5f);
             addRect(v, idx, x, 0.0f, 1.0f, h, col);
         }
     } else {
         for (int i = 0; i <= count; ++i) {
-            const float y = std::min(h - 1.0f, static_cast<float>(i * step) + 0.5f);
+            const float y = std::min(h - 1.0f, origin + static_cast<float>(i * step) + 0.5f);
             addRect(v, idx, 0.0f, y, w, 1.0f, col);
         }
     }

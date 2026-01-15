@@ -81,12 +81,12 @@ PrintsWidget::PrintsWidget(QWidget *parent)
 
     const int bucketMsEnv = qEnvironmentVariableIntValue("CLUSTERS_BUCKET_MS", &ok);
     if (ok && bucketMsEnv > 0) {
-        m_clusterBucketMs = std::clamp(bucketMsEnv, 100, 300000);
+        m_clusterBucketMs = std::clamp(bucketMsEnv, 100, 86400000);
     }
     ok = false;
     const int bucketCntEnv = qEnvironmentVariableIntValue("CLUSTERS_BUCKETS", &ok);
     if (ok && bucketCntEnv > 0) {
-        m_clusterBucketCount = std::clamp(bucketCntEnv, 1, 12);
+        m_clusterBucketCount = std::clamp(bucketCntEnv, 1, kMaxClusterBuckets);
     }
     if (qEnvironmentVariableIsSet("CLUSTERS_LIGHT")) {
         m_clusterBucketMs = std::max(200, m_clusterBucketMs);
@@ -136,8 +136,8 @@ void PrintsWidget::resetClusterAgg()
 
 void PrintsWidget::advanceClusterBuckets(qint64 nowMs)
 {
-    const int bucketMs = std::clamp(m_clusterBucketMs, 100, 300000);
-    const int bucketCount = std::clamp(m_clusterBucketCount, 1, 12);
+    const int bucketMs = std::clamp(m_clusterBucketMs, 100, 86400000);
+    const int bucketCount = std::clamp(m_clusterBucketCount, 1, kMaxClusterBuckets);
     const qint64 currentBucket = nowMs / static_cast<qint64>(bucketMs);
 
     if (m_clusterCurrentBucket == 0 || m_clusterAggBucketMs != bucketMs || m_clusterAggBucketCount != bucketCount) {
@@ -1103,10 +1103,12 @@ void PrintsWidget::updateClustersQml(bool force)
     }
     m_lastClusterUpdateMs = nowMs;
 
+    const QVector<qint64> startMsBefore = m_clusterBucketStartMs;
+
     // If mapping or cluster config changed, rebuild from the retained trade tail (bounded window).
     if (m_clusterAggBuiltRevision != m_clusterMappingRevision
-        || m_clusterAggBucketMs != std::clamp(m_clusterBucketMs, 100, 300000)
-        || m_clusterAggBucketCount != std::clamp(m_clusterBucketCount, 1, 12)) {
+        || m_clusterAggBucketMs != std::clamp(m_clusterBucketMs, 100, 86400000)
+        || m_clusterAggBucketCount != std::clamp(m_clusterBucketCount, 1, kMaxClusterBuckets)) {
         rebuildClusterAggFromTrades(nowMs);
     } else {
         advanceClusterBuckets(nowMs);
@@ -1148,8 +1150,9 @@ void PrintsWidget::updateClustersQml(bool force)
         totalsByCol[i] = (i < m_clusterAggTotalsByCol.size()) ? m_clusterAggTotalsByCol[i] : 0.0;
     }
     const bool bucketsChanged = (m_clusterBucketTotals != totalsByCol);
+    const bool startChanged = (m_clusterBucketStartMs != startMsBefore);
     m_clusterBucketTotals = std::move(totalsByCol);
-    if (bucketsChanged) {
+    if (bucketsChanged || startChanged) {
         emit clusterBucketsChanged();
     }
     scheduleNextClusterBoundary();
@@ -1208,6 +1211,18 @@ int PrintsWidget::resolvedRowForItem(const PrintItem &item, int *outRowIdx) cons
 QString PrintsWidget::clusterLabel() const
 {
     const int ms = std::max(100, m_clusterBucketMs);
+    static constexpr int kDayMs = 86400000;
+    static constexpr int kHourMs = 3600000;
+    static constexpr int kMinMs = 60000;
+    if (ms >= kDayMs && (ms % kDayMs) == 0) {
+        return QStringLiteral("%1d").arg(ms / kDayMs);
+    }
+    if (ms >= kHourMs && (ms % kHourMs) == 0) {
+        return QStringLiteral("%1h").arg(ms / kHourMs);
+    }
+    if (ms >= kMinMs && (ms % kMinMs) == 0) {
+        return QStringLiteral("%1m").arg(ms / kMinMs);
+    }
     if (ms >= 1000 && (ms % 1000) == 0) {
         return QStringLiteral("%1s").arg(ms / 1000);
     }
@@ -1216,7 +1231,7 @@ QString PrintsWidget::clusterLabel() const
 
 void PrintsWidget::setClusterWindowMs(int ms)
 {
-    const int clamped = std::clamp(ms, 100, 300000);
+    const int clamped = std::clamp(ms, 100, 86400000);
     if (m_clusterBucketMs == clamped) {
         return;
     }
@@ -1226,9 +1241,20 @@ void PrintsWidget::setClusterWindowMs(int ms)
     updateClustersQml(true);
 }
 
+void PrintsWidget::setClusterBucketCount(int count)
+{
+    const int clamped = std::clamp(count, 1, kMaxClusterBuckets);
+    if (m_clusterBucketCount == clamped) {
+        return;
+    }
+    m_clusterBucketCount = clamped;
+    resetClusterAgg();
+    updateClustersQml(true);
+}
+
 void PrintsWidget::scheduleNextClusterBoundary()
 {
-    const int bucketMs = std::clamp(m_clusterBucketMs, 100, 300000);
+    const int bucketMs = std::clamp(m_clusterBucketMs, 100, 86400000);
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     const qint64 currentBucket = nowMs / bucketMs;
     const qint64 nextBoundary = (currentBucket + 1) * static_cast<qint64>(bucketMs);

@@ -182,6 +182,7 @@ private:
         QWidget *notionalOverlay = nullptr;
         class QButtonGroup *notionalGroup = nullptr;
         QToolButton *leverageButton = nullptr;
+        QWidget *clustersFooterOverlay = nullptr;
         QFrame *positionOverlay = nullptr;
         QLabel *positionAvgLabel = nullptr;
         QLabel *positionValueLabel = nullptr;
@@ -270,7 +271,9 @@ private:
         bool backendManualPinned = false;
     };
 
+    void repositionClustersFooterOverlay(DomColumn &col);
     void repositionNotionalOverlay(DomColumn &col);
+    void enforceNotionalPrintsMinWidth(DomColumn &col);
     void applyDomHighlightPrices(DomColumn &col);
 
     struct WorkspaceTab {

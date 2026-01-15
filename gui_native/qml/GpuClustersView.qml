@@ -3,12 +3,15 @@ import Fusion 1.0
 
 Item {
     id: root
+    clip: true
     property var clustersModel: null
     property int rowCount: 0
     property int rowHeight: 20
     property int infoAreaHeight: 26
     property int columnCount: 5
     property int columnWidth: 28
+    property int columnOffset: 0
+    property int xOrigin: 0
     property var columnLabels: []
     property var columnTotals: []
     property color backgroundColor: "#151515"
@@ -89,8 +92,9 @@ Item {
                 ctx.lineWidth = 1;
                 var step = Math.max(1, root.columnWidth);
                 var count = Math.max(0, root.columnCount);
+                var origin = root.xOrigin;
                 for (var i = 0; i <= count; ++i) {
-                    var x = i * step;
+                    var x = origin + i * step;
                     ctx.beginPath();
                     ctx.moveTo(x + 0.5, 0);
                     ctx.lineTo(x + 0.5, height);
@@ -113,6 +117,7 @@ Item {
             vertical: true
             count: Math.max(0, root.columnCount)
             step: Math.max(1, root.columnWidth)
+            origin: root.xOrigin
             color: root.gridColor
             opacity: 0.6
             visible: root.useGpuClusters
@@ -130,7 +135,8 @@ Item {
                 property color textColor: typeof model.textColor !== "undefined" ? model.textColor : "#cfd8dc"
                 property color bgColor: typeof model.bgColor !== "undefined" ? model.bgColor : "transparent"
                 visible: row >= 0 && row < root.rowCount && textValue.length > 0
-                x: col * root.columnWidth
+                         && col >= root.columnOffset && col < (root.columnOffset + root.columnCount)
+                x: root.xOrigin + (col - root.columnOffset) * root.columnWidth
                 y: row * root.rowHeight
                 width: root.columnWidth
                 height: root.rowHeight
@@ -145,6 +151,10 @@ Item {
                     font.family: fontFamily
                     font.pixelSize: Math.max(9, fontPixelSize - 2)
                     font.bold: true
+                    fontSizeMode: Text.Fit
+                    minimumPixelSize: 6
+                    elide: Text.ElideNone
+                    clip: true
                 }
             }
         }
@@ -166,7 +176,8 @@ Item {
         Repeater {
             model: root.columnCount
             delegate: Item {
-                x: index * root.columnWidth
+                property int srcIndex: root.columnOffset + index
+                x: root.xOrigin + index * root.columnWidth
                 width: root.columnWidth
                 height: root.infoAreaHeight
                 Column {
@@ -178,11 +189,15 @@ Item {
                         height: parent.height / 2
                         verticalAlignment: Text.AlignVCenter
                         horizontalAlignment: Text.AlignHCenter
-                        text: (root.columnTotals && index < root.columnTotals.length) ? root.columnTotals[index] : ""
+                        text: (root.columnTotals && srcIndex < root.columnTotals.length) ? root.columnTotals[srcIndex] : ""
                         color: "#cfd8dc"
                         font.family: fontFamily
                         font.pixelSize: Math.max(8, fontPixelSize - 3)
                         font.bold: true
+                        fontSizeMode: Text.Fit
+                        minimumPixelSize: 6
+                        elide: Text.ElideNone
+                        clip: true
                         opacity: 0.95
                     }
                     Text {
@@ -190,10 +205,14 @@ Item {
                         height: parent.height / 2
                         verticalAlignment: Text.AlignVCenter
                         horizontalAlignment: Text.AlignHCenter
-                        text: (root.columnLabels && index < root.columnLabels.length) ? root.columnLabels[index] : ""
+                        text: (root.columnLabels && srcIndex < root.columnLabels.length) ? root.columnLabels[srcIndex] : ""
                         color: "#9aa7ad"
                         font.family: fontFamily
                         font.pixelSize: Math.max(8, fontPixelSize - 3)
+                        fontSizeMode: Text.Fit
+                        minimumPixelSize: 6
+                        elide: Text.ElideNone
+                        clip: true
                         opacity: 0.9
                     }
                 }

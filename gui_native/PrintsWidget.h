@@ -36,6 +36,7 @@ class QQuickWidget;
 class PrintsWidget : public QWidget {
     Q_OBJECT
 public:
+    static constexpr int kMaxClusterBuckets = 60;
     explicit PrintsWidget(QWidget *parent = nullptr);
 
     void setPrints(const QVector<PrintItem> &items);
@@ -57,6 +58,7 @@ public:
     QVector<qint64> clusterBucketStartMs() const { return m_clusterBucketStartMs; }
     QString clusterLabel() const;
     void setClusterWindowMs(int ms);
+    void setClusterBucketCount(int count);
     void clearClusters();
 
 signals:

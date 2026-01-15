@@ -484,6 +484,7 @@ constexpr int kMaxPendingMarkersPerBucket = 20;
 constexpr double kMarkerPriceTolerance = 1e-8;
 constexpr int kLocalMarkerDelayMs = 120;
 constexpr qint64 kPendingMarkerTimeoutMs = 8000;
+constexpr int kMarketableMarkerExpireMs = 650;
 constexpr int kMinBaseLadderLevels = 50;
 constexpr int kMaxBaseLadderLevels = 4000;
 constexpr int kMaxEffectiveLadderLevels = 20000;
@@ -1566,6 +1567,7 @@ MainWindow::MainWindow(const QString &backendPath,
                         stack.push_back(orderId);
                     }
                     const QString timerKey = markerTimerKey(symUpper, accountKey, orderId);
+                    const QString expireKey = timerKey + QStringLiteral("|expire");
                     auto *delayTimer = new QTimer(this);
                     delayTimer->setSingleShot(true);
                     connect(delayTimer,
@@ -1583,6 +1585,53 @@ MainWindow::MainWindow(const QString &backendPath,
                             });
                     m_markerDelayTimers.insert(timerKey, delayTimer);
                     delayTimer->start(kLocalMarkerDelayMs);
+
+                    // If the order is marketable (BUY above ask / SELL below bid), it may fill immediately
+                    // and never appear in open orders. Expire the local marker quickly in that case.
+                    bool marketable = false;
+                    DomColumn *colPtr = nullptr;
+                    const QString accountLower = account.trimmed().toLower();
+                    for (auto &tab : m_tabs) {
+                        for (auto &col : tab.columnsData) {
+                            if (col.symbol.compare(symUpper, Qt::CaseInsensitive) != 0) {
+                                continue;
+                            }
+                            if (!accountLower.isEmpty()
+                                && col.accountName.trimmed().toLower() != accountLower) {
+                                continue;
+                            }
+                            colPtr = &col;
+                            break;
+                        }
+                        if (colPtr) {
+                            break;
+                        }
+                    }
+                    if (colPtr && colPtr->dom) {
+                        const double bestAsk = colPtr->dom->bestAsk();
+                        const double bestBid = colPtr->dom->bestBid();
+                        const double tick = std::max(1e-12, colPtr->dom->tickSize());
+                        const double tol = tick * 0.25;
+                        marketable =
+                            (side == OrderSide::Buy && bestAsk > 0.0 && price >= bestAsk - tol)
+                            || (side == OrderSide::Sell && bestBid > 0.0 && price <= bestBid + tol);
+                    }
+                    if (marketable) {
+                        auto *expireTimer = new QTimer(this);
+                        expireTimer->setSingleShot(true);
+                        connect(expireTimer,
+                                &QTimer::timeout,
+                                this,
+                                [this, expireTimer, expireKey, account, symUpper, orderId]() {
+                                    removeMarkerDelayTimer(expireKey, expireTimer);
+                                    removeLocalOrderMarker(account, symUpper, orderId);
+                                });
+                        removeMarkerDelayTimer(expireKey, nullptr);
+                        m_markerDelayTimers.insert(expireKey, expireTimer);
+                        expireTimer->start(kMarketableMarkerExpireMs);
+                    } else {
+                        removeMarkerDelayTimer(expireKey, nullptr);
+                    }
                     const QString msg = tr("Order placed: %1 %2 @ %3")
                                             .arg(side == OrderSide::Buy ? QStringLiteral("BUY")
                                                                         : QStringLiteral("SELL"))
@@ -5018,6 +5067,20 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
             saveUserSettings();
         }
     }
+
+    // UZX Swap is effectively hedge-mode (pos_side=LG/ST). Our position model/UI is single-sided,
+    // so avoid accidentally opening the opposite side when the user is trying to close.
+    if (src == SymbolSource::UzxSwap) {
+        const TradePosition livePos = m_tradeManager->positionForSymbol(column->symbol, column->accountName);
+        const bool hasLivePos =
+            livePos.hasPosition && livePos.quantity > 0.0 && livePos.averagePrice > 0.0;
+        if (hasLivePos && livePos.side != side) {
+            statusBar()->showMessage(tr("Closing position @ %1").arg(QString::number(price, 'f', 6)), 1800);
+            m_tradeManager->closePositionMarket(column->symbol, column->accountName, price);
+            return;
+        }
+    }
+
     m_tradeManager->placeLimitOrder(column->symbol, column->accountName, price, quantity, side, leverage);
     statusBar()->showMessage(
         tr("Submitting %1 %2 @ %3")
@@ -9737,6 +9800,13 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
                     if (y < 4) y = 4;
                     overlay->move(pad, y);
                     overlay->raise();
+                    QVariant cfov = w->property("clustersFooterOverlayPtr");
+                    if (cfov.isValid()) {
+                        auto *footer = reinterpret_cast<QWidget *>(cfov.value<quintptr>());
+                        if (footer) {
+                            footer->raise();
+                        }
+                    }
                 }
             }
         }
@@ -12440,6 +12510,10 @@ void MainWindow::addLocalOrderMarker(const QString &accountName,
     marker.orderId = orderId;
     MarkerBucket &bucket = m_markerBuckets[symUpper][accountKey];
     bucket.accountLabel = accountDisplay;
+    if (bucket.confirmed.contains(orderId)) {
+        // The exchange already reported this order as live; don't re-add as pending.
+        return;
+    }
     bucket.pending.insert(orderId, marker);
     enforcePendingLimit(bucket);
     refreshColumnsForSymbol(symUpper);
@@ -12577,6 +12651,11 @@ void MainWindow::handleLocalOrdersUpdated(const QString &accountName,
                                      .arg(marker.price, 0, 'f', 8)
                                      .arg(marker.createdMs);
             }
+            // If we get a live order update for this id, cancel any delayed/expiry timers so we don't
+            // re-add it as pending or auto-expire it.
+            const QString baseKey = markerTimerKey(targetSymbol, accountKey, marker.orderId);
+            removeMarkerDelayTimer(baseKey, nullptr);
+            removeMarkerDelayTimer(baseKey + QStringLiteral("|expire"), nullptr);
             bucket.confirmed.insert(marker.orderId, marker);
             bucket.pending.remove(marker.orderId);
         }
@@ -14436,7 +14515,11 @@ void MainWindow::repositionClustersFooterOverlay(DomColumn &col)
     QWidget *vp = col.scrollArea->viewport();
 
     const int footerH = col.clustersFooterOverlay->height() > 0 ? col.clustersFooterOverlay->height() : 34;
-    int y = vp->height() - footerH;
+    int reserveBottom = 0;
+    if (col.positionOverlay && col.positionOverlay->isVisible()) {
+        reserveBottom = std::max(0, col.positionOverlay->height() + 2);
+    }
+    int y = vp->height() - footerH - reserveBottom;
     if (y < 0) {
         y = 0;
     }

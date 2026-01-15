@@ -3230,6 +3230,21 @@ void TradeManager::setWatchedSymbols(const QString &accountName, const QSet<QStr
                 pollLighterTrades(ctx);
             }
         }
+        if ((profile == ConnectionStore::Profile::UzxSwap
+             || profile == ConnectionStore::Profile::UzxSpot)
+            && ctx.state == ConnectionState::Connected) {
+            if (!ctx.openOrdersTimer.isActive() && !ctx.watchedSymbols.isEmpty()) {
+                ctx.openOrdersTimer.start();
+            }
+            if (ctx.watchedSymbols.isEmpty()) {
+                ctx.openOrdersTimer.stop();
+            } else {
+                fetchOpenOrders(ctx);
+                if (profile == ConnectionStore::Profile::UzxSwap) {
+                    fetchUzxSwapPositions(ctx);
+                }
+            }
+        }
         return;
     }
     if (ctx.state == ConnectionState::Connected) {
@@ -6928,6 +6943,7 @@ void TradeManager::fetchOpenOrders(Context &ctx)
     }
     if (ctx.profile == ConnectionStore::Profile::UzxSwap
         || ctx.profile == ConnectionStore::Profile::UzxSpot) {
+        fetchUzxOpenOrders(ctx);
         return;
     }
     if (ctx.openOrdersPending) {
@@ -7043,6 +7059,306 @@ void TradeManager::fetchOpenOrders(Context &ctx)
             emit localOrdersUpdated(ctxPtr->accountName, symbol, output);
         }
         ctxPtr->trackedSymbols = newSymbols;
+    });
+}
+
+void TradeManager::fetchUzxOpenOrders(Context &ctx)
+{
+    if (ctx.openOrdersPending) {
+        return;
+    }
+    if (ctx.state != ConnectionState::Connected) {
+        return;
+    }
+    if (!ensureCredentials(ctx)) {
+        return;
+    }
+    ctx.openOrdersPending = true;
+
+    const bool isSwap = (ctx.profile == ConnectionStore::Profile::UzxSwap);
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("ins_type"), isSwap ? QStringLiteral("2") : QStringLiteral("1"));
+    QNetworkRequest req =
+        makeUzxRequest(QStringLiteral("/v2/trade/orders"), QByteArray(), QStringLiteral("GET"), query, ctx);
+    auto *reply = m_network.get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr = &ctx]() {
+        ctxPtr->openOrdersPending = false;
+        const QNetworkReply::NetworkError err = reply->error();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray raw = reply->readAll();
+        reply->deleteLater();
+        if (err != QNetworkReply::NoError || status >= 400) {
+            emit logMessage(QStringLiteral("%1 UZX open orders fetch failed: %2")
+                                .arg(contextTag(ctxPtr->accountName),
+                                     raw.isEmpty() ? reply->errorString() : QString::fromUtf8(raw)));
+            return;
+        }
+
+        const auto toDouble = [](const QJsonValue &v) -> double {
+            if (v.isString()) return v.toString().toDouble();
+            if (v.isDouble()) return v.toDouble();
+            return v.toVariant().toDouble();
+        };
+        const auto toLongLong = [](const QJsonValue &v) -> qint64 {
+            if (v.isString()) return v.toString().toLongLong();
+            if (v.isDouble()) return static_cast<qint64>(v.toDouble());
+            return v.toVariant().toLongLong();
+        };
+        auto orderIdFromValue = [](const QJsonValue &v) -> QString {
+            if (v.isString()) return v.toString().trimmed();
+            if (v.isDouble()) return QString::number(static_cast<qlonglong>(v.toDouble()));
+            return v.toVariant().toString().trimmed();
+        };
+
+        QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            return;
+        }
+        const QJsonObject obj = doc.object();
+        const int code = obj.value(QStringLiteral("code")).toInt(0);
+        if (code != 0 && code != 200) {
+            const QString rawMsg =
+                obj.value(QStringLiteral("msg")).toString(QStringLiteral("request error"));
+            emit logMessage(QStringLiteral("%1 UZX open orders rejected: %2")
+                                .arg(contextTag(ctxPtr->accountName),
+                                     uzxFormatError(code, rawMsg)));
+            return;
+        }
+
+        const QJsonArray arr = obj.value(QStringLiteral("data")).toArray();
+        QHash<QString, QVector<DomWidget::LocalOrderMarker>> symbolMap;
+        QSet<QString> newSymbols;
+        QHash<QString, OrderRecord> fetchedOrders;
+        QSet<QString> fetchedSymbols;
+
+        for (const auto &val : arr) {
+            if (!val.isObject()) {
+                continue;
+            }
+            const QJsonObject o = val.toObject();
+            QString wire = o.value(QStringLiteral("product_name")).toString().trimmed().toUpper();
+            if (wire.isEmpty()) {
+                wire = o.value(QStringLiteral("symbol")).toString().trimmed().toUpper();
+            }
+            const QString symbol = normalizedSymbol(uzxUserSymbol(wire));
+            if (symbol.isEmpty()) {
+                continue;
+            }
+            const QString orderId =
+                orderIdFromValue(o.value(QStringLiteral("order_id")).isUndefined()
+                                     ? o.value(QStringLiteral("orderId"))
+                                     : o.value(QStringLiteral("order_id")));
+            if (orderId.isEmpty()) {
+                continue;
+            }
+            const double price = toDouble(o.value(QStringLiteral("price")));
+            if (!(price > 0.0)) {
+                continue;
+            }
+            double remain = toDouble(o.value(QStringLiteral("un_filled_amount")));
+            if (!(remain > 0.0)) {
+                remain = toDouble(o.value(QStringLiteral("un_filled_number")));
+            }
+            if (!(remain > 0.0)) {
+                remain = toDouble(o.value(QStringLiteral("amount")));
+                if (!(remain > 0.0)) {
+                    remain = toDouble(o.value(QStringLiteral("number")));
+                }
+            }
+            if (!(remain > 0.0)) {
+                continue;
+            }
+            const int sideFlag = o.value(QStringLiteral("order_buy_or_sell")).toInt(1);
+            const OrderSide side = sideFlag == 2 ? OrderSide::Sell : OrderSide::Buy;
+            const qint64 createdMs =
+                std::max(toLongLong(o.value(QStringLiteral("updated_at"))),
+                         toLongLong(o.value(QStringLiteral("created_at"))));
+
+            DomWidget::LocalOrderMarker marker;
+            marker.price = price;
+            marker.quantity = std::abs(price * remain);
+            marker.side = side;
+            marker.createdMs = createdMs > 0 ? createdMs : QDateTime::currentMSecsSinceEpoch();
+            marker.orderId = orderId;
+            symbolMap[symbol].push_back(marker);
+            newSymbols.insert(symbol);
+            fetchedSymbols.insert(symbol);
+
+            OrderRecord record;
+            record.symbol = symbol;
+            record.price = price;
+            record.quantityNotional = marker.quantity;
+            record.side = side;
+            record.createdMs = marker.createdMs;
+            record.orderId = orderId;
+            fetchedOrders.insert(orderId, record);
+        }
+
+        QList<OrderRecord> removedOrders;
+        for (auto it = ctxPtr->activeOrders.constBegin(); it != ctxPtr->activeOrders.constEnd(); ++it) {
+            if (!fetchedOrders.contains(it.key())) {
+                OrderRecord record = it.value();
+                record.orderId = it.key();
+                removedOrders.push_back(record);
+            }
+        }
+        ctxPtr->activeOrders = fetchedOrders;
+        for (const auto &record : removedOrders) {
+            emit orderCanceled(ctxPtr->accountName, record.symbol, record.side, record.price, record.orderId);
+        }
+        for (auto it = ctxPtr->pendingCancelSymbols.begin(); it != ctxPtr->pendingCancelSymbols.end();) {
+            if (!fetchedSymbols.contains(*it)) {
+                it = ctxPtr->pendingCancelSymbols.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        QSet<QString> allSymbols = ctxPtr->trackedSymbols;
+        allSymbols.unite(newSymbols);
+        for (const QString &symbol : allSymbols) {
+            QVector<DomWidget::LocalOrderMarker> output;
+            if (!ctxPtr->pendingCancelSymbols.contains(symbol)) {
+                output = symbolMap.value(symbol);
+            }
+            emit localOrdersUpdated(ctxPtr->accountName, symbol, output);
+        }
+        ctxPtr->trackedSymbols = newSymbols;
+    });
+}
+
+void TradeManager::fetchUzxSwapPositions(Context &ctx)
+{
+    if (ctx.futuresPositionsPending) {
+        return;
+    }
+    if (ctx.state != ConnectionState::Connected) {
+        return;
+    }
+    if (!ensureCredentials(ctx)) {
+        return;
+    }
+    ctx.futuresPositionsPending = true;
+    fetchUzxSwapPositionsPath(ctx, QStringLiteral("/v2/trade/swap/position"), true);
+}
+
+void TradeManager::fetchUzxSwapPositionsPath(Context &ctx, const QString &path, bool allowFallback)
+{
+    QNetworkRequest req = makeUzxRequest(path, QByteArray(), QStringLiteral("GET"), QUrlQuery(), ctx);
+    auto *reply = m_network.get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr = &ctx, path, allowFallback]() {
+        const QNetworkReply::NetworkError err = reply->error();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray raw = reply->readAll();
+        reply->deleteLater();
+        if (err != QNetworkReply::NoError || status >= 400) {
+            if (allowFallback && path == QStringLiteral("/v2/trade/swap/position")) {
+                fetchUzxSwapPositionsPath(*ctxPtr, QStringLiteral("/v2/trade/swap/positions"), false);
+                return;
+            }
+            emit logMessage(QStringLiteral("%1 UZX positions fetch failed: %2")
+                                .arg(contextTag(ctxPtr->accountName),
+                                     raw.isEmpty() ? reply->errorString() : QString::fromUtf8(raw)));
+            ctxPtr->futuresPositionsPending = false;
+            return;
+        }
+
+        QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            ctxPtr->futuresPositionsPending = false;
+            return;
+        }
+        const QJsonObject obj = doc.object();
+        const int code = obj.value(QStringLiteral("code")).toInt(0);
+        if (code != 0 && code != 200) {
+            const QString rawMsg =
+                obj.value(QStringLiteral("msg")).toString(QStringLiteral("request error"));
+            if (allowFallback && path == QStringLiteral("/v2/trade/swap/position")) {
+                fetchUzxSwapPositionsPath(*ctxPtr, QStringLiteral("/v2/trade/swap/positions"), false);
+                return;
+            }
+            emit logMessage(QStringLiteral("%1 UZX positions rejected: %2")
+                                .arg(contextTag(ctxPtr->accountName),
+                                     uzxFormatError(code, rawMsg)));
+            ctxPtr->futuresPositionsPending = false;
+            return;
+        }
+
+        QJsonArray arr;
+        const QJsonValue dataVal = obj.value(QStringLiteral("data"));
+        if (dataVal.isArray()) {
+            arr = dataVal.toArray();
+        } else if (dataVal.isObject()) {
+            const QJsonObject dataObj = dataVal.toObject();
+            arr = dataObj.value(QStringLiteral("positions")).toArray();
+            if (arr.isEmpty()) {
+                arr = dataObj.value(QStringLiteral("data")).toArray();
+            }
+        }
+        const auto toDouble = [](const QJsonValue &v) -> double {
+            if (v.isString()) return v.toString().toDouble();
+            if (v.isDouble()) return v.toDouble();
+            return v.toVariant().toDouble();
+        };
+        const auto toString = [](const QJsonValue &v) -> QString {
+            if (v.isString()) return v.toString();
+            return v.toVariant().toString();
+        };
+
+        QSet<QString> updatedSymbols;
+        for (const auto &val : arr) {
+            if (!val.isObject()) {
+                continue;
+            }
+            const QJsonObject p = val.toObject();
+            QString wire = p.value(QStringLiteral("product_name")).toString().trimmed().toUpper();
+            if (wire.isEmpty()) {
+                wire = p.value(QStringLiteral("symbol")).toString().trimmed().toUpper();
+            }
+            const QString sym = normalizedSymbol(uzxUserSymbol(wire));
+            if (sym.isEmpty()) {
+                continue;
+            }
+            const QString sideStr = toString(p.value(QStringLiteral("pos_side"))).trimmed().toUpper();
+            const OrderSide side =
+                (sideStr == QStringLiteral("ST") || sideStr == QStringLiteral("SHORT"))
+                    ? OrderSide::Sell
+                    : OrderSide::Buy;
+            double qty = toDouble(p.value(QStringLiteral("holdVol")));
+            if (!(qty > 0.0)) qty = toDouble(p.value(QStringLiteral("quantity")));
+            if (!(qty > 0.0)) qty = toDouble(p.value(QStringLiteral("pos")));
+            if (!(qty > 0.0)) qty = toDouble(p.value(QStringLiteral("amount")));
+            if (!(qty > 0.0)) {
+                continue;
+            }
+            double avg = toDouble(p.value(QStringLiteral("avg_entry_price")));
+            if (!(avg > 0.0)) avg = toDouble(p.value(QStringLiteral("holdAvgPrice")));
+            if (!(avg > 0.0)) avg = toDouble(p.value(QStringLiteral("avg_price")));
+            if (!(avg > 0.0)) avg = toDouble(p.value(QStringLiteral("open_avg_price")));
+
+            TradePosition pos;
+            pos.hasPosition = true;
+            pos.side = side;
+            pos.quantity = qty;
+            pos.averagePrice = avg;
+            pos.qtyMultiplier = 1.0;
+            pos.realizedPnl = toDouble(p.value(QStringLiteral("realized_pnl")));
+            ctxPtr->positions.insert(sym, pos);
+            updatedSymbols.insert(sym);
+            emitPositionChanged(*ctxPtr, sym);
+        }
+
+        for (auto it = ctxPtr->positions.begin(); it != ctxPtr->positions.end();) {
+            const QString key = it.key();
+            if (!updatedSymbols.contains(key) && it.value().hasPosition && it.value().quantity > 0.0) {
+                it = ctxPtr->positions.erase(it);
+                emitPositionChanged(*ctxPtr, key);
+            } else {
+                ++it;
+            }
+        }
+
+        ctxPtr->futuresPositionsPending = false;
     });
 }
 
@@ -9464,11 +9780,10 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
     ctx->openOrdersTimer.setSingleShot(false);
     ctx->openOrdersTimer.setInterval(4000);
     self->connect(&ctx->openOrdersTimer, &QTimer::timeout, self, [self, ctx]() {
-        if (ctx->profile == ConnectionStore::Profile::UzxSwap
-            || ctx->profile == ConnectionStore::Profile::UzxSpot) {
-            return;
-        }
         self->fetchOpenOrders(*ctx);
+        if (ctx->profile == ConnectionStore::Profile::UzxSwap) {
+            self->fetchUzxSwapPositions(*ctx);
+        }
     });
 
     ctx->myTradesTimer.setSingleShot(false);
@@ -9795,6 +10110,13 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
                                   self->setState(*ctx,
                                            ConnectionState::Connected,
                                            QStringLiteral("UZX authenticated"));
+                                  self->fetchOpenOrders(*ctx);
+                                  if (profile == ConnectionStore::Profile::UzxSwap) {
+                                      self->fetchUzxSwapPositions(*ctx);
+                                  }
+                                  if (!ctx->openOrdersTimer.isActive()) {
+                                      ctx->openOrdersTimer.start();
+                                  }
                               }
                               return;
                           }

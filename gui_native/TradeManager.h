@@ -268,6 +268,9 @@ private:
     void ensureLighterStreamWired(Context &ctx);
     void ensureLighterStreamOpen(Context &ctx);
     void subscribeLighterPrivateWs(Context &ctx);
+    void fetchUzxOpenOrders(Context &ctx);
+    void fetchUzxSwapPositions(Context &ctx);
+    void fetchUzxSwapPositionsPath(Context &ctx, const QString &path, bool allowFallback);
 
     Context &ensureContext(ConnectionStore::Profile profile) const;
     QString defaultAccountName(ConnectionStore::Profile profile) const;

@@ -738,6 +738,12 @@ void PrintsWidget::syncQuickProperties()
     }
 }
 
+void PrintsWidget::refreshFontProperties()
+{
+    syncQuickProperties();
+    update();
+}
+
 void PrintsWidget::requestCancel(const QVariant &orderIds,
                                 const QString &label,
                                 double price,

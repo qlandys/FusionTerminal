@@ -60,6 +60,7 @@ public:
     void setClusterWindowMs(int ms);
     void setClusterBucketCount(int count);
     void clearClusters();
+    void refreshFontProperties();
 
 signals:
     void clusterLabelChanged(const QString &label);

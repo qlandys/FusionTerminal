@@ -3,6 +3,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QColorDialog>
+#include <QFontDatabase>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QKeyEvent>
@@ -446,6 +447,50 @@ SettingsWindow::SettingsWindow(QWidget *parent)
     displayLayout->addWidget(
         new QLabel(tr("Здесь будут глобальные параметры внешнего вида и тем."),
                    displayPage));
+    // Global font family (single font for the whole app)
+    {
+        auto *row = new QHBoxLayout();
+        auto *label = new QLabel(tr("Шрифт"), displayPage);
+        m_fontFamilyCombo = new QComboBox(displayPage);
+        m_fontFamilyCombo->setEditable(true);
+        m_fontFamilyCombo->setInsertPolicy(QComboBox::NoInsert);
+        m_fontFamilyCombo->setSizeAdjustPolicy(QComboBox::AdjustToContentsOnFirstShow);
+
+        m_fontFamilyCombo->addItem(tr("(По умолчанию)"), QString());
+        const QStringList families = QFontDatabase().families();
+        for (const QString &fam : families) {
+            const QString t = fam.trimmed();
+            if (!t.isEmpty()) {
+                m_fontFamilyCombo->addItem(t, t);
+            }
+        }
+
+        row->addWidget(label);
+        row->addWidget(m_fontFamilyCombo, 1);
+        displayLayout->addLayout(row);
+
+        QObject::connect(m_fontFamilyCombo, &QComboBox::currentTextChanged, this, [this](const QString &text) {
+            if (!m_fontFamilyCombo) {
+                return;
+            }
+            QString family;
+            const int idx = m_fontFamilyCombo->currentIndex();
+            if (idx >= 0) {
+                family = m_fontFamilyCombo->itemData(idx).toString().trimmed();
+            }
+            if (family.isEmpty()) {
+                family = text.trimmed();
+                if (family == tr("(По умолчанию)")) {
+                    family.clear();
+                }
+            }
+            if (family == m_fontFamily) {
+                return;
+            }
+            m_fontFamily = family;
+            emit fontFamilyChanged(m_fontFamily);
+        });
+    }
     displayLayout->addStretch(1);
 
     addCategory(tr("Отображение"), displayPage);
@@ -708,6 +753,32 @@ void SettingsWindow::setActiveDomOutlineEnabled(bool enabled)
     }
     const QSignalBlocker blocker(m_activeDomOutlineCheck);
     m_activeDomOutlineCheck->setChecked(enabled);
+}
+
+void SettingsWindow::setFontFamily(const QString &family)
+{
+    m_fontFamily = family.trimmed();
+    if (!m_fontFamilyCombo) {
+        return;
+    }
+    const QSignalBlocker blocker(m_fontFamilyCombo);
+    const QString want = m_fontFamily;
+    int found = -1;
+    for (int i = 0; i < m_fontFamilyCombo->count(); ++i) {
+        if (m_fontFamilyCombo->itemData(i).toString() == want) {
+            found = i;
+            break;
+        }
+    }
+    if (found >= 0) {
+        m_fontFamilyCombo->setCurrentIndex(found);
+        return;
+    }
+    if (want.isEmpty()) {
+        m_fontFamilyCombo->setCurrentIndex(0);
+        return;
+    }
+    m_fontFamilyCombo->setCurrentText(want);
 }
 
 void SettingsWindow::refreshVolumeRulesTable()

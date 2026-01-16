@@ -22,6 +22,7 @@ public:
     int xOrigin() const { return m_cachedXOrigin; }
 
     bool adjustColumnWidthByWheelSteps(int steps);
+    void refreshFontProperties();
 
 signals:
     void layoutChanged();

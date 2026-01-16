@@ -14,12 +14,16 @@
 #include <QQuickWindow>
 #include <QSGRendererInterface>
 #include <QtQml/qqml.h>
+#include <QStandardPaths>
+#include <QTextStream>
 
 #include "GpuDomItem.h"
 #include "GpuGridItem.h"
 #include "GpuTrailItem.h"
 #include "GpuCirclesItem.h"
 #include "GpuMarkerItem.h"
+
+#include <exception>
 
 #ifdef Q_OS_WIN
 #include <ShObjIdl.h>
@@ -164,6 +168,85 @@ static void maybeRefreshShellIconCache()
 }
 #endif
 
+static QString startupCrashLogPath()
+{
+    QString base = qEnvironmentVariable("LOCALAPPDATA");
+    if (base.isEmpty()) {
+        base = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    }
+    if (base.isEmpty()) {
+        base = QDir::homePath() + QLatin1String("/.fusion_terminal");
+    }
+    QDir().mkpath(base);
+    const QString logDir = QDir(base).filePath(QStringLiteral("Fusion/FusionTerminal/logs"));
+    QDir().mkpath(logDir);
+    return QDir(logDir).filePath(QStringLiteral("startup_crash.log"));
+}
+
+static void appendStartupCrashLog(const QString &msg)
+{
+    QFile f(startupCrashLogPath());
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        return;
+    }
+    QTextStream ts(&f);
+    ts << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << " " << msg << "\n";
+}
+
+static void installStartupCrashHandlers()
+{
+    if (qEnvironmentVariableIntValue("FUSION_STARTUP_CRASH_LOG") <= 0) {
+        return;
+    }
+    static bool installed = false;
+    if (installed) {
+        return;
+    }
+    installed = true;
+
+    std::set_terminate([]() {
+        QString detail = QStringLiteral("std::terminate");
+        if (auto ex = std::current_exception()) {
+            try {
+                std::rethrow_exception(ex);
+            } catch (const std::exception &e) {
+                detail += QStringLiteral(" (std::exception): ");
+                detail += QString::fromUtf8(e.what());
+            } catch (...) {
+                detail += QStringLiteral(" (unknown exception)");
+            }
+        }
+        appendStartupCrashLog(detail);
+        std::abort();
+    });
+
+    qInstallMessageHandler([](QtMsgType type, const QMessageLogContext &, const QString &msg) {
+        QString line;
+        switch (type) {
+        case QtDebugMsg:
+            line = QStringLiteral("[debug] ");
+            break;
+        case QtInfoMsg:
+            line = QStringLiteral("[info] ");
+            break;
+        case QtWarningMsg:
+            line = QStringLiteral("[warn] ");
+            break;
+        case QtCriticalMsg:
+            line = QStringLiteral("[critical] ");
+            break;
+        case QtFatalMsg:
+            line = QStringLiteral("[fatal] ");
+            break;
+        }
+        line += msg;
+        appendStartupCrashLog(line);
+        if (type == QtFatalMsg) {
+            std::abort();
+        }
+    });
+}
+
 int main(int argc, char **argv)
 {
 #ifdef Q_OS_WIN
@@ -243,6 +326,7 @@ int main(int argc, char **argv)
     }
 
     QApplication app(argc, argv);
+    installStartupCrashHandlers();
 
 #ifdef Q_OS_WIN
     // On Windows with light OS theme, the default palette bleeds into unstyled widgets and
@@ -270,7 +354,7 @@ int main(int argc, char **argv)
     QCoreApplication::setOrganizationName(QStringLiteral("Fusion"));
     QCoreApplication::setApplicationName(QStringLiteral("FusionTerminal"));
     QGuiApplication::setApplicationDisplayName(QStringLiteral("Fusion Terminal"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.35-a"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.36-a"));
 
 #ifdef Q_OS_WIN
     // Make Windows use a stable AppUserModelID so pinned/taskbar identity and icon refresh are consistent.
@@ -360,6 +444,11 @@ int main(int argc, char **argv)
     appFont.setKerning(true);
     app.setFont(appFont);
 
+    // Always register JetBrains Mono (used for the build/version label) even if Inter is found externally.
+    // Without this, the family may be missing from QFontDatabase::families() and QSS/QML can fall back.
+    QFontDatabase::addApplicationFont(QStringLiteral(":/font/JetBrainsMono-Regular.ttf"));
+    QFontDatabase::addApplicationFont(QStringLiteral(":/font/JetBrainsMono-Bold.ttf"));
+
     QString backendPath = QStringLiteral("orderbook_backend.exe");
     QString symbol;
     int levels = 500; // 500 per side => ~1000 levels total
@@ -405,10 +494,19 @@ int main(int argc, char **argv)
 
     backendPath = resolveBackendPath(backendPath);
 
-    MainWindow win(backendPath, symbol, levels);
-    win.show();
-    return app.exec();
+    try {
+        MainWindow win(backendPath, symbol, levels);
+        win.show();
+        return app.exec();
+    } catch (const std::exception &e) {
+        appendStartupCrashLog(QStringLiteral("main() caught std::exception: %1").arg(QString::fromUtf8(e.what())));
+        return 1;
+    } catch (...) {
+        appendStartupCrashLog(QStringLiteral("main() caught unknown exception"));
+        return 1;
+    }
 }
+
 
 
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QDialog>
+#include <QVariantMap>
 #include "TradeTypes.h"
 
 class TradeManager;
@@ -19,7 +20,7 @@ public:
     void refreshUi();
 
 private:
-    void appendTrade(const ExecutedTrade &trade);
+    void appendClosedTradeRow(const QVariantMap &row);
     void rebuildAccountFilter();
 
     TradeManager *m_manager = nullptr;
@@ -31,4 +32,3 @@ private:
     QStandardItemModel *m_model = nullptr;
     QSortFilterProxyModel *m_proxy = nullptr;
 };
-

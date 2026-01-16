@@ -19,7 +19,11 @@ Item {
     property real trailWidth: 1.25
     property color hoverColor: "#2860ff"
     property color hoverTextColor: "#f4f6f8"
-    property string fontFamily: "JetBrains Mono"
+    // Hover "ray" for DOM hover info text (percent | notional).
+    // Keep it visually consistent across columns by using an opaque fill.
+    property color hoverBeamColor: "#1b2333"
+    property color hoverBeamBorderColor: "#2b3a55"
+    property string fontFamily: Qt.application.font.family
     property int fontPixelSize: 12
     property int hoverRow: -1
     property string hoverText: ""
@@ -212,6 +216,8 @@ Item {
     }
 
     Rectangle {
+        // Row hover highlight (kept separate from the hover info "ray").
+        // When the ray is visible we disable this highlight to avoid the "double ray" look.
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
@@ -219,7 +225,7 @@ Item {
         height: rowHeight
         color: hoverColor
         opacity: hoverRow >= 0 ? 0.25 : 0.0
-        visible: hoverRow >= 0 && !root.dragActive
+        visible: hoverRow >= 0 && !root.dragActive && !hoverBeam.visible
         z: 5
     }
 
@@ -467,7 +473,11 @@ Item {
                     text: textValue
                     color: "#f7f9fb"
                     font.family: fontFamily
-                    font.bold: true
+                    font.weight: Font.DemiBold
+                    font.bold: false
+                    font.kerning: false
+                    font.preferShaping: true
+                    font.features: { "tnum": 1, "lnum": 1 }
                     font.pixelSize: Math.max(10, Math.min(fontPixelSize, height - 4))
                 }
 
@@ -578,25 +588,55 @@ Item {
             text: root.dragText
             color: "#f7f9fb"
             font.family: root.fontFamily
-            font.bold: true
+            font.weight: Font.DemiBold
+            font.bold: false
+            font.kerning: false
+            font.preferShaping: true
+            font.features: { "tnum": 1, "lnum": 1 }
             font.pixelSize: Math.max(10, Math.min(root.fontPixelSize, dragGhost.height - 4))
         }
     }
 
-    Text {
-        anchors.right: parent.right
-        anchors.rightMargin: 4
-        anchors.top: parent.top
-        anchors.topMargin: hoverRow >= 0 ? hoverRow * rowHeight : 0
-        height: rowHeight
-        verticalAlignment: Text.AlignVCenter
-        horizontalAlignment: Text.AlignRight
-        text: hoverRow >= 0 ? hoverText : ""
-        color: hoverTextColor
-        font.family: fontFamily
-        font.pixelSize: Math.max(8, fontPixelSize - 1)
-        visible: hoverRow >= 0 && hoverText.length > 0
+    Item {
+        id: hoverBeam
         z: 7
+        visible: hoverRow >= 0 && hoverText.length > 0 && !root.dragActive
+        height: rowHeight
+        y: hoverRow >= 0 ? hoverRow * rowHeight : 0
+        property int padX: 10
+        property int padY: 2
+        width: Math.min(parent.width, Math.max(1, hoverBeamText.contentWidth + padX * 2))
+        x: parent.width - width
+
+        Rectangle {
+            anchors.fill: parent
+            radius: 0
+            color: root.hoverBeamColor
+            border.width: 0
+            opacity: 1.0
+        }
+
+        Text {
+            id: hoverBeamText
+            anchors.fill: parent
+            anchors.leftMargin: hoverBeam.padX
+            anchors.rightMargin: hoverBeam.padX
+            anchors.topMargin: hoverBeam.padY
+            anchors.bottomMargin: hoverBeam.padY
+            verticalAlignment: Text.AlignVCenter
+            horizontalAlignment: Text.AlignHCenter
+            text: hoverText
+            color: hoverTextColor
+            font.family: fontFamily
+            font.weight: Font.DemiBold
+            font.bold: false
+            font.kerning: false
+            font.preferShaping: true
+            font.features: { "tnum": 1, "lnum": 1 }
+            font.pixelSize: Math.max(8, fontPixelSize - 1)
+            elide: Text.ElideNone
+            clip: true
+        }
     }
 
     Rectangle {

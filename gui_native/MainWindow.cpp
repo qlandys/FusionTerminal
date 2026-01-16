@@ -16,6 +16,7 @@
 #include "AnimatedSplitter.h"
 #include <QApplication>
 #include <QCoreApplication>
+#include <QFontDatabase>
 #include <QGuiApplication>
 #include <QDateTime>
 #include <QDir>
@@ -1420,6 +1421,8 @@ MainWindow::MainWindow(const QString &backendPath,
     , m_maxButton(nullptr)
     , m_closeButton(nullptr)
 {
+    m_defaultAppFont = qApp ? qApp->font() : QFont();
+
     if (qEnvironmentVariableIntValue("FUSION_STALL_MONITOR") > 0) {
         new UiStallMonitor(this);
     }
@@ -1447,6 +1450,7 @@ MainWindow::MainWindow(const QString &backendPath,
     setWindowFlag(Qt::FramelessWindowHint);
 
     loadUserSettings();
+    applyGlobalFontFamily(m_uiFontFamily);
     if (!m_authToken.isEmpty()) {
         requestInstalledMods();
     }
@@ -2601,24 +2605,54 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
         return;
     }
 
-    if (matchesHotkey(key, mods, m_settingsSearchKey, m_settingsSearchMods)) {
+    if (matchesHotkeyEvent(event, m_settingsSearchKey, m_settingsSearchMods)) {
         toggleSettingsSearchDrawer(!m_settingsSearchExpanded, true);
         event->accept();
         return;
     }
 
-    if (matchesHotkey(key, mods, m_newTabKey, m_newTabMods)) {
+    if (matchesHotkeyEvent(event, m_newTabKey, m_newTabMods)) {
         handleNewTabRequested();
         event->accept();
         return;
     }
-    if (matchesHotkey(key, mods, m_addLadderKey, m_addLadderMods)) {
+    if (matchesHotkeyEvent(event, m_addLadderKey, m_addLadderMods)) {
         handleNewLadderRequested();
         event->accept();
         return;
     }
-    if (matchesHotkey(key, mods, m_refreshLadderKey, m_refreshLadderMods)) {
+    if (matchesHotkeyEvent(event, m_refreshLadderKey, m_refreshLadderMods)) {
         refreshActiveLadder();
+        event->accept();
+        return;
+    }
+    if (matchesHotkeyEvent(event, m_marketBuyKey, m_marketBuyMods)) {
+        handleMarketHotkey(OrderSide::Buy);
+        event->accept();
+        return;
+    }
+    if (matchesHotkeyEvent(event, m_marketSellKey, m_marketSellMods)) {
+        handleMarketHotkey(OrderSide::Sell);
+        event->accept();
+        return;
+    }
+    if (matchesHotkeyEvent(event, m_frontBidBuyKey, m_frontBidBuyMods)) {
+        handleFrontLimitHotkey(OrderSide::Buy);
+        event->accept();
+        return;
+    }
+    if (matchesHotkeyEvent(event, m_frontAskSellKey, m_frontAskSellMods)) {
+        handleFrontLimitHotkey(OrderSide::Sell);
+        event->accept();
+        return;
+    }
+    if (matchesHotkeyEvent(event, m_frontAskBuyKey, m_frontAskBuyMods)) {
+        handleCrossFrontLimitHotkey(OrderSide::Buy);
+        event->accept();
+        return;
+    }
+    if (matchesHotkeyEvent(event, m_frontBidSellKey, m_frontBidSellMods)) {
+        handleCrossFrontLimitHotkey(OrderSide::Sell);
         event->accept();
         return;
     }
@@ -2801,7 +2835,7 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
             return;
         }
     }
-    if (matchesHotkey(key, mods, m_volumeAdjustKey, m_volumeAdjustMods)) {
+    if (matchesHotkeyEvent(event, m_volumeAdjustKey, m_volumeAdjustMods)) {
         m_capsAdjustMode = true;
         event->accept();
         return;
@@ -3276,6 +3310,22 @@ QWidget *MainWindow::buildMainArea(QWidget *parent)
     auto *buildLabel = new QLabel(buildVersion, sidebar);
     buildLabel->setObjectName(QStringLiteral("SideBuildLabel"));
     buildLabel->setAlignment(Qt::AlignHCenter | Qt::AlignTop);
+    // Keep build/version label in JetBrains Mono permanently (independent of global UI font).
+    {
+        const QStringList families = QFontDatabase().families();
+        QString resolved;
+        for (const QString &fam : families) {
+            if (fam.compare(QStringLiteral("JetBrains Mono"), Qt::CaseInsensitive) == 0
+                || fam.contains(QStringLiteral("JetBrains Mono"), Qt::CaseInsensitive)
+                || fam.contains(QStringLiteral("JetBrainsMono"), Qt::CaseInsensitive)) {
+                resolved = fam;
+                break;
+            }
+        }
+        QFont f = buildLabel->font();
+        f.setFamily(resolved.isEmpty() ? QStringLiteral("JetBrains Mono") : resolved);
+        buildLabel->setFont(f);
+    }
     buildLabel->setStyleSheet(
         "QLabel#SideBuildLabel {"
         "  color: #9aa0a6;"
@@ -4819,6 +4869,30 @@ void MainWindow::logLadderStatus(const QString &msg)
 
 void MainWindow::logMarkerEvent(const QString &msg)
 {
+    static const bool verboseMarkers =
+        qEnvironmentVariableIntValue("DOM_DEBUG_MARKERS") > 0;
+    if (!verboseMarkers) {
+        const QString lower = msg.toLower();
+        static const QStringList keywords = {
+            QStringLiteral("error"),
+            QStringLiteral("fail"),
+            QStringLiteral("reject"),
+            QStringLiteral("denied"),
+            QStringLiteral("invalid"),
+            QStringLiteral("timeout"),
+            QStringLiteral("can't"),
+        };
+        bool important = false;
+        for (const auto &k : keywords) {
+            if (lower.contains(k)) {
+                important = true;
+                break;
+            }
+        }
+        if (!important) {
+            return;
+        }
+    }
     appendConnectionsLog(msg);
 }
 
@@ -4839,6 +4913,89 @@ void MainWindow::appendConnectionsLog(const QString &msg)
         m_connectionsLogBacklog.erase(m_connectionsLogBacklog.begin(),
                                       m_connectionsLogBacklog.begin()
                                           + (m_connectionsLogBacklog.size() - kMaxBacklog));
+    }
+}
+
+bool MainWindow::matchesHotkeyEvent(QKeyEvent *event, int key, Qt::KeyboardModifiers mods) const
+{
+    if (!event) {
+        return false;
+    }
+    if (key == 0) {
+        return false;
+    }
+    const int eventKey = event->key();
+    Qt::KeyboardModifiers cleaned = event->modifiers() & ~Qt::KeypadModifier;
+    if (eventKey == key && cleaned == mods) {
+        return true;
+    }
+#if defined(Q_OS_WIN)
+    if (cleaned != mods) {
+        return false;
+    }
+    // Make letter/digit hotkeys layout-independent by comparing Windows VK codes.
+    // Example: binding 'G' should still work on RU layout (same physical key).
+    const int vk = static_cast<int>(event->nativeVirtualKey());
+    if (key >= Qt::Key_A && key <= Qt::Key_Z) {
+        const int expected = 'A' + (key - Qt::Key_A);
+        return vk == expected;
+    }
+    if (key >= Qt::Key_0 && key <= Qt::Key_9) {
+        const int expected = '0' + (key - Qt::Key_0);
+        return vk == expected;
+    }
+#else
+    Q_UNUSED(eventKey);
+#endif
+    return false;
+}
+
+void MainWindow::applyGlobalFontFamily(const QString &family)
+{
+    QFont base = m_defaultAppFont;
+    if (base.family().trimmed().isEmpty() && qApp) {
+        base = qApp->font();
+    }
+
+    QString fam = family.trimmed();
+    if (!fam.isEmpty()) {
+        // Resolve installed family case-insensitively.
+        const QStringList families = QFontDatabase().families();
+        QString resolved;
+        for (const QString &f : families) {
+            if (f.compare(fam, Qt::CaseInsensitive) == 0) {
+                resolved = f;
+                break;
+            }
+        }
+        if (!resolved.isEmpty()) {
+            base.setFamily(resolved);
+        }
+    }
+
+    if (qApp) {
+        qApp->setFont(base);
+    }
+
+    // The DOM ladder must use a monospaced font for the price/volume columns to stay vertically aligned.
+    // Let DomWidget pick the best monospaced fallback (JetBrains Mono/TypeWriter) based on app font.
+    QFont ladder = base;
+
+    // Update existing widgets that push font props into QML.
+    for (auto &tab : m_tabs) {
+        for (auto &col : tab.columnsData) {
+            if (col.dom) {
+                col.dom->refreshFontProperties();
+            }
+            if (col.prints) {
+                col.prints->setFont(base);
+                col.prints->refreshFontProperties();
+            }
+            if (col.clusters) {
+                col.clusters->setFont(base);
+                col.clusters->refreshFontProperties();
+            }
+        }
     }
 }
 
@@ -5004,17 +5161,37 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
             2000);
         return;
     }
-    const double notional = column->orderNotional > 0.0 ? column->orderNotional : 0.0;
+    const OrderSide side = (button == Qt::LeftButton) ? OrderSide::Buy : OrderSide::Sell;
+    submitDomOrder(*column, price, side);
+}
+
+bool MainWindow::submitDomOrder(DomColumn &column,
+                                double price,
+                                OrderSide side,
+                                double notionalOverride)
+{
+    if (!m_tradeManager) {
+        return false;
+    }
+    const SymbolSource src = symbolSourceForAccount(column.accountName);
+    const bool lighterPerp = (src == SymbolSource::Lighter) && !column.symbol.contains(QLatin1Char('/'));
+
+    const double notional =
+        (notionalOverride > 0.0) ? notionalOverride
+                                 : (column.orderNotional > 0.0 ? column.orderNotional : 0.0);
     if (price <= 0.0 || notional <= 0.0) {
         statusBar()->showMessage(tr("Set a positive order size before trading"), 2000);
-        return;
+        return false;
     }
-    const QString symUpper = column->symbol.trimmed().toUpper().replace(QStringLiteral("-"), QString());
+
+    const QString symUpper =
+        column.symbol.trimmed().toUpper().replace(QStringLiteral("-"), QString());
     double quantity = notional / price;
     if (quantity <= 0.0) {
         statusBar()->showMessage(tr("Calculated order quantity is zero"), 2000);
-        return;
+        return false;
     }
+
     if (src == SymbolSource::UzxSwap) {
         if (m_uzxSwapContractValueBySymbol.isEmpty() && !m_uzxSwapRequestInFlight) {
             fetchSymbolLibrary(SymbolSource::UzxSwap, nullptr);
@@ -5024,9 +5201,13 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
             appendConnectionsLog(QStringLiteral("[UZX Swap] Specs not loaded yet; placing order without rounding."));
             statusBar()->showMessage(tr("UZX swap specs not loaded yet"), 2000);
         } else {
-            double priceUnit = m_uzxSwapPriceUnitBySymbol.value(symUpper, 0.0);
+            const double priceUnit = m_uzxSwapPriceUnitBySymbol.value(symUpper, 0.0);
             if (priceUnit > 0.0) {
-                price = std::floor(price / priceUnit + 1e-9) * priceUnit;
+                if (side == OrderSide::Buy) {
+                    price = std::ceil(price / priceUnit - 1e-9) * priceUnit;
+                } else {
+                    price = std::floor(price / priceUnit + 1e-9) * priceUnit;
+                }
             }
             double step = m_uzxSwapContractValueBySymbol.value(symUpper, 0.0);
             const int numPrecision = m_uzxSwapNumPrecisionBySymbol.value(symUpper, -1);
@@ -5048,21 +5229,22 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
                         .arg(QString::number(step, 'f', 8))
                         .arg(QString::number(minNotional, 'f', 4)),
                     3500);
-                return;
+                return false;
             }
         }
     }
-    const OrderSide side = (button == Qt::LeftButton) ? OrderSide::Buy : OrderSide::Sell;
-    clearPendingCancelForSymbol(column->symbol);
-    int leverage = column->leverage;
+
+    clearPendingCancelForSymbol(column.symbol);
+
+    int leverage = column.leverage;
     if (src == SymbolSource::UzxSwap) {
         const int maxLev = m_uzxSwapMaxLeverageBySymbol.value(symUpper, 0);
         if (maxLev > 0 && leverage > maxLev) {
             leverage = maxLev;
-            column->leverage = maxLev;
+            column.leverage = maxLev;
             m_futuresLeverageBySymbol.insert(symUpper, maxLev);
-            if (column->leverageButton) {
-                column->leverageButton->setText(QStringLiteral("%1x").arg(maxLev));
+            if (column.leverageButton) {
+                column.leverageButton->setText(QStringLiteral("%1x").arg(maxLev));
             }
             saveUserSettings();
         }
@@ -5071,17 +5253,17 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
     // UZX Swap is effectively hedge-mode (pos_side=LG/ST). Our position model/UI is single-sided,
     // so avoid accidentally opening the opposite side when the user is trying to close.
     if (src == SymbolSource::UzxSwap) {
-        const TradePosition livePos = m_tradeManager->positionForSymbol(column->symbol, column->accountName);
+        const TradePosition livePos = m_tradeManager->positionForSymbol(column.symbol, column.accountName);
         const bool hasLivePos =
             livePos.hasPosition && livePos.quantity > 0.0 && livePos.averagePrice > 0.0;
         if (hasLivePos && livePos.side != side) {
             statusBar()->showMessage(tr("Closing position @ %1").arg(QString::number(price, 'f', 6)), 1800);
-            m_tradeManager->closePositionMarket(column->symbol, column->accountName, price);
-            return;
+            m_tradeManager->closePositionMarket(column.symbol, column.accountName, price);
+            return true;
         }
     }
 
-    m_tradeManager->placeLimitOrder(column->symbol, column->accountName, price, quantity, side, leverage);
+    m_tradeManager->placeLimitOrder(column.symbol, column.accountName, price, quantity, side, leverage);
     statusBar()->showMessage(
         tr("Submitting %1 %2 @ %3")
             .arg(side == OrderSide::Buy ? QStringLiteral("BUY") : QStringLiteral("SELL"))
@@ -5094,21 +5276,21 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
     // and let the true WS position update override it.
     const bool allowOptimisticPositionHint =
         qEnvironmentVariableIntValue("DOM_OPTIMISTIC_POSITION_HINT") > 0;
-    if (allowOptimisticPositionHint && lighterPerp && column->dom) {
-        const double bestAsk = column->dom->bestAsk();
-        const double bestBid = column->dom->bestBid();
-        const double tick = std::max(1e-12, column->dom->tickSize());
+    if (allowOptimisticPositionHint && lighterPerp && column.dom) {
+        const double bestAsk = column.dom->bestAsk();
+        const double bestBid = column.dom->bestBid();
+        const double tick = std::max(1e-12, column.dom->tickSize());
         const double tol = tick * 0.25;
         const bool marketable =
             (side == OrderSide::Buy && bestAsk > 0.0 && price >= bestAsk - tol)
             || (side == OrderSide::Sell && bestBid > 0.0 && price <= bestBid + tol);
         if (marketable) {
-            const TradePosition live = m_tradeManager->positionForSymbol(column->symbol, column->accountName);
+            const TradePosition live = m_tradeManager->positionForSymbol(column.symbol, column.accountName);
             const bool hasLive =
                 live.hasPosition && live.quantity > 0.0 && live.averagePrice > 0.0;
             const bool hasCached =
-                column->hasCachedPosition && column->cachedPosition.hasPosition
-                && column->cachedPosition.quantity > 0.0 && column->cachedPosition.averagePrice > 0.0;
+                column.hasCachedPosition && column.cachedPosition.hasPosition
+                && column.cachedPosition.quantity > 0.0 && column.cachedPosition.averagePrice > 0.0;
             if (!hasLive && !hasCached) {
                 TradePosition hint;
                 hint.hasPosition = true;
@@ -5116,14 +5298,14 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
                 hint.quantity = quantity;
                 hint.averagePrice = price;
                 hint.qtyMultiplier = 1.0;
-                column->cachedPosition = hint;
-                column->hasCachedPosition = true;
-                column->dom->setTradePosition(hint);
-                updatePositionOverlay(*column, hint);
+                column.cachedPosition = hint;
+                column.hasCachedPosition = true;
+                column.dom->setTradePosition(hint);
+                updatePositionOverlay(column, hint);
 
-                const QString sym = column->symbol;
-                const QString accountName = column->accountName;
-                QPointer<QWidget> columnGuard = column->container;
+                const QString sym = column.symbol;
+                const QString accountName = column.accountName;
+                QPointer<QWidget> columnGuard = column.container;
                 QTimer::singleShot(2500, this, [this, columnGuard, sym, accountName]() {
                     if (!columnGuard || !m_tradeManager) {
                         return;
@@ -5152,6 +5334,132 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
             }
         }
     }
+
+    return true;
+}
+
+void MainWindow::handleMarketHotkey(OrderSide side)
+{
+    DomColumn *col = focusedDomColumn();
+    if (!col || !col->dom) {
+        statusBar()->showMessage(tr("No active DOM"), 1500);
+        return;
+    }
+
+    const double bestAsk = col->dom->bestAsk();
+    const double bestBid = col->dom->bestBid();
+    double ref = 0.0;
+    if (side == OrderSide::Buy) {
+        ref = (bestAsk > 0.0) ? bestAsk : bestBid;
+    } else {
+        ref = (bestBid > 0.0) ? bestBid : bestAsk;
+    }
+    if (!(ref > 0.0)) {
+        statusBar()->showMessage(tr("Top-of-book not available yet"), 1500);
+        return;
+    }
+
+    const double tick = std::max(1e-12, col->dom->tickSize());
+    double price = ref;
+    if (side == OrderSide::Buy) {
+        price = ref + tick * 20.0;
+    } else {
+        price = std::max(1e-12, ref - tick * 20.0);
+    }
+    submitDomOrder(*col, price, side);
+}
+
+void MainWindow::handleFrontLimitHotkey(OrderSide side)
+{
+    DomColumn *col = focusedDomColumn();
+    if (!col || !col->dom) {
+        statusBar()->showMessage(tr("No active DOM"), 1500);
+        return;
+    }
+
+    const double bestAsk = col->dom->bestAsk();
+    const double bestBid = col->dom->bestBid();
+    const double tick = std::max(1e-12, col->dom->tickSize());
+    const double tol = tick * 0.25;
+
+    double price = 0.0;
+    if (side == OrderSide::Buy) {
+        if (!(bestBid > 0.0)) {
+            statusBar()->showMessage(tr("BID not available yet"), 1500);
+            return;
+        }
+        price = bestBid + tick;
+        if (bestAsk > 0.0 && price >= bestAsk - tol) {
+            price = bestBid; // avoid turning into a marketable order
+        }
+    } else {
+        if (!(bestAsk > 0.0)) {
+            statusBar()->showMessage(tr("ASK not available yet"), 1500);
+            return;
+        }
+        price = bestAsk - tick;
+        if (bestBid > 0.0 && price <= bestBid + tol) {
+            price = bestAsk; // avoid turning into a marketable order
+        }
+        if (price <= 0.0) {
+            price = bestAsk;
+        }
+    }
+
+    submitDomOrder(*col, price, side);
+}
+
+void MainWindow::handleCrossFrontLimitHotkey(OrderSide side)
+{
+    DomColumn *col = focusedDomColumn();
+    if (!col || !col->dom) {
+        statusBar()->showMessage(tr("No active DOM"), 1500);
+        return;
+    }
+
+    const double bestAsk = col->dom->bestAsk();
+    const double bestBid = col->dom->bestBid();
+    const double tick = std::max(1e-12, col->dom->tickSize());
+    const double tol = tick * 0.25;
+
+    double price = 0.0;
+    if (side == OrderSide::Buy) {
+        // "Before ask" -> slightly below ask, but keep above bid to avoid crossing/market.
+        if (!(bestAsk > 0.0)) {
+            statusBar()->showMessage(tr("ASK not available yet"), 1500);
+            return;
+        }
+        price = bestAsk - tick;
+        if (bestBid > 0.0 && price <= bestBid + tol) {
+            // Spread too tight; fall back to just in front of bid (non-crossing).
+            price = bestBid + tick;
+            if (price >= bestAsk - tol) {
+                price = bestBid;
+            }
+        }
+        if (price <= 0.0) {
+            price = bestAsk;
+        }
+    } else {
+        // "Before bid" -> slightly above bid, but keep below ask to avoid crossing/market.
+        if (!(bestBid > 0.0)) {
+            statusBar()->showMessage(tr("BID not available yet"), 1500);
+            return;
+        }
+        price = bestBid + tick;
+        if (bestAsk > 0.0 && price >= bestAsk - tol) {
+            // Spread too tight; fall back to just in front of ask (non-crossing).
+            price = bestAsk - tick;
+            if (bestBid > 0.0 && price <= bestBid + tol) {
+                price = bestAsk;
+            }
+        }
+        if (price <= 0.0) {
+            price = bestBid;
+        }
+    }
+
+    submitDomOrder(*col, price, side);
 }
 
 void MainWindow::handlePrintsCancelRequested(const QStringList &orderIds,
@@ -5254,12 +5562,36 @@ void MainWindow::handlePrintsMoveBeginRequested(const QString &orderId)
         return;
     }
 
-    logMarkerEvent(QStringLiteral("[Move] begin acc=%1 sym=%2 id=%3")
-                       .arg(account, sym, id));
-
     const QString cacheKey =
         QStringLiteral("%1|%2|%3")
             .arg(account.trimmed().toLower(), sym.trimmed().toUpper(), id);
+
+    // Guard: if a marker was just created from the same click (orderPlaced -> delayed marker add),
+    // the marker can appear under the mouse while the button is still held, triggering an
+    // unintended "move" that instantly cancels the fresh order. Ignore move requests for
+    // very recent markers.
+    {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        const qint64 createdMsByKey = m_recentMarkerCreatedMsByKey.value(cacheKey, 0);
+        if (createdMsByKey > 0 && nowMs - createdMsByKey < 1200) {
+            return;
+        }
+        for (const auto &m : column->localOrders) {
+            if (m.orderId == id) {
+                qint64 createdMs = m.createdMs;
+                if (createdMs > 0 && createdMs < 1000000000000LL) {
+                    createdMs *= 1000;
+                }
+                if (createdMs > 0 && nowMs - createdMs < 450) {
+                    return;
+                }
+                break;
+            }
+        }
+    }
+
+    logMarkerEvent(QStringLiteral("[Move] begin acc=%1 sym=%2 id=%3")
+                       .arg(account, sym, id));
     for (const auto &m : column->localOrders) {
         if (m.orderId == id) {
             m_moveMarkerCache.insert(cacheKey, m);
@@ -5648,6 +5980,17 @@ void MainWindow::handlePositionChanged(const QString &accountName,
                 col.dom->setTradePosition(position);
             }
             updatePositionOverlay(col, position);
+            if (active) {
+                QTimer::singleShot(0, this, [this, container = QPointer<QWidget>(col.container)]() {
+                    if (!container) return;
+                    WorkspaceTab *tab2 = nullptr;
+                    DomColumn *col2 = nullptr;
+                    int idx2 = -1;
+                    if (locateColumn(container.data(), tab2, col2, idx2) && col2) {
+                        repositionPositionOverlay(*col2);
+                    }
+                });
+            }
             if (isLighter && !playedSound && col.hasCachedPosition) {
                 bool shouldPlay = false;
                 if (!wasActive && active) {
@@ -5697,6 +6040,7 @@ void MainWindow::updatePositionOverlay(DomColumn &col, const TradePosition &posi
         position.hasPosition && position.quantity > 0.0 && position.averagePrice > 0.0;
     if (!active) {
         col.positionOverlay->hide();
+        repositionClustersFooterOverlay(col);
         col.lastOverlayPnlSign = 0;
         col.lastOverlayValueText.clear();
         col.lastOverlayPctText.clear();
@@ -5787,7 +6131,38 @@ void MainWindow::updatePositionOverlay(DomColumn &col, const TradePosition &posi
             .arg(pnlBg.green())
             .arg(pnlBg.blue()));
 
+    repositionPositionOverlay(col);
     col.positionOverlay->show();
+    col.positionOverlay->raise();
+    repositionClustersFooterOverlay(col);
+    QTimer::singleShot(0, this, [this, container = QPointer<QWidget>(col.container)]() {
+        if (!container) return;
+        WorkspaceTab *tab2 = nullptr;
+        DomColumn *col2 = nullptr;
+        int idx2 = -1;
+        if (locateColumn(container.data(), tab2, col2, idx2) && col2) {
+            repositionClustersFooterOverlay(*col2);
+        }
+    });
+}
+
+void MainWindow::repositionPositionOverlay(DomColumn &col)
+{
+    if (!col.positionOverlay) {
+        return;
+    }
+    if (!col.scrollArea || !col.scrollArea->viewport()) {
+        return;
+    }
+    QWidget *vp = col.scrollArea->viewport();
+    const int pad = 6;
+    const int bottomMargin = 4;
+    const int width = std::max(80, vp->width() - pad * 2);
+    col.positionOverlay->setFixedWidth(width);
+    col.positionOverlay->adjustSize();
+    int y = vp->height() - col.positionOverlay->sizeHint().height() - bottomMargin;
+    if (y < 4) y = 4;
+    col.positionOverlay->move(pad, y);
     col.positionOverlay->raise();
 }
 
@@ -8377,6 +8752,7 @@ void MainWindow::openSettingsWindow()
         m_settingsWindow->setCustomHotkeys(currentCustomHotkeys());
         m_settingsWindow->setDomRefreshRate(m_domTargetFps);
         m_settingsWindow->setActiveDomOutlineEnabled(m_activeDomOutlineEnabled);
+        m_settingsWindow->setFontFamily(m_uiFontFamily);
         connect(m_settingsWindow,
                 &SettingsWindow::centerHotkeyChanged,
                 this,
@@ -8423,12 +8799,21 @@ void MainWindow::openSettingsWindow()
                     applyActiveDomOutline();
                     saveUserSettings();
                 });
+        connect(m_settingsWindow,
+                &SettingsWindow::fontFamilyChanged,
+                this,
+                [this](const QString &family) {
+                    m_uiFontFamily = family.trimmed();
+                    applyGlobalFontFamily(m_uiFontFamily);
+                    saveUserSettings();
+                });
     } else {
         m_settingsWindow->setCenterHotkey(m_centerKey, m_centerMods, m_centerAllLadders);
         m_settingsWindow->setVolumeHighlightRules(m_volumeRules);
         m_settingsWindow->setCustomHotkeys(currentCustomHotkeys());
         m_settingsWindow->setDomRefreshRate(m_domTargetFps);
         m_settingsWindow->setActiveDomOutlineEnabled(m_activeDomOutlineEnabled);
+        m_settingsWindow->setFontFamily(m_uiFontFamily);
     }
     m_settingsWindow->show();
     m_settingsWindow->raise();
@@ -9622,6 +10007,21 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
                     ke->accept();
                     return true;
                 }
+
+                // Allow custom hotkeys even for keys that can be eaten by focus navigation
+                // (e.g. Tab) by routing them through keyPressEvent here.
+                const bool customMatch =
+                    matchesHotkeyEvent(ke, m_marketBuyKey, m_marketBuyMods)
+                    || matchesHotkeyEvent(ke, m_marketSellKey, m_marketSellMods)
+                    || matchesHotkeyEvent(ke, m_frontBidBuyKey, m_frontBidBuyMods)
+                    || matchesHotkeyEvent(ke, m_frontAskSellKey, m_frontAskSellMods)
+                    || matchesHotkeyEvent(ke, m_frontAskBuyKey, m_frontAskBuyMods)
+                    || matchesHotkeyEvent(ke, m_frontBidSellKey, m_frontBidSellMods);
+                if (customMatch) {
+                    keyPressEvent(ke);
+                    ke->accept();
+                    return true;
+                }
             }
         }
     }
@@ -9800,13 +10200,6 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
                     if (y < 4) y = 4;
                     overlay->move(pad, y);
                     overlay->raise();
-                    QVariant cfov = w->property("clustersFooterOverlayPtr");
-                    if (cfov.isValid()) {
-                        auto *footer = reinterpret_cast<QWidget *>(cfov.value<quintptr>());
-                        if (footer) {
-                            footer->raise();
-                        }
-                    }
                 }
             }
         }
@@ -11002,6 +11395,9 @@ void MainWindow::loadUserSettings()
         theme->setPrintsSquare(s.value(QStringLiteral("printsSquare"), false).toBool());
         s.endGroup();
     }
+    s.beginGroup(QStringLiteral("ui"));
+    m_uiFontFamily = s.value(QStringLiteral("fontFamily"), QString()).toString().trimmed();
+    s.endGroup();
     s.beginGroup(QStringLiteral("hotkeys"));
     m_centerKey = s.value(QStringLiteral("centerKey"), int(Qt::Key_Shift)).toInt();
     m_centerMods = Qt::KeyboardModifiers(
@@ -11020,6 +11416,44 @@ void MainWindow::loadUserSettings()
     m_cancelLastLimitKey = s.value(QStringLiteral("cancelLastLimitKey"), int(Qt::Key_G)).toInt();
     m_cancelLastLimitMods = Qt::KeyboardModifiers(
         s.value(QStringLiteral("cancelLastLimitMods"), int(Qt::NoModifier)).toInt());
+    m_marketBuyKey = s.value(QStringLiteral("marketBuyKey"), 0).toInt();
+    m_marketBuyMods = Qt::KeyboardModifiers(
+        s.value(QStringLiteral("marketBuyMods"), int(Qt::NoModifier)).toInt());
+    m_marketSellKey = s.value(QStringLiteral("marketSellKey"), 0).toInt();
+    m_marketSellMods = Qt::KeyboardModifiers(
+        s.value(QStringLiteral("marketSellMods"), int(Qt::NoModifier)).toInt());
+    m_frontBidBuyKey = s.value(QStringLiteral("frontBidBuyKey"), 0).toInt();
+    m_frontBidBuyMods = Qt::KeyboardModifiers(
+        s.value(QStringLiteral("frontBidBuyMods"), int(Qt::NoModifier)).toInt());
+    m_frontAskSellKey = s.value(QStringLiteral("frontAskSellKey"), 0).toInt();
+    m_frontAskSellMods = Qt::KeyboardModifiers(
+        s.value(QStringLiteral("frontAskSellMods"), int(Qt::NoModifier)).toInt());
+    m_frontAskBuyKey = s.value(QStringLiteral("frontAskBuyKey"), 0).toInt();
+    m_frontAskBuyMods = Qt::KeyboardModifiers(
+        s.value(QStringLiteral("frontAskBuyMods"), int(Qt::NoModifier)).toInt());
+    m_frontBidSellKey = s.value(QStringLiteral("frontBidSellKey"), 0).toInt();
+    m_frontBidSellMods = Qt::KeyboardModifiers(
+        s.value(QStringLiteral("frontBidSellMods"), int(Qt::NoModifier)).toInt());
+
+    // Migration: older builds had separate "...Selected" keys. Keep user's existing binding.
+    if (m_marketBuyKey == 0) {
+        const int legacyKey = s.value(QStringLiteral("marketBuySelectedKey"), 0).toInt();
+        const Qt::KeyboardModifiers legacyMods = Qt::KeyboardModifiers(
+            s.value(QStringLiteral("marketBuySelectedMods"), int(Qt::NoModifier)).toInt());
+        if (legacyKey != 0) {
+            m_marketBuyKey = legacyKey;
+            m_marketBuyMods = legacyMods;
+        }
+    }
+    if (m_marketSellKey == 0) {
+        const int legacyKey = s.value(QStringLiteral("marketSellSelectedKey"), 0).toInt();
+        const Qt::KeyboardModifiers legacyMods = Qt::KeyboardModifiers(
+            s.value(QStringLiteral("marketSellSelectedMods"), int(Qt::NoModifier)).toInt());
+        if (legacyKey != 0) {
+            m_marketSellKey = legacyKey;
+            m_marketSellMods = legacyMods;
+        }
+    }
     m_volumeAdjustKey = s.value(QStringLiteral("volumeAdjustKey"), int(Qt::Key_CapsLock)).toInt();
     m_volumeAdjustMods = Qt::KeyboardModifiers(
         s.value(QStringLiteral("volumeAdjustMods"), int(Qt::NoModifier)).toInt());
@@ -11230,6 +11664,13 @@ void MainWindow::saveUserSettings() const
         s.setValue(QStringLiteral("printsSquare"), theme->printsSquare());
         s.endGroup();
     }
+    s.beginGroup(QStringLiteral("ui"));
+    if (m_uiFontFamily.trimmed().isEmpty()) {
+        s.remove(QStringLiteral("fontFamily"));
+    } else {
+        s.setValue(QStringLiteral("fontFamily"), m_uiFontFamily.trimmed());
+    }
+    s.endGroup();
     s.beginGroup(QStringLiteral("hotkeys"));
     s.setValue(QStringLiteral("centerKey"), m_centerKey);
     s.setValue(QStringLiteral("centerMods"), int(m_centerMods));
@@ -11242,6 +11683,18 @@ void MainWindow::saveUserSettings() const
     s.setValue(QStringLiteral("refreshLadderMods"), int(m_refreshLadderMods));
     s.setValue(QStringLiteral("cancelLastLimitKey"), m_cancelLastLimitKey);
     s.setValue(QStringLiteral("cancelLastLimitMods"), int(m_cancelLastLimitMods));
+    s.setValue(QStringLiteral("marketBuyKey"), m_marketBuyKey);
+    s.setValue(QStringLiteral("marketBuyMods"), int(m_marketBuyMods));
+    s.setValue(QStringLiteral("marketSellKey"), m_marketSellKey);
+    s.setValue(QStringLiteral("marketSellMods"), int(m_marketSellMods));
+    s.setValue(QStringLiteral("frontBidBuyKey"), m_frontBidBuyKey);
+    s.setValue(QStringLiteral("frontBidBuyMods"), int(m_frontBidBuyMods));
+    s.setValue(QStringLiteral("frontAskSellKey"), m_frontAskSellKey);
+    s.setValue(QStringLiteral("frontAskSellMods"), int(m_frontAskSellMods));
+    s.setValue(QStringLiteral("frontAskBuyKey"), m_frontAskBuyKey);
+    s.setValue(QStringLiteral("frontAskBuyMods"), int(m_frontAskBuyMods));
+    s.setValue(QStringLiteral("frontBidSellKey"), m_frontBidSellKey);
+    s.setValue(QStringLiteral("frontBidSellMods"), int(m_frontBidSellMods));
     s.setValue(QStringLiteral("volumeAdjustKey"), m_volumeAdjustKey);
     s.setValue(QStringLiteral("volumeAdjustMods"), int(m_volumeAdjustMods));
     s.setValue(QStringLiteral("sltpPlaceKey"), m_sltpPlaceKey);
@@ -11695,6 +12148,30 @@ QVector<SettingsWindow::HotkeyEntry> MainWindow::currentCustomHotkeys() const
                     tr("Cancel last limit order"),
                     m_cancelLastLimitKey,
                     m_cancelLastLimitMods});
+    entries.append({QStringLiteral("marketBuy"),
+                    tr("Market BUY"),
+                    m_marketBuyKey,
+                    m_marketBuyMods});
+    entries.append({QStringLiteral("marketSell"),
+                    tr("Market SELL"),
+                    m_marketSellKey,
+                    m_marketSellMods});
+    entries.append({QStringLiteral("frontBidBuy"),
+                    tr("Limit BUY in front of BID"),
+                    m_frontBidBuyKey,
+                    m_frontBidBuyMods});
+    entries.append({QStringLiteral("frontAskSell"),
+                    tr("Limit SELL in front of ASK"),
+                    m_frontAskSellKey,
+                    m_frontAskSellMods});
+    entries.append({QStringLiteral("frontAskBuy"),
+                    tr("Limit BUY in front of ASK"),
+                    m_frontAskBuyKey,
+                    m_frontAskBuyMods});
+    entries.append({QStringLiteral("frontBidSell"),
+                    tr("Limit SELL in front of BID"),
+                    m_frontBidSellKey,
+                    m_frontBidSellMods});
     entries.append({QStringLiteral("settingsSearch"),
                     tr("Search settings"),
                     m_settingsSearchKey,
@@ -11730,6 +12207,18 @@ void MainWindow::updateCustomHotkey(const QString &id, int key, Qt::KeyboardModi
         assign(m_refreshLadderKey, m_refreshLadderMods);
     } else if (id == QLatin1String("cancelLastLimit")) {
         assign(m_cancelLastLimitKey, m_cancelLastLimitMods);
+    } else if (id == QLatin1String("marketBuy")) {
+        assign(m_marketBuyKey, m_marketBuyMods);
+    } else if (id == QLatin1String("marketSell")) {
+        assign(m_marketSellKey, m_marketSellMods);
+    } else if (id == QLatin1String("frontBidBuy")) {
+        assign(m_frontBidBuyKey, m_frontBidBuyMods);
+    } else if (id == QLatin1String("frontAskSell")) {
+        assign(m_frontAskSellKey, m_frontAskSellMods);
+    } else if (id == QLatin1String("frontAskBuy")) {
+        assign(m_frontAskBuyKey, m_frontAskBuyMods);
+    } else if (id == QLatin1String("frontBidSell")) {
+        assign(m_frontBidSellKey, m_frontBidSellMods);
     } else if (id == QLatin1String("settingsSearch")) {
         assign(m_settingsSearchKey, m_settingsSearchMods);
     } else if (id == QLatin1String("volumeAdjust")) {
@@ -12488,7 +12977,10 @@ void MainWindow::addLocalOrderMarker(const QString &accountName,
     if (orderId.isEmpty()) {
         return;
     }
-    const qint64 ts = createdMs > 0 ? createdMs : QDateTime::currentMSecsSinceEpoch();
+    qint64 ts = createdMs > 0 ? createdMs : QDateTime::currentMSecsSinceEpoch();
+    if (ts > 0 && ts < 1000000000000LL) {
+        ts *= 1000;
+    }
     const QString symUpper = normalizedSymbolKey(symbol);
     if (symUpper.isEmpty()) {
         return;
@@ -12502,6 +12994,10 @@ void MainWindow::addLocalOrderMarker(const QString &accountName,
     }
     const QString accountDisplay = normalizedAccountLabel(accountName);
     const QString accountKey = normalizedAccountKey(accountDisplay);
+    const QString createKey =
+        QStringLiteral("%1|%2|%3")
+            .arg(accountDisplay.trimmed().toLower(), symUpper.trimmed().toUpper(), orderId);
+    m_recentMarkerCreatedMsByKey.insert(createKey, ts);
     DomWidget::LocalOrderMarker marker;
     marker.price = price;
     marker.quantity = std::abs(quantity * price);
@@ -12539,6 +13035,10 @@ void MainWindow::removeLocalOrderMarker(const QString &accountName,
         return;
     }
     const QString accountDisplay = normalizedAccountLabel(accountName);
+    const QString createKey =
+        QStringLiteral("%1|%2|%3")
+            .arg(accountDisplay.trimmed().toLower(), symUpper.trimmed().toUpper(), orderId);
+    m_recentMarkerCreatedMsByKey.remove(createKey);
     const QString accountKey = normalizedAccountKey(accountDisplay);
     DomWidget::LocalOrderMarker removed;
     bool touched = false;
@@ -14199,14 +14699,85 @@ void MainWindow::fetchSymbolLibrary(SymbolSource source, SymbolPickerDialog *dlg
     }
     inFlightRef = true;
     bool *flagPtr = &inFlightRef;
-    auto *reply = m_symbolFetcher.get(QNetworkRequest(url));
-    connect(reply, &QNetworkReply::finished, this, [this, reply, dlg, isSwap, flagPtr]() {
+
+    QNetworkProxy proxy(QNetworkProxy::DefaultProxy);
+    const auto profile = isSwap ? ConnectionStore::Profile::UzxSwap : ConnectionStore::Profile::UzxSpot;
+    if (m_connectionStore) {
+        const MexcCredentials creds = m_connectionStore->loadMexcCredentials(profile);
+        QString proxyType = creds.proxyType.trimmed().toLower();
+        if (proxyType == QStringLiteral("https")) {
+            proxyType = QStringLiteral("http");
+        }
+        const QString proxyRaw = creds.proxy.trimmed();
+        if (proxyRaw.compare(QStringLiteral("disabled"), Qt::CaseInsensitive) == 0
+            || proxyRaw.compare(QStringLiteral("none"), Qt::CaseInsensitive) == 0
+            || proxyRaw.compare(QStringLiteral("direct"), Qt::CaseInsensitive) == 0) {
+            proxy = QNetworkProxy(QNetworkProxy::NoProxy);
+        } else if (!proxyRaw.isEmpty() && proxyRaw.compare(QStringLiteral("system"), Qt::CaseInsensitive) != 0) {
+            // Formats supported: host:port, user:pass@host:port, host:port:user:pass, user:pass:host:port
+            QString host;
+            QString portStr;
+            QString user;
+            QString pass;
+            const QString trimmed = proxyRaw.trimmed();
+            const QStringList atSplit = trimmed.split('@');
+            if (atSplit.size() == 2) {
+                const QStringList cp = atSplit.at(0).split(':');
+                const QStringList hp = atSplit.at(1).split(':');
+                if (cp.size() >= 2 && hp.size() == 2) {
+                    user = cp.at(0);
+                    pass = cp.at(1);
+                    host = hp.at(0);
+                    portStr = hp.at(1);
+                }
+            } else {
+                const QStringList parts = trimmed.split(':');
+                if (parts.size() == 2) {
+                    host = parts.at(0);
+                    portStr = parts.at(1);
+                } else if (parts.size() == 4) {
+                    host = parts.at(0);
+                    portStr = parts.at(1);
+                    user = parts.at(2);
+                    pass = parts.at(3);
+                    bool okPort = false;
+                    portStr.toInt(&okPort);
+                    if (!okPort) {
+                        // host:user:pass:port
+                        host = parts.at(0);
+                        user = parts.at(1);
+                        pass = parts.at(2);
+                        portStr = parts.at(3);
+                    }
+                }
+            }
+            bool okPort = false;
+            const int port = portStr.toInt(&okPort);
+            if (!host.isEmpty() && okPort && port > 0) {
+                const auto ptype =
+                    (proxyType == QStringLiteral("socks5")) ? QNetworkProxy::Socks5Proxy : QNetworkProxy::HttpProxy;
+                proxy = QNetworkProxy(ptype, host, port, user, pass);
+            }
+        }
+    }
+
+    const bool useDedicatedNam = proxy.type() != QNetworkProxy::DefaultProxy;
+    QNetworkAccessManager *nam = useDedicatedNam ? new QNetworkAccessManager(this) : &m_symbolFetcher;
+    if (useDedicatedNam) {
+        nam->setProxy(proxy);
+    }
+
+    auto *reply = nam->get(QNetworkRequest(url));
+    connect(reply, &QNetworkReply::finished, this, [this, reply, dlg, isSwap, flagPtr, useDedicatedNam, nam]() {
         if (flagPtr) {
             *flagPtr = false;
         }
         const auto err = reply->error();
         const QByteArray raw = reply->readAll();
         reply->deleteLater();
+        if (useDedicatedNam && nam) {
+            nam->deleteLater();
+        }
         if (err != QNetworkReply::NoError) {
             qWarning() << "[symbols] uzx fetch failed:" << err;
             return;

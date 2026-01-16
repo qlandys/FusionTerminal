@@ -14,9 +14,14 @@ Item {
     property int priceColumnWidth: 80
     property color priceBorderColor: "#2b2b2b"
     property var domBridge
-    property string priceFontFamily: "JetBrains Mono"
+    property string priceFontFamily: Qt.application.font.family
     property int priceFontPixelSize: 12
     property int hoverRow: -1
+    property string hoverText: ""
+    // Hover "ray" styling (shared with prints hover info).
+    property color hoverBeamColor: "#1b2333"
+    property color hoverBeamBorderColor: "#2b3a55"
+    property color hoverBeamTextColor: "#f4f6f8"
     property real tickSize: 0.0
     property bool positionActive: false
     property real positionEntryPrice: 0.0
@@ -50,6 +55,58 @@ Item {
     Rectangle {
         anchors.fill: parent
         color: backgroundColor
+    }
+
+    Item {
+        id: hoverBeam
+        z: 6.5
+        visible: root.hoverRow >= 0 && root.hoverText.length > 0
+                 && !root.actionOverlayVisible
+        height: root.rowHeight
+        y: root.hoverRow >= 0 ? root.hoverRow * root.rowHeight : 0
+
+        // End the ray exactly at the volume/price boundary, and grow/shrink from the left.
+        anchors.right: parent.right
+        anchors.rightMargin: Math.max(0, root.priceColumnWidth - 1)
+
+        property int padX: 10
+        property int padY: 2
+        width: Math.min(Math.max(1, parent.width - root.priceColumnWidth + 1),
+                        Math.max(1, hoverBeamText.contentWidth + padX * 2))
+        x: (parent.width - root.priceColumnWidth + 1) - width
+
+        Rectangle {
+            anchors.fill: parent
+            radius: 0
+            color: root.hoverBeamColor
+            border.width: 0
+            opacity: 1.0
+        }
+
+        Text {
+            id: hoverBeamText
+            anchors.fill: parent
+            anchors.leftMargin: hoverBeam.padX
+            anchors.rightMargin: hoverBeam.padX
+            anchors.topMargin: hoverBeam.padY
+            anchors.bottomMargin: hoverBeam.padY
+            verticalAlignment: Text.AlignVCenter
+            horizontalAlignment: Text.AlignHCenter
+            // Keep as a hidden width/height measurer so the ray width matches the
+            // hover label shown in prints, without duplicating text here.
+            text: root.hoverText
+            color: root.hoverBeamTextColor
+            opacity: 0.0
+            font.family: root.priceFontFamily
+            font.weight: Font.DemiBold
+            font.bold: false
+            font.kerning: false
+            font.preferShaping: true
+            font.features: { "tnum": 1, "lnum": 1 }
+            font.pixelSize: Math.max(8, root.priceFontPixelSize - 1)
+            elide: Text.ElideNone
+            clip: true
+        }
     }
 
     Item {
@@ -123,7 +180,12 @@ Item {
                     color: levelVolumeTextColor
                     visible: levelVolumeText.length > 0
                     font.pixelSize: Math.max(10, root.rowHeight - 4)
-                    font.bold: true
+                    font.family: root.priceFontFamily
+                    font.weight: Font.Medium
+                    font.bold: false
+                    font.kerning: false
+                    font.preferShaping: true
+                    font.features: { "tnum": 1, "lnum": 1 }
                     elide: Text.ElideRight
                 }
 
@@ -135,10 +197,16 @@ Item {
                     horizontalAlignment: Text.AlignRight
                     text: levelPriceText
                     color: inPositionRange ? root.positionPnlColor : root.textColor
-                    font.pixelSize: Math.max(10, root.priceFontPixelSize)
+                    font.pixelSize: Math.max(8, root.priceFontPixelSize - 2)
                     font.family: root.priceFontFamily
-                    font.bold: isMarkRow
-                    elide: Text.ElideLeft
+                    font.weight: isMarkRow ? Font.Bold : Font.DemiBold
+                    font.bold: false
+                    font.kerning: false
+                    font.preferShaping: true
+                    // Keep digits aligned (Inter supports tabular figures).
+                    font.features: { "tnum": 1, "lnum": 1 }
+                    elide: Text.ElideNone
+                    clip: true
                 }
             }
         }
@@ -228,7 +296,12 @@ Item {
                 color: levelVolumeTextColor
                 visible: levelVolumeText.length > 0
                 font.pixelSize: Math.max(10, root.rowHeight - 4)
-                font.bold: true
+                font.family: root.priceFontFamily
+                font.weight: Font.Medium
+                font.bold: false
+                font.kerning: false
+                font.preferShaping: true
+                font.features: { "tnum": 1, "lnum": 1 }
             }
 
             // Tick highlight: makes our orders visible even when prints overlap the marker.
@@ -297,9 +370,15 @@ Item {
                 horizontalAlignment: Text.AlignRight
                 text: levelPriceText
                 color: rowItem.inPositionRange ? root.positionPnlColor : root.textColor
-                font.pixelSize: Math.max(10, root.priceFontPixelSize)
+                font.pixelSize: Math.max(8, root.priceFontPixelSize - 2)
                 font.family: root.priceFontFamily
-                font.bold: rowItem.isMarkRow
+                font.weight: rowItem.isMarkRow ? Font.Bold : Font.DemiBold
+                font.bold: false
+                font.kerning: false
+                font.preferShaping: true
+                font.features: { "tnum": 1, "lnum": 1 }
+                elide: Text.ElideNone
+                clip: true
             }
 
             Rectangle {

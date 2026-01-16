@@ -70,6 +70,7 @@ public:
     explicit DomWidget(QWidget *parent = nullptr);
 
     void updateSnapshot(const DomSnapshot &snapshot);
+    void refreshFontProperties();
     void setStyle(const DomStyle &style);
     void centerToSpread();
     int rowHeight() const { return m_rowHeight; }

@@ -20,6 +20,7 @@
 #include <QByteArray>
 #include <QUrl>
 #include <QElapsedTimer>
+#include <QFont>
 #include <array>
 
 class QLabel;
@@ -148,6 +149,15 @@ private slots:
 
 private:
     void appendConnectionsLog(const QString &msg);
+    bool matchesHotkeyEvent(QKeyEvent *event, int key, Qt::KeyboardModifiers mods) const;
+    void applyGlobalFontFamily(const QString &family);
+    bool submitDomOrder(DomColumn &column,
+                        double price,
+                        OrderSide side,
+                        double notionalOverride = -1.0);
+    void handleMarketHotkey(OrderSide side);
+    void handleFrontLimitHotkey(OrderSide side);
+    void handleCrossFrontLimitHotkey(OrderSide side);
     struct MarkerBucket {
         QHash<QString, DomWidget::LocalOrderMarker> confirmed;
         QHash<QString, DomWidget::LocalOrderMarker> pending;
@@ -273,6 +283,7 @@ private:
 
     void repositionClustersFooterOverlay(DomColumn &col);
     void repositionNotionalOverlay(DomColumn &col);
+    void repositionPositionOverlay(DomColumn &col);
     void enforceNotionalPrintsMinWidth(DomColumn &col);
     void applyDomHighlightPrices(DomColumn &col);
 
@@ -566,6 +577,7 @@ private:
     QHash<QString, QString> m_lastCancelAttemptByKey;
     QHash<QString, QPointer<QTimer>> m_markerDelayTimers;
     QHash<QString, DomWidget::LocalOrderMarker> m_moveMarkerCache;
+    QHash<QString, qint64> m_recentMarkerCreatedMsByKey;
     QToolButton *m_settingsSearchButton = nullptr;
     QWidget *m_settingsSearchContainer = nullptr;
     QPointer<QPropertyAnimation> m_settingsSearchAnim;
@@ -704,6 +716,8 @@ private:
     QString m_authRole;
     QString m_authUser;
     QSet<QString> m_installedMods;
+    QFont m_defaultAppFont;
+    QString m_uiFontFamily;
 
     // Hotkey: ????????????? ???????? ?? ??????.
     int m_centerKey = Qt::Key_Shift;
@@ -721,6 +735,18 @@ private:
     Qt::KeyboardModifiers m_refreshLadderMods = Qt::ControlModifier;
     int m_cancelLastLimitKey = Qt::Key_G;
     Qt::KeyboardModifiers m_cancelLastLimitMods = Qt::NoModifier;
+    int m_marketBuyKey = 0;
+    Qt::KeyboardModifiers m_marketBuyMods = Qt::NoModifier;
+    int m_marketSellKey = 0;
+    Qt::KeyboardModifiers m_marketSellMods = Qt::NoModifier;
+    int m_frontBidBuyKey = 0;
+    Qt::KeyboardModifiers m_frontBidBuyMods = Qt::NoModifier;
+    int m_frontAskSellKey = 0;
+    Qt::KeyboardModifiers m_frontAskSellMods = Qt::NoModifier;
+    int m_frontAskBuyKey = 0;
+    Qt::KeyboardModifiers m_frontAskBuyMods = Qt::NoModifier;
+    int m_frontBidSellKey = 0;
+    Qt::KeyboardModifiers m_frontBidSellMods = Qt::NoModifier;
     int m_volumeAdjustKey = Qt::Key_CapsLock;
     Qt::KeyboardModifiers m_volumeAdjustMods = Qt::NoModifier;
     int m_sltpPlaceKey = Qt::Key_C;

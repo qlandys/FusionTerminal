@@ -50,6 +50,8 @@ struct ExecutedTrade {
     double feeAmount = 0.0;
     double realizedPnl = 0.0; // per-fill realized PnL delta in quote currency (USDT)
     double realizedPct = 0.0; // per-fill realized PnL % vs entry notional for closed part
+    bool isFutures = false;
+    int leverage = 0; // futures leverage, 0 = unknown
     qint64 timeMs = 0;
 };
 

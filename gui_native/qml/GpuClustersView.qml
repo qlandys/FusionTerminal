@@ -16,7 +16,7 @@ Item {
     property var columnTotals: []
     property color backgroundColor: "#151515"
     property color gridColor: "#303030"
-    property string fontFamily: "JetBrains Mono"
+    property string fontFamily: Qt.application.font.family
     property int fontPixelSize: 12
     property string label: ""
     property bool useGpuClusters: false

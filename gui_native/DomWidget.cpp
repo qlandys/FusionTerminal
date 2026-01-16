@@ -3,6 +3,7 @@
 
 #include <QAbstractScrollArea>
 #include <QDateTime>
+#include <QFontDatabase>
 #include <QFont>
 #include <QFontMetrics>
 #include <QMouseEvent>
@@ -333,11 +334,12 @@ DomWidget::DomWidget(QWidget *parent)
     setAutoFillBackground(false);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
-    // Prefer JetBrains Mono for ladder, fall back to current app font.
-    QFont f = font();
-    f.setFamily(QStringLiteral("JetBrains Mono"));
-    f.setPointSize(9);
-    setFont(f);
+
+    // Ladder font follows the application font (Inter by default) so the UI uses a single font.
+    // QML gets the font family via syncQuickProperties().
+    if (qApp) {
+        setFont(qApp->font());
+    }
 
     ThemeManager *theme = ThemeManager::instance();
     setStyle(theme->domStyle());
@@ -349,6 +351,18 @@ DomWidget::DomWidget(QWidget *parent)
         ensureQuickInitialized();
         syncQuickProperties();
     }
+}
+
+void DomWidget::refreshFontProperties()
+{
+    const QFont next = qApp ? qApp->font() : font();
+    if (next != font()) {
+        setFont(next);
+    }
+    if (m_quickAllowed) {
+        syncQuickProperties();
+    }
+    update();
 }
 
 void DomWidget::updateSnapshot(const DomSnapshot &snapshot)
@@ -1060,6 +1074,7 @@ void DomWidget::updateHoverInfo(int row)
         if (m_quickWidget && m_quickReady) {
             if (auto *root = m_quickWidget->rootObject()) {
                 root->setProperty("hoverRow", -1);
+                root->setProperty("hoverText", QString());
             }
         }
         return;
@@ -1088,6 +1103,7 @@ void DomWidget::updateHoverInfo(int row)
     if (m_quickWidget && m_quickReady) {
         if (auto *root = m_quickWidget->rootObject()) {
             root->setProperty("hoverRow", m_hoverRow);
+            root->setProperty("hoverText", m_hoverInfoText);
         }
     }
 }

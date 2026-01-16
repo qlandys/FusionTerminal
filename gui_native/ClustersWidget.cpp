@@ -389,6 +389,12 @@ void ClustersWidget::syncQuickProperties()
     }
 }
 
+void ClustersWidget::refreshFontProperties()
+{
+    syncQuickProperties();
+    update();
+}
+
 void ClustersWidget::recomputeLayout()
 {
     if (!m_prints) {

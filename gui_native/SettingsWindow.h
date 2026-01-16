@@ -28,6 +28,7 @@ public:
     void setVolumeHighlightRules(const QVector<VolumeHighlightRule> &rules);
     void setDomRefreshRate(int fps);
     void setActiveDomOutlineEnabled(bool enabled);
+    void setFontFamily(const QString &family);
     void focusCenterHotkey();
     void focusVolumeHighlightRules();
 
@@ -37,6 +38,7 @@ signals:
     void customHotkeyChanged(const QString &id, int key, Qt::KeyboardModifiers mods);
     void domRefreshRateChanged(int fps);
     void activeDomOutlineEnabledChanged(bool enabled);
+    void fontFamilyChanged(const QString &family);
 
 private:
     int addCategory(const QString &title, QWidget *page);
@@ -55,6 +57,8 @@ private:
     QComboBox *m_domRefreshCombo = nullptr;
     QVector<int> m_domRefreshChoices;
     QCheckBox *m_activeDomOutlineCheck = nullptr;
+    QComboBox *m_fontFamilyCombo = nullptr;
+    QString m_fontFamily;
 
     int m_centerKey = Qt::Key_Shift;
     Qt::KeyboardModifiers m_centerMods = Qt::NoModifier;

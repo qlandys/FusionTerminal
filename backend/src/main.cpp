@@ -3184,31 +3184,102 @@ bool fetchUzxSnapshot(const Config& config, dom::OrderBook& book, double& tickSi
     const auto bidsArr = doc["data"]["bids"];
     const auto asksArr = doc["data"]["asks"];
 
-    // Derive tickSize from first price
+    // Derive tick size from adjacent price deltas rather than decimal count.
+    // UZX often returns prices with fixed decimals (e.g. 8) even when the true tick is larger,
+    // so "count decimals" can yield a wildly wrong tick size and break the ladder scale.
     tickSizeOut = tickSizeOut > 0.0 ? tickSizeOut : 0.0;
-    auto detectTick = [](const json& side) -> double {
+    auto inferTickFromSide = [](const json& side) -> double {
+        if (!side.is_array())
+        {
+            return 0.0;
+        }
+        std::vector<double> prices;
+        prices.reserve(64);
         for (const auto& lvl : side)
         {
             if (!lvl.is_array() || lvl.size() < 1) continue;
-            const std::string priceStr = lvl[0].get<std::string>();
-            auto pos = priceStr.find('.');
-            if (pos != std::string::npos)
+            const double price = jsonToDouble(lvl[0]);
+            if (price > 0.0 && std::isfinite(price))
             {
-                const int decimals = static_cast<int>(priceStr.size() - pos - 1);
-                if (decimals > 0 && decimals < 18)
-                {
-                    return std::pow(10.0, -decimals);
-                }
+                prices.push_back(price);
+                if (prices.size() >= 64) break;
             }
         }
-        return 0.0001;
+        if (prices.size() < 2)
+        {
+            return 0.0;
+        }
+        std::sort(prices.begin(), prices.end());
+        prices.erase(std::unique(prices.begin(), prices.end()), prices.end());
+        if (prices.size() < 2)
+        {
+            return 0.0;
+        }
+        double best = 0.0;
+        for (std::size_t i = 1; i < prices.size(); ++i)
+        {
+            const double d = prices[i] - prices[i - 1];
+            if (!(d > 0.0) || !std::isfinite(d)) continue;
+            if (d < 1e-12) continue;
+            if (best <= 0.0 || d < best)
+            {
+                best = d;
+            }
+        }
+        if (!(best > 0.0))
+        {
+            return 0.0;
+        }
+        // Quantize to avoid floating drift (1e-12 granularity is enough for our UI).
+        best = std::round(best * 1e12) / 1e12;
+        return (best > 0.0) ? best : 0.0;
+    };
+    auto detectTickByDecimals = [](const json& side) -> double {
+        if (!side.is_array())
+        {
+            return 0.0;
+        }
+        for (const auto& lvl : side)
+        {
+            if (!lvl.is_array() || lvl.size() < 1) continue;
+            if (!lvl[0].is_string()) continue;
+            const std::string priceStr = lvl[0].get<std::string>();
+            auto pos = priceStr.find('.');
+            if (pos == std::string::npos)
+            {
+                continue;
+            }
+            const int decimals = static_cast<int>(priceStr.size() - pos - 1);
+            if (decimals > 0 && decimals < 18)
+            {
+                return std::pow(10.0, -decimals);
+            }
+        }
+        return 0.0;
     };
     if (tickSizeOut <= 0.0)
     {
-        tickSizeOut = detectTick(bidsArr);
+        const double bidTick = inferTickFromSide(bidsArr);
+        const double askTick = inferTickFromSide(asksArr);
+        if (bidTick > 0.0 && askTick > 0.0)
+        {
+            tickSizeOut = std::min(bidTick, askTick);
+        }
+        else if (bidTick > 0.0)
+        {
+            tickSizeOut = bidTick;
+        }
+        else if (askTick > 0.0)
+        {
+            tickSizeOut = askTick;
+        }
         if (tickSizeOut <= 0.0)
         {
-            tickSizeOut = detectTick(asksArr);
+            tickSizeOut = detectTickByDecimals(bidsArr);
+            if (tickSizeOut <= 0.0)
+            {
+                tickSizeOut = detectTickByDecimals(asksArr);
+            }
         }
     }
 
@@ -3902,6 +3973,28 @@ bool runUzxWebSocket(const Config& config, dom::OrderBook& book, double tickSize
     const std::string channel = isSwap ? "swap.orderbook" : "spot.orderbook";
     const std::string biz = "market";
     const std::string symbol = normalizeSymbol(config.symbol, isSwap);
+
+    // Seed the book and tick size via REST snapshot first. This avoids unstable start-up states
+    // where the first WS frames don't carry enough precision to infer tick size reliably.
+    {
+        double snapTick = tickSize;
+        if (!fetchUzxSnapshot(config, book, snapTick, isSwap))
+        {
+            std::cerr << "[backend] uzx snapshot failed, continuing with empty book" << std::endl;
+        }
+        if (snapTick > 0.0)
+        {
+            tickSize = snapTick;
+        }
+        if (book.tickSize() > 0.0 && book.bestBid() > 0.0 && book.bestAsk() > 0.0)
+        {
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+            emitLadder(config, book, book.bestBid(), book.bestAsk(), nowMs);
+        }
+    }
+
     json sub = {{"event", "sub"},
                 {"params",
                  {{"biz", biz}, {"type", channel}, {"symbol", symbol}, {"interval", "0"}}},
@@ -3939,7 +4032,7 @@ bool runUzxWebSocket(const Config& config, dom::OrderBook& book, double tickSize
         auto pos = priceStr.find('.');
         if (pos == std::string_view::npos)
         {
-            return 1.0;
+            return 0.0;
         }
         const int decimals = static_cast<int>(priceStr.size() - pos - 1);
         if (decimals <= 0 || decimals > 12) return 0.0;

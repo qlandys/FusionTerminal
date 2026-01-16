@@ -162,6 +162,7 @@ private:
         ConnectionState state{ConnectionState::Disconnected};
         QNetworkAccessManager *mexcNetwork{nullptr};
         QNetworkAccessManager *lighterNetwork{nullptr};
+        QNetworkAccessManager *uzxNetwork{nullptr};
         QWebSocket privateSocket;
         QWebSocket lighterStreamSocket;
         QString proxyStatusLog;
@@ -179,6 +180,7 @@ private:
         QTimer reconnectTimer;
         QTimer wsPingTimer;
         QTimer openOrdersTimer;
+        QTimer uzxPositionsTimer;
         QTimer myTradesTimer;
         QTimer futuresDealsTimer;
         QTimer lighterAccountTimer;
@@ -232,6 +234,12 @@ private:
         QHash<QString, qint64> uzxRecentOrderFingerprintsMs;
         QHash<QString, qint64> uzxTerminalOrderSeenMs;
         QHash<QString, qint64> uzxSpotCloseRetryMs;
+        qint64 uzxSwapPositionsDisabledUntilMs{0};
+        // UZX swap positions rehydration is REST-based and sometimes returns transient/partial data.
+        // Track when a symbol was last seen as non-zero (and explicitly flat) to avoid UI flicker.
+        QHash<QString, qint64> uzxSwapRestLastSeenMsBySymbol;
+        QHash<QString, qint64> uzxSwapRestFlatSeenMsBySymbol;
+        QHash<QString, qint64> uzxSwapRestMissingSeenMsBySymbol;
 
         // Lighter: best-effort local cache of per-market leverage we last set (market_id -> leverage x).
         QHash<int, int> lighterLeverageByMarketId;
@@ -265,12 +273,12 @@ private:
                        const QString &txInfo,
                        std::function<void(QString txHash, QString err)> cb);
     QNetworkAccessManager *ensureMexcNetwork(Context &ctx);
+    QNetworkAccessManager *ensureUzxNetwork(Context &ctx);
     void ensureLighterStreamWired(Context &ctx);
     void ensureLighterStreamOpen(Context &ctx);
     void subscribeLighterPrivateWs(Context &ctx);
     void fetchUzxOpenOrders(Context &ctx);
     void fetchUzxSwapPositions(Context &ctx);
-    void fetchUzxSwapPositionsPath(Context &ctx, const QString &path, bool allowFallback);
 
     Context &ensureContext(ConnectionStore::Profile profile) const;
     QString defaultAccountName(ConnectionStore::Profile profile) const;
@@ -355,6 +363,7 @@ private:
     void pollLighterTrades(Context &ctx);
     void pollLighterActiveOrders(Context &ctx);
     QNetworkAccessManager *ensureLighterNetwork(Context &ctx);
+    void applyExecutedTradeMeta(Context &ctx, const QString &symbol, ExecutedTrade &trade);
     void ensureLighterMetaLoaded(Context &ctx, const QString &baseUrl, std::function<void(QString err)> cb);
     void armLighterBurst(Context &ctx, int ticks);
 

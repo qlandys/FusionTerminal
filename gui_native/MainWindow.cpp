@@ -4508,7 +4508,91 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
             &DomWidget::rowClicked,
             this,
             &MainWindow::handleDomRowClicked);
-    connect(dom, &DomWidget::hoverInfoChanged, prints, &PrintsWidget::setHoverInfo);
+    connect(dom,
+            &DomWidget::rowHovered,
+            this,
+            [this, columnGuard](int row, double price, double bidQty, double askQty) {
+                if (!columnGuard) {
+                    return;
+                }
+                WorkspaceTab *tab = nullptr;
+                DomColumn *col = nullptr;
+                int idx = -1;
+                if (!locateColumn(columnGuard.data(), tab, col, idx) || !col || !col->prints) {
+                    return;
+                }
+                PrintsWidget *prints = col->prints;
+                LadderClient *client = col->client;
+
+                if (row < 0 || !(price > 0.0) || !std::isfinite(price)) {
+                    col->hoverRayActive = false;
+                    col->hoverRayPrice = 0.0;
+                    prints->setHoverInfo(-1, 0.0, QString());
+                    return;
+                }
+
+                col->hoverRayActive = true;
+                col->hoverRayPrice = price;
+
+                auto formatValueShort = [](double v) -> QString {
+                    const double av = std::abs(v);
+                    double value = av;
+                    QString suffix;
+                    if (av >= 1000000000.0) {
+                        value = av / 1000000000.0;
+                        suffix = QStringLiteral("B");
+                    } else if (av >= 1000000.0) {
+                        value = av / 1000000.0;
+                        suffix = QStringLiteral("M");
+                    } else if (av >= 1000.0) {
+                        value = av / 1000.0;
+                        suffix = QStringLiteral("K");
+                    }
+                    const int precision = value >= 10.0 ? 1 : 2;
+                    const QString text = QString::number(value, 'f', precision);
+                    return suffix.isEmpty() ? text : text + suffix;
+                };
+
+                auto percentFromReference = [](double p, double bestBid, double bestAsk, double &outPercent) -> bool {
+                    if (bestBid > 0.0 && p <= bestBid) {
+                        outPercent = (bestBid - p) / bestBid * 100.0;
+                        return true;
+                    }
+                    if (bestAsk > 0.0 && p >= bestAsk) {
+                        outPercent = (p - bestAsk) / bestAsk * 100.0;
+                        return true;
+                    }
+                    if (bestAsk > 0.0 && p < bestAsk) {
+                        outPercent = -((bestAsk - p) / bestAsk * 100.0);
+                        return true;
+                    }
+                    if (bestBid > 0.0 && p > bestBid) {
+                        outPercent = -((p - bestBid) / bestBid * 100.0);
+                        return true;
+                    }
+                    return false;
+                };
+
+                const double bestBid = client ? client->bestBid() : 0.0;
+                const double bestAsk = client ? client->bestAsk() : 0.0;
+                double pct = 0.0;
+                QString percentText = QStringLiteral("-");
+                if (percentFromReference(price, bestBid, bestAsk, pct)) {
+                    percentText = QString::number(pct, 'f', std::abs(pct) >= 0.1 ? 2 : 3) + QLatin1String("%");
+                }
+
+                const double notional = std::max(bidQty, askQty) * std::abs(price);
+                const double cumulative = client ? client->cumulativeNotionalForPrice(price) : 0.0;
+
+                QStringList parts;
+                parts << percentText;
+                if (cumulative > 0.0) {
+                    parts << formatValueShort(cumulative);
+                } else if (notional > 0.0) {
+                    parts << formatValueShort(notional);
+                }
+                prints->setHoverInfo(row, price, parts.join(QStringLiteral(" | ")));
+            });
     connect(dom, &DomWidget::infoAreaHeightChanged, prints, &PrintsWidget::setDomInfoAreaHeight);
     connect(dom, &DomWidget::infoAreaHeightChanged, clusters, &ClustersWidget::setInfoAreaHeight);
     connect(prints, &PrintsWidget::cancelMarkerRequested, this, &MainWindow::handlePrintsCancelRequested);
@@ -12015,6 +12099,66 @@ bool MainWindow::pullSnapshotForColumn(DomColumn &col, qint64 bottomTick, qint64
             col.lastPrintsCompression = compression;
             col.lastPrintsTick = tickForPrints;
             col.lastPrintsRowCount = snap.levels.size();
+        }
+
+        // Live-update the hover "ray" text even if the mouse doesn't move.
+        if (col.hoverRayActive && col.hoverRayPrice > 0.0 && std::isfinite(col.hoverRayPrice)) {
+            auto formatValueShort = [](double v) -> QString {
+                const double av = std::abs(v);
+                double value = av;
+                QString suffix;
+                if (av >= 1000000000.0) {
+                    value = av / 1000000000.0;
+                    suffix = QStringLiteral("B");
+                } else if (av >= 1000000.0) {
+                    value = av / 1000000.0;
+                    suffix = QStringLiteral("M");
+                } else if (av >= 1000.0) {
+                    value = av / 1000.0;
+                    suffix = QStringLiteral("K");
+                }
+                const int precision = value >= 10.0 ? 1 : 2;
+                const QString text = QString::number(value, 'f', precision);
+                return suffix.isEmpty() ? text : text + suffix;
+            };
+
+            auto percentFromReference = [](double p, double bestBid, double bestAsk, double &outPercent) -> bool {
+                if (bestBid > 0.0 && p <= bestBid) {
+                    outPercent = (bestBid - p) / bestBid * 100.0;
+                    return true;
+                }
+                if (bestAsk > 0.0 && p >= bestAsk) {
+                    outPercent = (p - bestAsk) / bestAsk * 100.0;
+                    return true;
+                }
+                if (bestAsk > 0.0 && p < bestAsk) {
+                    outPercent = -((bestAsk - p) / bestAsk * 100.0);
+                    return true;
+                }
+                if (bestBid > 0.0 && p > bestBid) {
+                    outPercent = -((p - bestBid) / bestBid * 100.0);
+                    return true;
+                }
+                return false;
+            };
+
+            const double bestBid = col.client ? col.client->bestBid() : 0.0;
+            const double bestAsk = col.client ? col.client->bestAsk() : 0.0;
+            double pct = 0.0;
+            QString percentText = QStringLiteral("-");
+            if (percentFromReference(col.hoverRayPrice, bestBid, bestAsk, pct)) {
+                percentText = QString::number(pct, 'f', std::abs(pct) >= 0.1 ? 2 : 3) + QLatin1String("%");
+            }
+
+            const double cumulative =
+                col.client ? col.client->cumulativeNotionalForPrice(col.hoverRayPrice) : 0.0;
+
+            QStringList parts;
+            parts << percentText;
+            if (cumulative > 0.0) {
+                parts << formatValueShort(cumulative);
+            }
+            col.prints->setHoverInfo(-1, col.hoverRayPrice, parts.join(QStringLiteral(" | ")));
         }
     }
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();

@@ -89,7 +89,10 @@ public:
     qint64 centerTick() const { return m_centerTick; }
     double tickSize() const { return m_lastTickSize; }
     bool hasBook() const { return m_hasBook; }
+    double cumulativeNotionalForPrice(double price) const;
     quint64 bookRevision() const { return m_bookRevision; }
+    double bestBid() const { return m_bestBid; }
+    double bestAsk() const { return m_bestAsk; }
 
 private slots:
     void handleReadyRead();
@@ -155,6 +158,7 @@ private:
     qint64 m_centerTick = 0;
     double m_lastTickSize = 0.0;
     bool m_hasBook = false;
+    int m_cacheLevels = 0;
     double m_bestBid = 0.0;
     double m_bestAsk = 0.0;
     bool m_stopRequested = false;

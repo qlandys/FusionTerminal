@@ -19,9 +19,11 @@ Item {
     property int hoverRow: -1
     property string hoverText: ""
     // Hover "ray" styling (shared with prints hover info).
-    property color hoverBeamColor: "#1b2333"
+    property color hoverBeamColor: "#2860ff"
     property color hoverBeamBorderColor: "#2b3a55"
     property color hoverBeamTextColor: "#f4f6f8"
+    // Semi-transparent so underlying order volumes remain visible.
+    property real hoverBeamOpacity: 0.22
     property real tickSize: 0.0
     property bool positionActive: false
     property real positionEntryPrice: 0.0
@@ -57,57 +59,12 @@ Item {
         color: backgroundColor
     }
 
-    Item {
-        id: hoverBeam
-        z: 6.5
-        visible: root.hoverRow >= 0 && root.hoverText.length > 0
-                 && !root.actionOverlayVisible
-        height: root.rowHeight
-        y: root.hoverRow >= 0 ? root.hoverRow * root.rowHeight : 0
 
-        // End the ray exactly at the volume/price boundary, and grow/shrink from the left.
-        anchors.right: parent.right
-        anchors.rightMargin: Math.max(0, root.priceColumnWidth - 1)
+    // When hoverText is present, the beam is the hover indicator; disable the
+    // regular DOM row hover tint to keep everything a single, uniform layer.
+    property int effectiveHoverRow: root.hoverRow
 
-        property int padX: 10
-        property int padY: 2
-        width: Math.min(Math.max(1, parent.width - root.priceColumnWidth + 1),
-                        Math.max(1, hoverBeamText.contentWidth + padX * 2))
-        x: (parent.width - root.priceColumnWidth + 1) - width
-
-        Rectangle {
-            anchors.fill: parent
-            radius: 0
-            color: root.hoverBeamColor
-            border.width: 0
-            opacity: 1.0
-        }
-
-        Text {
-            id: hoverBeamText
-            anchors.fill: parent
-            anchors.leftMargin: hoverBeam.padX
-            anchors.rightMargin: hoverBeam.padX
-            anchors.topMargin: hoverBeam.padY
-            anchors.bottomMargin: hoverBeam.padY
-            verticalAlignment: Text.AlignVCenter
-            horizontalAlignment: Text.AlignHCenter
-            // Keep as a hidden width/height measurer so the ray width matches the
-            // hover label shown in prints, without duplicating text here.
-            text: root.hoverText
-            color: root.hoverBeamTextColor
-            opacity: 0.0
-            font.family: root.priceFontFamily
-            font.weight: Font.DemiBold
-            font.bold: false
-            font.kerning: false
-            font.preferShaping: true
-            font.features: { "tnum": 1, "lnum": 1 }
-            font.pixelSize: Math.max(8, root.priceFontPixelSize - 1)
-            elide: Text.ElideNone
-            clip: true
-        }
-    }
+    // Note: hover info label is rendered in prints column (GpuPrintsView.qml).
 
     Item {
         id: gpuLayer
@@ -130,7 +87,7 @@ Item {
             gridColor: root.gridColor
             hoverColor: "#2860ff"
             priceBorderColor: root.priceBorderColor
-            hoverRow: root.hoverRow
+            hoverRow: root.effectiveHoverRow
             orderHighlightPhase: root.orderHighlightPhase
             positionActive: root.positionActive
             positionEntryPrice: root.positionEntryPrice
@@ -287,6 +244,11 @@ Item {
                 color: root.priceBorderColor
                 opacity: 0.7
             }
+            Rectangle {
+                // Paint over the tick border so the hover ray doesn't look cut.
+                // Disabled: global overlay above handles the divider in GPU mode to avoid double tint ("blob").
+                visible: false
+            }
 
             Text {
                 anchors.verticalCenter: bookArea.verticalCenter
@@ -392,7 +354,8 @@ Item {
             Rectangle {
                 anchors.fill: parent
                 color: "#2860ff"
-                opacity: root.hoverRow === index ? 0.25 : 0.0
+                // Avoid "double ray": when hoverText is present, the beam itself is the hover indicator.
+                opacity: (root.hoverRow === index && root.hoverText.length === 0) ? 0.25 : 0.0
             }
         }
     }

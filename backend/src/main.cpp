@@ -2474,7 +2474,9 @@ namespace
         dom::OrderBook::Tick winMin = 0;
         dom::OrderBook::Tick winMax = 0;
         dom::OrderBook::Tick centerTick = 0;
-        auto rowsSparse = book.ladderSparse(config.ladderLevelsPerSide, &winMin, &winMax, &centerTick);
+        const std::size_t ladderLevels =
+            std::max<std::size_t>(config.ladderLevelsPerSide, config.cacheLevelsPerSide);
+        auto rowsSparse = book.ladderSparse(ladderLevels, &winMin, &winMax, &centerTick);
         const double tickSize = book.tickSize();
 
         auto enrich = [&](json &out) {
@@ -2903,7 +2905,10 @@ namespace
                                             static_cast<DWORD>(payload.size())) == S_OK;
             };
 
-            const int depthLimit = std::max(50, static_cast<int>(config.ladderLevelsPerSide));
+            const int depthLimit =
+                std::max(50, static_cast<int>(
+                                 std::max<std::size_t>(config.ladderLevelsPerSide,
+                                                       config.cacheLevelsPerSide)));
             json depthSub = {{"method","sub.depth"},
                              {"param", {{"symbol", config.symbol},
                                         {"limit", depthLimit}}}};

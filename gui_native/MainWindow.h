@@ -279,6 +279,8 @@ private:
         int lastScrollBarValue = 0;
         bool scrollValueValid = false;
         bool backendManualPinned = false;
+        bool hoverRayActive = false;
+        double hoverRayPrice = 0.0;
     };
 
     void repositionClustersFooterOverlay(DomColumn &col);

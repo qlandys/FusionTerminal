@@ -20,9 +20,11 @@ Item {
     property color hoverColor: "#2860ff"
     property color hoverTextColor: "#f4f6f8"
     // Hover "ray" for DOM hover info text (percent | notional).
-    // Keep it visually consistent across columns by using an opaque fill.
-    property color hoverBeamColor: "#1b2333"
+    // Use the same blue as DOM hover highlight so it reads as one element.
+    property color hoverBeamColor: "#2860ff"
     property color hoverBeamBorderColor: "#2b3a55"
+    // Beam needs to stay readable but not hide limit marker volumes beneath it.
+    property real hoverBeamOpacity: 0.22
     property string fontFamily: Qt.application.font.family
     property int fontPixelSize: 12
     property int hoverRow: -1
@@ -216,8 +218,7 @@ Item {
     }
 
     Rectangle {
-        // Row hover highlight (kept separate from the hover info "ray").
-        // When the ray is visible we disable this highlight to avoid the "double ray" look.
+        // Row hover highlight.
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
@@ -225,8 +226,21 @@ Item {
         height: rowHeight
         color: hoverColor
         opacity: hoverRow >= 0 ? 0.25 : 0.0
-        visible: hoverRow >= 0 && !root.dragActive && !hoverBeam.visible
+        visible: hoverRow >= 0 && !root.dragActive && hoverText.length === 0
         z: 5
+    }
+
+    Rectangle {
+        // Compact "ray" background, clipped on the left by matching the hover label width.
+        // This keeps underlying prints/limit markers readable.
+        x: hoverBeam.visible ? hoverBeam.x : 0
+        y: hoverRow >= 0 ? hoverRow * rowHeight : -rowHeight
+        width: hoverBeam.visible ? hoverBeam.width : 0
+        height: rowHeight
+        color: root.hoverBeamColor
+        opacity: hoverBeam.visible ? root.hoverBeamOpacity : 0.0
+        visible: hoverBeam.visible
+        z: 6.2
     }
 
     Item {
@@ -608,14 +622,6 @@ Item {
         width: Math.min(parent.width, Math.max(1, hoverBeamText.contentWidth + padX * 2))
         x: parent.width - width
 
-        Rectangle {
-            anchors.fill: parent
-            radius: 0
-            color: root.hoverBeamColor
-            border.width: 0
-            opacity: 1.0
-        }
-
         Text {
             id: hoverBeamText
             anchors.fill: parent
@@ -627,6 +633,8 @@ Item {
             horizontalAlignment: Text.AlignHCenter
             text: hoverText
             color: hoverTextColor
+            style: Text.Outline
+            styleColor: "#000000"
             font.family: fontFamily
             font.weight: Font.DemiBold
             font.bold: false

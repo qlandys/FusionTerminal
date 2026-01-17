@@ -606,6 +606,7 @@ LadderClient::LadderClient(const QString &backendPath,
     , m_proxy(proxy)
     , m_prints(prints)
 {
+    m_cacheLevels = std::max(m_levels, 10000);
     qRegisterMetaType<QVector<QByteArray>>("QVector<QByteArray>");
     qRegisterMetaType<ParsedTradeEvent>("ParsedTradeEvent");
     qRegisterMetaType<ParsedLadderRow>("ParsedLadderRow");
@@ -842,6 +843,7 @@ void LadderClient::restart(const QString &symbol, int levels, const QString &exc
     m_stopRequested = true;
     m_symbol = symbol;
     m_levels = levels;
+    m_cacheLevels = std::max(m_levels, 10000);
     if (!exchange.isEmpty()) {
         m_exchange = exchange;
     }
@@ -915,9 +917,10 @@ void LadderClient::restart(const QString &symbol, int levels, const QString &exc
     }
 
     QStringList args;
+    const int fullDepthLevels = std::max(m_levels, 10000);
     args << "--symbol" << wireSymbol
          << "--ladder-levels" << QString::number(m_levels)
-         << "--cache-levels" << QString::number(m_levels);
+         << "--cache-levels" << QString::number(fullDepthLevels);
     if (!m_exchange.isEmpty()) {
         args << "--exchange" << m_exchange;
     }
@@ -1921,6 +1924,36 @@ void LadderClient::applyDeltaLadderMessage(const ParsedLadderDelta &msg)
 
 void LadderClient::trimBookToWindow(qint64 minTick, qint64 maxTick, QSet<qint64> *dirtyBuckets)
 {
+    if (m_lastTickSize <= 0.0) {
+        return;
+    }
+
+    // Keep book coverage anchored around the current best price so cumulative
+    // volume does not change when the user scrolls the visible window.
+    qint64 bestTick = 0;
+    auto priceToRawTick = [&](double price) -> qint64 {
+        if (!(price > 0.0) || !(m_lastTickSize > 0.0) || !std::isfinite(price) || !std::isfinite(m_lastTickSize)) {
+            return 0;
+        }
+        const double scaled = price / m_lastTickSize;
+        if (!std::isfinite(scaled)) {
+            return 0;
+        }
+        return static_cast<qint64>(std::llround(scaled));
+    };
+    if (m_bestBid > 0.0) {
+        bestTick = priceToRawTick(m_bestBid);
+    }
+    if (bestTick == 0 && m_bestAsk > 0.0) {
+        bestTick = priceToRawTick(m_bestAsk);
+    }
+
+    if (bestTick != 0 && m_cacheLevels > 0) {
+        const qint64 span = static_cast<qint64>(m_cacheLevels);
+        minTick = bestTick - span;
+        maxTick = bestTick + span;
+    }
+
     if (minTick > maxTick) {
         return;
     }
@@ -2177,6 +2210,135 @@ DomSnapshot LadderClient::buildSnapshot(qint64 minTick, qint64 maxTick) const
         snap.levels.push_back(buckets[i]);
     }
     return snap;
+}
+
+double LadderClient::cumulativeNotionalForPrice(double price) const
+{
+    if (!(m_lastTickSize > 0.0) || !std::isfinite(price) || !(price > 0.0)) {
+        return 0.0;
+    }
+    const qint64 compression = std::max<qint64>(1, m_tickCompression);
+
+    auto priceToRawTick = [&](double p) -> qint64 {
+        if (!(p > 0.0) || !std::isfinite(p) || !(m_lastTickSize > 0.0) || !std::isfinite(m_lastTickSize)) {
+            return 0;
+        }
+        const double scaled = p / m_lastTickSize;
+        if (!std::isfinite(scaled)) {
+            return 0;
+        }
+        const double nudged = scaled + (scaled >= 0.0 ? 1e-9 : -1e-9);
+        return static_cast<qint64>(std::llround(nudged));
+    };
+
+    auto bestBuckets = [&]() -> std::pair<qint64, qint64> {
+        qint64 bid = m_lastStableBestBidBucketTick;
+        qint64 ask = m_lastStableBestAskBucketTick;
+        if (bid != 0 && ask != 0) {
+            return {bid, ask};
+        }
+        // Fallback: derive from the current cached bucket book (stable across scrolling).
+        qint64 bestBid = 0;
+        qint64 bestAsk = 0;
+        bool hasBid = false;
+        bool hasAsk = false;
+        for (auto it = m_bucketBook.constBegin(); it != m_bucketBook.constEnd(); ++it) {
+            const qint64 t = it.key();
+            if (it->bidQty > 0.0) {
+                if (!hasBid || t > bestBid) {
+                    bestBid = t;
+                    hasBid = true;
+                }
+            }
+            if (it->askQty > 0.0) {
+                if (!hasAsk || t < bestAsk) {
+                    bestAsk = t;
+                    hasAsk = true;
+                }
+            }
+        }
+        return {hasBid ? bestBid : 0, hasAsk ? bestAsk : 0};
+    };
+
+    const auto [bestBidBucket, bestAskBucket] = bestBuckets();
+    if (bestBidBucket == 0 && bestAskBucket == 0) {
+        return 0.0;
+    }
+
+    const double bestBidPrice = (bestBidBucket != 0) ? (static_cast<double>(bestBidBucket) * m_lastTickSize) : 0.0;
+    const double bestAskPrice = (bestAskBucket != 0) ? (static_cast<double>(bestAskBucket) * m_lastTickSize) : 0.0;
+
+    const qint64 targetTick = priceToRawTick(price);
+    if (targetTick == 0) {
+        return 0.0;
+    }
+
+    // Compute from the spread, not from the visible window:
+    // - Below/at bid => sum bids from best bid down to target.
+    // - Above/at ask => sum asks from best ask up to target.
+    // - Inside the spread => pick a side (midpoint) and clamp to the best bucket,
+    //   so scrolling can't flip us into a "0 then fallback-to-visible" path.
+    enum class Side { Bid, Ask };
+    Side side = Side::Bid;
+    const double tol = std::max(1e-8, m_lastTickSize * 0.25);
+    if (bestBidPrice > 0.0 && price <= bestBidPrice + tol) {
+        side = Side::Bid;
+    } else if (bestAskPrice > 0.0 && price >= bestAskPrice - tol) {
+        side = Side::Ask;
+    } else {
+        if (bestBidPrice > 0.0 && bestAskPrice > 0.0) {
+            const double mid = 0.5 * (bestBidPrice + bestAskPrice);
+            side = (price <= mid) ? Side::Bid : Side::Ask;
+        } else if (bestAskPrice > 0.0) {
+            side = Side::Ask;
+        } else {
+            side = Side::Bid;
+        }
+    }
+
+    qint64 lo = 0;
+    qint64 hi = 0;
+    const bool useBidSide = (side == Side::Bid);
+    if (useBidSide) {
+        if (bestBidBucket == 0) {
+            return 0.0;
+        }
+        qint64 targetBucket = floorBucketTickSigned(targetTick, compression);
+        if (targetBucket > bestBidBucket) {
+            targetBucket = bestBidBucket; // inside-spread clamp
+        }
+        lo = std::min(targetBucket, bestBidBucket);
+        hi = std::max(targetBucket, bestBidBucket);
+    } else {
+        if (bestAskBucket == 0) {
+            return 0.0;
+        }
+        qint64 targetBucket = ceilBucketTickSigned(targetTick, compression);
+        if (targetBucket < bestAskBucket) {
+            targetBucket = bestAskBucket; // inside-spread clamp
+        }
+        lo = std::min(bestAskBucket, targetBucket);
+        hi = std::max(bestAskBucket, targetBucket);
+    }
+
+    double total = 0.0;
+    for (auto it = m_bucketBook.constBegin(); it != m_bucketBook.constEnd(); ++it) {
+        const qint64 t = it.key();
+        if (t < lo || t > hi) {
+            continue;
+        }
+        const double p = std::abs(static_cast<double>(t) * m_lastTickSize);
+        if (useBidSide) {
+            if (it->bidQty > 0.0) {
+                total += it->bidQty * p;
+            }
+        } else {
+            if (it->askQty > 0.0) {
+                total += it->askQty * p;
+            }
+        }
+    }
+    return total;
 }
 
 #include "LadderClient.moc"

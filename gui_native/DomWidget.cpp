@@ -399,12 +399,39 @@ void DomWidget::applyPendingSnapshot()
         m_cachedTotalHeight = totalHeight;
     }
 
-    if (m_hoverRow >= rows) {
-        m_hoverRow = -1;
-        m_hoverInfoText.clear();
-        emit hoverInfoChanged(-1, 0.0, QString());
-    } else if (m_hoverRow >= 0) {
-        updateHoverInfo(m_hoverRow);
+    // Keep hover stable while the ladder window changes:
+    // - If the cursor is over the widget, recompute the hovered row from cursor Y (even if mouse doesn't move)
+    //   so scrolling updates the hovered price.
+    // - If the cursor is not over the widget, clear hover to avoid a "stuck" ray in Prints.
+    {
+        const QPoint localPos = mapFromGlobal(QCursor::pos());
+        const int ladderHeight = rows * rowHeight;
+        const bool cursorInside =
+            isVisible() && rect().contains(localPos) && localPos.y() >= 0 && localPos.y() < ladderHeight;
+
+        if (!cursorInside) {
+            if (m_hoverRow != -1) {
+                m_hoverRow = -1;
+                updateHoverInfo(-1);
+                emit rowHovered(-1, 0.0, 0.0, 0.0);
+            } else if (!m_hoverInfoText.isEmpty()) {
+                updateHoverInfo(-1);
+            }
+        } else {
+            int row = -1;
+            if (rows > 0 && localPos.y() >= 0 && localPos.y() < ladderHeight) {
+                row = std::clamp(localPos.y() / rowHeight, 0, rows - 1);
+            }
+            const bool changed = (row != m_hoverRow);
+            m_hoverRow = row;
+            updateHoverInfo(row);
+            if (row >= 0) {
+                const DomLevel &lvl = m_snapshot.levels[row];
+                emit rowHovered(row, lvl.price, lvl.bidQty, lvl.askQty);
+            } else if (changed) {
+                emit rowHovered(-1, 0.0, 0.0, 0.0);
+            }
+        }
     }
 
     updateQuickOverlayProperties();

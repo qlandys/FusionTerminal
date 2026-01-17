@@ -222,11 +222,15 @@ namespace
         std::string exchange{"mexc"};
         std::string proxyType{"http"}; // http | socks5
         std::string proxy;             // host:port[:user:pass] / user:pass@host:port / etc
+        bool forceNoProxy{false};      // ignore system proxy and use direct connections
         std::size_t ladderLevelsPerSide{120};
         std::chrono::milliseconds throttle{50};
         std::size_t snapshotDepth{500};
         std::size_t cacheLevelsPerSide{5000};
         double futuresContractSize{1.0}; // MEXC futures qty is in contracts; multiply by this to get base qty
+        int mexcStreamIntervalMs{100};  // MEXC spot protobuf WS interval (ms)
+        int mexcSpotPollMs{250};        // MEXC spot REST polling interval (fallback)
+        std::string mexcSpotMode{"pbws"}; // pbws | rest
 
         std::wstring winProxy; // WinHTTP proxy string; empty means no proxy
         std::wstring proxyUser;
@@ -471,6 +475,7 @@ namespace
     Config parseArgs(int argc, char** argv)
     {
         Config cfg;
+        bool snapshotDepthSet = false;
 
         for (int i = 1; i < argc; ++i)
         {
@@ -502,6 +507,12 @@ namespace
             else if (arg == "--proxy-type")
             {
                 cfg.proxyType = value("--proxy-type");
+                const std::string t = toLowerAscii(cfg.proxyType);
+                if (t == "none" || t == "direct" || t == "noproxy" || t == "no_proxy")
+                {
+                    cfg.forceNoProxy = true;
+                    cfg.proxyType = "http";
+                }
             }
             else if (arg == "--ladder-levels")
             {
@@ -514,6 +525,23 @@ namespace
             else if (arg == "--snapshot-depth")
             {
                 cfg.snapshotDepth = std::stoul(value("--snapshot-depth"));
+                snapshotDepthSet = true;
+            }
+            else if (arg == "--mexc-interval-ms")
+            {
+                cfg.mexcStreamIntervalMs = std::stoi(value("--mexc-interval-ms"));
+            }
+            else if (arg == "--mexc-spot-poll-ms")
+            {
+                cfg.mexcSpotPollMs = std::stoi(value("--mexc-spot-poll-ms"));
+            }
+            else if (arg == "--mexc-spot-mode")
+            {
+                cfg.mexcSpotMode = toLowerAscii(value("--mexc-spot-mode"));
+            }
+            else if (arg == "--no-proxy")
+            {
+                cfg.forceNoProxy = true;
             }
             else if (arg == "--cache-levels")
             {
@@ -522,20 +550,33 @@ namespace
         }
 
         constexpr std::size_t kMinCacheLevels = 5000;
-        constexpr std::size_t kDefaultSnapshotDepth = 50;
         const std::size_t kMaxSnapshotDepth =
             (cfg.exchange == "binance" || cfg.exchange == "binance_futures") ? 1000 : 5000;
 
         cfg.cacheLevelsPerSide = std::max(cfg.cacheLevelsPerSide, kMinCacheLevels);
 
-        if (cfg.snapshotDepth == 0)
+        if (!snapshotDepthSet || cfg.snapshotDepth == 0)
         {
-            cfg.snapshotDepth = kDefaultSnapshotDepth;
+            if (cfg.exchange == "binance" || cfg.exchange == "binance_futures")
+            {
+                cfg.snapshotDepth = 1000;
+            }
+            else if (cfg.exchange == "mexc" || cfg.exchange == "mexc_futures")
+            {
+                cfg.snapshotDepth = 200;
+            }
+            else
+            {
+                cfg.snapshotDepth = 500;
+            }
         }
-        // Ensure the initial REST snapshot covers at least the cached span, while
-        // respecting the depth endpoint limit.
+        // Ensure the initial REST snapshot is "good enough" to show a usable ladder quickly.
+        // Note: ladderLevelsPerSide can be very large (user can zoom out), but fetching an equally
+        // huge REST snapshot is expensive and often unnecessary — the WS stream will fill depth
+        // progressively. Cap the minimum snapshot to keep startup responsive.
         const std::size_t minSnapshot =
-            std::min(cfg.cacheLevelsPerSide * 2, kMaxSnapshotDepth);
+            std::min(std::max<std::size_t>(std::min<std::size_t>(cfg.ladderLevelsPerSide * 2, 1000), 50),
+                     kMaxSnapshotDepth);
         if (cfg.snapshotDepth < minSnapshot)
         {
             cfg.snapshotDepth = minSnapshot;
@@ -545,8 +586,143 @@ namespace
             cfg.snapshotDepth = kMaxSnapshotDepth;
         }
 
-        finalizeProxy(cfg);
+        if (cfg.forceNoProxy)
+        {
+            cfg.proxy.clear();
+            cfg.winProxy.clear();
+            cfg.proxyUser.clear();
+            cfg.proxyPass.clear();
+        }
+        else
+        {
+            finalizeProxy(cfg);
+        }
+
+        // Normalize MEXC spot stream interval to supported values.
+        // Note: `spot@public.aggre.*.v3.api.pb` is allowed only at 100ms; other intervals are blocked.
+        if (cfg.exchange == "mexc")
+        {
+            // MEXC spot JSON WS supports a small set of fixed intervals; keep 100ms by default.
+            cfg.mexcStreamIntervalMs = 100;
+            if (cfg.mexcSpotPollMs < 50) cfg.mexcSpotPollMs = 50;
+            if (cfg.mexcSpotPollMs > 2000) cfg.mexcSpotPollMs = 2000;
+            if (cfg.mexcSpotMode != "pbws" && cfg.mexcSpotMode != "rest")
+            {
+                cfg.mexcSpotMode = "pbws";
+            }
+        }
         return cfg;
+    }
+
+    // Forward declarations for MEXC spot polling helpers (defined later in this file).
+    std::optional<std::string> httpGet(const Config& cfg,
+                                       const std::string& host,
+                                       const std::string& path,
+                                       bool secure);
+    double jsonToDouble(const json& value);
+    dom::OrderBook::Tick tickFromPrice(double price, double tickSize);
+    void emitLadder(const Config& config,
+                    const dom::OrderBook& book,
+                    double bestBid,
+                    double bestAsk,
+                    std::int64_t ts);
+    extern std::mutex g_bookMutex;
+
+    bool fetchMexcSpotDepthSnapshot(const Config& cfg,
+                                    double tickSize,
+                                    std::vector<std::pair<dom::OrderBook::Tick, double>>& bids,
+                                    std::vector<std::pair<dom::OrderBook::Tick, double>>& asks)
+    {
+        if (tickSize <= 0.0)
+        {
+            return false;
+        }
+        std::ostringstream path;
+        path << "/api/v3/depth?symbol=" << cfg.symbol << "&limit=" << cfg.snapshotDepth;
+        auto body = httpGet(cfg, "api.mexc.com", path.str(), true);
+        if (!body)
+        {
+            return false;
+        }
+        json j;
+        try
+        {
+            j = json::parse(*body);
+        }
+        catch (const std::exception& ex)
+        {
+            std::cerr << "[backend] depth JSON parse error: " << ex.what() << std::endl;
+            return false;
+        }
+        if (!j.contains("bids") || !j.contains("asks"))
+        {
+            return false;
+        }
+
+        auto parseSide = [tickSize](const json& arr,
+                                    std::vector<std::pair<dom::OrderBook::Tick, double>>& out) {
+            out.clear();
+            if (!arr.is_array()) return;
+            for (const auto& e : arr)
+            {
+                if (!e.is_array() || e.size() < 2) continue;
+                double price = 0.0;
+                double qty = 0.0;
+                try
+                {
+                    if (e[0].is_string()) price = std::stod(e[0].get<std::string>());
+                    else price = jsonToDouble(e[0]);
+                    if (e[1].is_string()) qty = std::stod(e[1].get<std::string>());
+                    else qty = jsonToDouble(e[1]);
+                }
+                catch (...)
+                {
+                    continue;
+                }
+                if (!(price > 0.0) || !(qty >= 0.0)) continue;
+                const auto tick = tickFromPrice(price, tickSize);
+                out.emplace_back(tick, qty);
+            }
+        };
+
+        parseSide(j["bids"], bids);
+        parseSide(j["asks"], asks);
+        return true;
+    }
+
+    [[noreturn]] void runMexcSpotPolling(const Config& config, dom::OrderBook& book)
+    {
+        const double tickSize = book.tickSize();
+        if (!(tickSize > 0.0))
+        {
+            throw std::runtime_error("mexc poll: tickSize missing");
+        }
+
+        std::cerr << "[backend] starting MEXC spot REST polling for " << config.symbol
+                  << " every " << config.mexcSpotPollMs << "ms" << std::endl;
+
+        auto lastEmit = std::chrono::steady_clock::now();
+        std::vector<std::pair<dom::OrderBook::Tick, double>> bids;
+        std::vector<std::pair<dom::OrderBook::Tick, double>> asks;
+
+        for (;;)
+        {
+            if (fetchMexcSpotDepthSnapshot(config, tickSize, bids, asks))
+            {
+                const auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> lock(g_bookMutex);
+                book.loadSnapshot(bids, asks);
+                if (now - lastEmit >= config.throttle)
+                {
+                    lastEmit = now;
+                    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::system_clock::now().time_since_epoch())
+                                           .count();
+                    emitLadder(config, book, book.bestBid(), book.bestAsk(), nowMs);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(config.mexcSpotPollMs));
+        }
     }
 
     bool isMexcFutures(const Config &cfg)
@@ -750,19 +926,39 @@ namespace
 
     WinHttpHandle openSession(const Config &cfg)
     {
-        if (!cfg.winProxy.empty())
+        WinHttpHandle session;
+        if (cfg.forceNoProxy)
         {
-            return WinHttpHandle(WinHttpOpen(L"Ghost/1.0",
-                                             WINHTTP_ACCESS_TYPE_NAMED_PROXY,
-                                             cfg.winProxy.c_str(),
-                                             WINHTTP_NO_PROXY_BYPASS,
-                                             0));
+            session.reset(WinHttpOpen(L"Ghost/1.0",
+                                      WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                      WINHTTP_NO_PROXY_NAME,
+                                      WINHTTP_NO_PROXY_BYPASS,
+                                      0));
         }
-        return WinHttpHandle(WinHttpOpen(L"Ghost/1.0",
-                                         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                         nullptr,
-                                         nullptr,
-                                         0));
+        else if (!cfg.winProxy.empty())
+        {
+            session.reset(WinHttpOpen(L"Ghost/1.0",
+                                      WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                                      cfg.winProxy.c_str(),
+                                      WINHTTP_NO_PROXY_BYPASS,
+                                      0));
+        }
+        else
+        {
+            session.reset(WinHttpOpen(L"Ghost/1.0",
+                                      WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                      nullptr,
+                                      nullptr,
+                                      0));
+        }
+        if (session.valid())
+        {
+            // Improve perceived startup: don't hang for tens of seconds on DNS/connect.
+            // Keep conservative values to avoid spurious failures on slow networks.
+            static constexpr int kTimeoutMs = 7000;
+            WinHttpSetTimeouts(session.get(), kTimeoutMs, kTimeoutMs, kTimeoutMs, kTimeoutMs);
+        }
+        return session;
     }
 
     void applyProxyCredentials(const Config &cfg, HINTERNET request)
@@ -1492,7 +1688,7 @@ namespace
             std::cerr << "[backend] " << winhttpError("WinHttpWebSocketCompleteUpgrade") << std::endl;
             return false;
         }
-        WinHttpCloseHandle(request.get());
+        request.reset();
 
         std::cerr << "[backend] connected to Lighter ws" << std::endl;
 
@@ -2388,6 +2584,34 @@ namespace
     bool g_haveLastLadder = false;
     bool g_forceFullLadder = false;
 
+    void heartbeatThread()
+    {
+        using namespace std::chrono_literals;
+        // Keep the GUI watchdog alive even when a WS connection is idle (WinHTTP receive blocks).
+        for (;;)
+        {
+            std::this_thread::sleep_for(5s);
+            if (!g_bookReady.load())
+            {
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(g_bookMutex);
+            if (!g_bookPtr)
+            {
+                continue;
+            }
+            json hb;
+            hb["type"] = "hb";
+            hb["symbol"] = g_activeConfig.symbol;
+            hb["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+            hb["bestBid"] = g_bookPtr->bestBid();
+            hb["bestAsk"] = g_bookPtr->bestAsk();
+            stdoutWriter().writeLine(hb.dump());
+        }
+    }
+
     void emitCurrentLadderLocked()
     {
         const double bestBid = g_bookPtr->bestBid();
@@ -2474,8 +2698,11 @@ namespace
         dom::OrderBook::Tick winMin = 0;
         dom::OrderBook::Tick winMax = 0;
         dom::OrderBook::Tick centerTick = 0;
+        // Ladder emission must reflect what's actually visible. `cacheLevelsPerSide` is just
+        // storage capacity and can be much larger; using it here can generate massive JSON
+        // payloads (and stall/crash the GUI pipe), causing LadderClient restarts.
         const std::size_t ladderLevels =
-            std::max<std::size_t>(config.ladderLevelsPerSide, config.cacheLevelsPerSide);
+            std::max<std::size_t>(config.ladderLevelsPerSide, 1);
         auto rowsSparse = book.ladderSparse(ladderLevels, &winMin, &winMax, &centerTick);
         const double tickSize = book.tickSize();
 
@@ -2607,6 +2834,7 @@ namespace
         g_lastWindowMaxTick = winMax;
     }
 
+    // Legacy MEXC spot protobuf WS implementation (kept for reference / debugging).
     bool runWebSocket(const Config& config, dom::OrderBook& book)
     {
         WinHttpHandle session = openSession(config);
@@ -2671,17 +2899,17 @@ namespace
             std::cerr << "[backend] " << winhttpError("WinHttpWebSocketCompleteUpgrade") << std::endl;
             return false;
         }
-        WinHttpCloseHandle(request.get());
+        request.reset();
 
         std::cerr << "[backend] connected to Mexc ws" << std::endl;
 
         // Подписка на aggre.depth и aggre.deals
         std::ostringstream depthChannel;
-        depthChannel << "spot@public.aggre.depth.v3.api.pb@100ms@" << config.symbol;
+        depthChannel << "spot@public.aggre.depth.v3.api.pb@" << config.mexcStreamIntervalMs << "ms@" << config.symbol;
         // Aggre deals channel also requires an interval suffix (10ms/100ms); without it
         // the server replies with "Blocked" and sends no trades.
         std::ostringstream dealsChannel;
-        dealsChannel << "spot@public.aggre.deals.v3.api.pb@100ms@" << config.symbol;
+        dealsChannel << "spot@public.aggre.deals.v3.api.pb@" << config.mexcStreamIntervalMs << "ms@" << config.symbol;
         json sub = {{"method", "SUBSCRIPTION"},
                     {"params", json::array({depthChannel.str(), dealsChannel.str()})}};
         const std::string subStr = sub.dump();
@@ -2698,7 +2926,14 @@ namespace
 
         std::cerr << "[backend] sent " << subStr << std::endl;
 
-        std::vector<unsigned char> buffer(64 * 1024);
+        // MEXC spot public streams are protobuf and can exceed 64KB; using a larger receive buffer
+        // reduces fragmentation and prevents decode stalls/crashes behind some proxies.
+        std::vector<unsigned char> buffer(256 * 1024);
+        std::vector<unsigned char> binBuffer;
+        binBuffer.reserve(256 * 1024);
+        std::string textBuffer;
+        textBuffer.reserve(16 * 1024);
+        std::uint64_t unknownBinaryFrames = 0;
         auto lastEmit = std::chrono::steady_clock::now();
 
         for (;;)
@@ -2727,7 +2962,29 @@ namespace
             if (type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
                 type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
             {
-                std::string text(reinterpret_cast<char*>(buffer.data()), received);
+                // WinHTTP may deliver JSON frames split into fragments; assemble before parsing.
+                if (type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
+                {
+                    textBuffer.append(reinterpret_cast<const char*>(buffer.data()), received);
+                    if (textBuffer.size() > 1024 * 1024)
+                    {
+                        std::cerr << "[backend] WS text fragment buffer too large, dropping\n";
+                        textBuffer.clear();
+                    }
+                    continue;
+                }
+
+                std::string text;
+                if (!textBuffer.empty())
+                {
+                    textBuffer.append(reinterpret_cast<const char*>(buffer.data()), received);
+                    text.swap(textBuffer);
+                    textBuffer.clear();
+                }
+                else
+                {
+                    text.assign(reinterpret_cast<const char*>(buffer.data()), received);
+                }
                 // PING / служебные сообщения
                 try
                 {
@@ -2758,6 +3015,17 @@ namespace
             {
                 try
                 {
+                    // WinHTTP may deliver protobuf frames split into fragments; assemble before decoding.
+                    if (type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE)
+                    {
+                        binBuffer.insert(binBuffer.end(), buffer.begin(), buffer.begin() + received);
+                        if (binBuffer.size() > 4 * 1024 * 1024)
+                        {
+                            std::cerr << "[backend] WS binary fragment buffer too large, dropping\n";
+                            binBuffer.clear();
+                        }
+                        continue;
+                    }
                     const double tickSize = book.tickSize();
                     if (tickSize <= 0.0)
                     {
@@ -2769,8 +3037,17 @@ namespace
                     std::vector<std::pair<dom::OrderBook::Tick, double>> bids;
                     std::vector<PublicAggreDeal> deals;
 
+                    const unsigned char* payloadPtr = buffer.data();
+                    std::size_t payloadSize = static_cast<std::size_t>(received);
+                    if (!binBuffer.empty())
+                    {
+                        binBuffer.insert(binBuffer.end(), buffer.begin(), buffer.begin() + received);
+                        payloadPtr = binBuffer.data();
+                        payloadSize = binBuffer.size();
+                    }
+
                     // Try trades first
-                    if (parseDealsFromWrapper(buffer.data(), received, channelName, deals))
+                    if (parseDealsFromWrapper(payloadPtr, payloadSize, channelName, deals))
                     {
                         for (const auto& d : deals)
                         {
@@ -2793,11 +3070,12 @@ namespace
                             t["timestamp"] = d.time;
                             tradeBatcher().add(config.symbol, std::move(t));
                         }
+                        binBuffer.clear();
                         continue;
                     }
 
                     // Depth updates
-                    if (parsePushWrapper(buffer.data(), received, channelName, tickSize, asks, bids))
+                    if (parsePushWrapper(payloadPtr, payloadSize, channelName, tickSize, asks, bids))
                     {
                         const auto now = std::chrono::steady_clock::now();
                         std::lock_guard<std::mutex> lock(g_bookMutex);
@@ -2811,11 +3089,340 @@ namespace
                             emitLadder(config, book, book.bestBid(), book.bestAsk(), nowMs);
                         }
                     }
+                    else
+                    {
+                        // If the wrapper isn't recognized, emit a very low-frequency hint to stderr for debugging.
+                        // (Some proxies can mangle frames; also MEXC can occasionally send other channels.)
+                        ++unknownBinaryFrames;
+                        if (unknownBinaryFrames <= 3 || (unknownBinaryFrames % 5000) == 0)
+                        {
+                            std::cerr << "[backend] mexc unknown binary frame len=" << payloadSize
+                                      << " count=" << unknownBinaryFrames << std::endl;
+                        }
+                    }
+                    binBuffer.clear();
                 }
                 catch (const std::exception& ex)
                 {
                     std::cerr << "[backend] decode/apply error: " << ex.what() << std::endl;
+                    binBuffer.clear();
                 }
+            }
+        }
+
+        WinHttpCloseHandle(rawSocket);
+        return true;
+    }
+
+    bool runMexcSpotJsonWebSocket(const Config& config, dom::OrderBook& book)
+    {
+        WinHttpHandle session = openSession(config);
+        if (!session.valid())
+        {
+            std::cerr << "[backend] " << winhttpError("WinHttpOpen") << std::endl;
+            return false;
+        }
+
+        const std::wstring host = L"wbs-api.mexc.com";
+        const std::wstring path = L"/ws";
+
+        WinHttpHandle connection(
+            WinHttpConnect(session.get(), host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
+        if (!connection.valid())
+        {
+            std::cerr << "[backend] " << winhttpError("WinHttpConnect") << std::endl;
+            return false;
+        }
+
+        WinHttpHandle request(WinHttpOpenRequest(connection.get(),
+                                                 L"GET",
+                                                 path.c_str(),
+                                                 nullptr,
+                                                 WINHTTP_NO_REFERER,
+                                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                 WINHTTP_FLAG_SECURE));
+        if (!request.valid())
+        {
+            std::cerr << "[backend] " << winhttpError("WinHttpOpenRequest") << std::endl;
+            return false;
+        }
+
+        applyProxyCredentials(config, request.get());
+        if (!WinHttpSetOption(request.get(), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0))
+        {
+            std::cerr << "[backend] " << winhttpError("WinHttpSetOption") << std::endl;
+            return false;
+        }
+
+        if (!WinHttpSendRequest(request.get(),
+                                WINHTTP_NO_ADDITIONAL_HEADERS,
+                                0,
+                                WINHTTP_NO_REQUEST_DATA,
+                                0,
+                                0,
+                                0))
+        {
+            std::cerr << "[backend] " << winhttpError("WinHttpSendRequest") << std::endl;
+            return false;
+        }
+
+        if (!WinHttpReceiveResponse(request.get(), nullptr))
+        {
+            std::cerr << "[backend] " << winhttpError("WinHttpReceiveResponse") << std::endl;
+            return false;
+        }
+
+        HINTERNET rawSocket = WinHttpWebSocketCompleteUpgrade(request.get(), 0);
+        request.reset();
+        if (!rawSocket)
+        {
+            std::cerr << "[backend] " << winhttpError("WinHttpWebSocketCompleteUpgrade") << std::endl;
+            return false;
+        }
+
+        // Subscribe to JSON channels (no protobuf).
+        // Use the same channel names as protobuf, but without the `.pb` suffix.
+        std::ostringstream depthChannel;
+        depthChannel << "spot@public.aggre.depth.v3.api@" << config.mexcStreamIntervalMs << "ms@" << config.symbol;
+        std::ostringstream dealsChannel;
+        dealsChannel << "spot@public.aggre.deals.v3.api@" << config.mexcStreamIntervalMs << "ms@" << config.symbol;
+        json sub = {{"method", "SUBSCRIPTION"},
+                    {"params", json::array({depthChannel.str(), dealsChannel.str()})}};
+        const std::string subStr = sub.dump();
+
+        if (WinHttpWebSocketSend(rawSocket,
+                                 WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                                 (void*)subStr.data(),
+                                 static_cast<DWORD>(subStr.size())) != S_OK)
+        {
+            std::cerr << "[backend] failed to send SUBSCRIPTION" << std::endl;
+            WinHttpCloseHandle(rawSocket);
+            return false;
+        }
+        std::cerr << "[backend] sent " << subStr << std::endl;
+
+        std::vector<unsigned char> buffer(128 * 1024);
+        std::string textBuffer;
+        textBuffer.reserve(16 * 1024);
+        auto lastEmit = std::chrono::steady_clock::now();
+
+        auto parseSide = [&](const json& side, std::vector<std::pair<dom::OrderBook::Tick, double>>& out) {
+            out.clear();
+            if (!side.is_array())
+            {
+                return;
+            }
+            out.reserve(side.size());
+            const double tickSize = book.tickSize();
+            for (const auto& lvl : side)
+            {
+                if (!lvl.is_array() || lvl.size() < 2) continue;
+                const double price = jsonToDouble(lvl[0]);
+                const double qty = jsonToDouble(lvl[1]);
+                if (!(price > 0.0) || !(qty >= 0.0)) continue;
+                const auto tick = tickFromPrice(price, tickSize);
+                out.emplace_back(tick, qty);
+            }
+        };
+
+        auto handleDepthOrTrades = [&](const json& j) {
+            // Common envelopes:
+            // - { "c": "<channel>", "d": <data> }
+            // - { "channel": "<channel>", "data": <data> }
+            // - { "stream": "<channel>", "data": <data> }  (binance-style)
+            std::string channel;
+            const json* dataPtr = nullptr;
+
+            auto takeStr = [&](const char* k) -> std::optional<std::string> {
+                auto it = j.find(k);
+                if (it != j.end() && it->is_string()) return it->get<std::string>();
+                return std::nullopt;
+            };
+
+            if (auto c = takeStr("c")) channel = *c;
+            else if (auto c2 = takeStr("channel")) channel = *c2;
+            else if (auto s = takeStr("stream")) channel = *s;
+
+            if (auto it = j.find("d"); it != j.end()) dataPtr = &(*it);
+            else if (auto it = j.find("data"); it != j.end()) dataPtr = &(*it);
+
+            if (!dataPtr)
+            {
+                return;
+            }
+            const json& data = *dataPtr;
+
+            // Depth
+            if (data.is_object() && (data.contains("bids") || data.contains("asks") || data.contains("b") || data.contains("a")))
+            {
+                const json bidsSide = data.contains("bids") ? data["bids"]
+                                   : data.contains("b") ? data["b"]
+                                                        : json::array();
+                const json asksSide = data.contains("asks") ? data["asks"]
+                                   : data.contains("a") ? data["a"]
+                                                        : json::array();
+                std::vector<std::pair<dom::OrderBook::Tick, double>> bids;
+                std::vector<std::pair<dom::OrderBook::Tick, double>> asks;
+                parseSide(bidsSide, bids);
+                parseSide(asksSide, asks);
+
+                const auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> lock(g_bookMutex);
+                book.applyDelta(bids, asks, config.cacheLevelsPerSide);
+                if (now - lastEmit >= config.throttle)
+                {
+                    lastEmit = now;
+                    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::system_clock::now().time_since_epoch())
+                                           .count();
+                    emitLadder(config, book, book.bestBid(), book.bestAsk(), nowMs);
+                }
+                return;
+            }
+
+            // Trades / deals
+            auto emitTrade = [&](double price, double qty, bool isBuy, std::int64_t ts) {
+                json t;
+                t["type"] = "trade";
+                t["symbol"] = config.symbol;
+                t["price"] = price;
+                t["qty"] = qty;
+                t["side"] = isBuy ? "buy" : "sell";
+                t["timestamp"] = ts;
+                tradeBatcher().add(config.symbol, std::move(t));
+            };
+
+            auto parseDealObj = [&](const json& d) {
+                if (!d.is_object()) return;
+                const double price = d.contains("p") ? jsonToDouble(d["p"])
+                                    : d.contains("price") ? jsonToDouble(d["price"])
+                                                      : 0.0;
+                const double qty = d.contains("v") ? jsonToDouble(d["v"])
+                                  : d.contains("q") ? jsonToDouble(d["q"])
+                                  : d.contains("qty") ? jsonToDouble(d["qty"])
+                                                  : 0.0;
+                if (!(price > 0.0) || !(qty > 0.0)) return;
+
+                std::int64_t ts = 0;
+                if (d.contains("t")) ts = static_cast<std::int64_t>(jsonToDouble(d["t"]));
+                else if (d.contains("ts")) ts = static_cast<std::int64_t>(jsonToDouble(d["ts"]));
+                else if (d.contains("time")) ts = static_cast<std::int64_t>(jsonToDouble(d["time"]));
+                if (ts <= 0)
+                {
+                    ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+                }
+
+                bool isBuy = true;
+                if (d.contains("S"))
+                {
+                    const int s = static_cast<int>(jsonToDouble(d["S"]));
+                    // Common: 1=BUY, 2=SELL
+                    isBuy = (s == 1);
+                }
+                else if (d.contains("side") && d["side"].is_string())
+                {
+                    const std::string side = toLowerAscii(d["side"].get<std::string>());
+                    isBuy = (side == "buy" || side == "bid");
+                }
+                emitTrade(price, qty, isBuy, ts);
+            };
+
+            if (data.is_object() && data.contains("deals") && data["deals"].is_array())
+            {
+                for (const auto& d : data["deals"])
+                {
+                    parseDealObj(d);
+                }
+                return;
+            }
+            if (data.is_array())
+            {
+                for (const auto& d : data)
+                {
+                    parseDealObj(d);
+                }
+                return;
+            }
+
+            (void)channel;
+        };
+
+        for (;;)
+        {
+            DWORD received = 0;
+            WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
+            HRESULT hr =
+                WinHttpWebSocketReceive(rawSocket, buffer.data(), static_cast<DWORD>(buffer.size()), &received, &type);
+            if (FAILED(hr))
+            {
+                std::cerr << "[backend] WebSocket receive failed: " << std::hex << hr << std::dec << std::endl;
+                break;
+            }
+
+            if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE)
+            {
+                std::cerr << "[backend] ws closed by server" << std::endl;
+                break;
+            }
+            if (received == 0) continue;
+
+            if (type != WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE &&
+                type != WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
+            {
+                // JSON WS should be UTF8; ignore other frames.
+                continue;
+            }
+
+            if (type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
+            {
+                textBuffer.append(reinterpret_cast<const char*>(buffer.data()), received);
+                if (textBuffer.size() > 1024 * 1024)
+                {
+                    std::cerr << "[backend] WS text fragment buffer too large, dropping\n";
+                    textBuffer.clear();
+                }
+                continue;
+            }
+
+            std::string text;
+            if (!textBuffer.empty())
+            {
+                textBuffer.append(reinterpret_cast<const char*>(buffer.data()), received);
+                text.swap(textBuffer);
+                textBuffer.clear();
+            }
+            else
+            {
+                text.assign(reinterpret_cast<const char*>(buffer.data()), received);
+            }
+
+            try
+            {
+                auto j = json::parse(text);
+                const auto methodIt = j.find("method");
+                if (methodIt != j.end() && methodIt->is_string() && *methodIt == "PING")
+                {
+                    const std::string pong = R"({"method":"PONG"})";
+                    WinHttpWebSocketSend(rawSocket,
+                                         WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                                         (void*)pong.data(),
+                                         static_cast<DWORD>(pong.size()));
+                    continue;
+                }
+
+                // Server acks / errors.
+                if (j.contains("code") && j["code"].is_number_integer() && j["code"].get<int>() != 0)
+                {
+                    std::cerr << "[backend] mexc ws error: " << text << std::endl;
+                }
+
+                handleDepthOrTrades(j);
+            }
+            catch (const std::exception& ex)
+            {
+                std::cerr << "[backend] mexc ws json parse/apply error: " << ex.what() << std::endl;
             }
         }
 
@@ -2893,7 +3500,7 @@ namespace
                 std::this_thread::sleep_for(1000ms);
                 continue;
             }
-            WinHttpCloseHandle(request.get());
+            request.reset();
 
             std::mutex sendMutex;
             auto sendJson = [&](const json &msg) -> bool {
@@ -3645,7 +4252,7 @@ bool runBinanceWebSocket(const Config &config, dom::OrderBook &book, bool future
             std::cerr << "[backend] " << winhttpError("WinHttpWebSocketCompleteUpgrade") << std::endl;
             return false;
         }
-        WinHttpCloseHandle(request.get());
+        request.reset();
 
         std::cerr << "[backend] connected to Binance ws" << (futures ? " (futures)" : " (spot)") << std::endl;
 
@@ -3934,7 +4541,7 @@ bool runUzxWebSocket(const Config& config, dom::OrderBook& book, double tickSize
         std::cerr << "[backend] " << winhttpError("WinHttpWebSocketCompleteUpgrade") << std::endl;
         return false;
     }
-    WinHttpCloseHandle(request.get());
+    request.reset();
 
     auto normalizeSymbol = [](std::string symbol, bool swap) -> std::string {
         if (symbol.empty())
@@ -4327,11 +4934,12 @@ int main(int argc, char** argv)
         }
         dom::OrderBook book;
         book.setCacheLevelsPerSide(cfg.cacheLevelsPerSide);
+        std::thread(heartbeatThread).detach();
         std::thread(controlReaderThread).detach();
 
         if (cfg.exchange == "mexc")
         {
-            std::cerr << "[backend] starting MEXC WS depth for " << cfg.symbol << std::endl;
+            std::cerr << "[backend] starting MEXC spot depth for " << cfg.symbol << std::endl;
             double tickSize = 0.0;
             if (!fetchExchangeInfo(cfg, tickSize))
             {
@@ -4357,7 +4965,17 @@ int main(int argc, char** argv)
                 g_activeConfig = cfg;
             }
             g_bookReady.store(true);
-            runWebSocket(cfg, book);
+            if (cfg.mexcSpotMode == "rest")
+            {
+                runMexcSpotPolling(cfg, book);
+            }
+            else
+            {
+                // Default: protobuf WebSocket market streams (the official MEXC spot WS is protobuf-only).
+                // REST polling remains as a fallback mode for problematic networks.
+                runWebSocket(cfg, book);
+            }
+            return 0;
         }
         else if (cfg.exchange == "mexc_futures")
         {

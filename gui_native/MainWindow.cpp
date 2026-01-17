@@ -6817,8 +6817,17 @@ void MainWindow::startNotionalEdit(QWidget *columnContainer, int presetIndex)
         col->notionalEditField = line;
         overlay->installEventFilter(this);
         line->installEventFilter(this);
-        connect(line, &QLineEdit::returnPressed, this, [this, columnContainer]() {
-            commitNotionalEdit(columnContainer, true);
+        const QPointer<QWidget> columnGuard = columnContainer;
+        connect(line, &QLineEdit::returnPressed, this, [this, columnGuard]() {
+            if (columnGuard) {
+                commitNotionalEdit(columnGuard, true);
+            }
+        });
+        // Save on focus loss / click outside too (not only Enter).
+        connect(line, &QLineEdit::editingFinished, this, [this, columnGuard]() {
+            if (columnGuard) {
+                commitNotionalEdit(columnGuard, true);
+            }
         });
     }
 
@@ -6995,11 +7004,21 @@ void MainWindow::handleConnectionStateChanged(ConnectionStore::Profile profile,
         statusBar()->showMessage(QStringLiteral("%1: %2").arg(profileLabel(), message), 2500);
     }
 
-    if (state == TradeManager::ConnectionState::Error
-        || state == TradeManager::ConnectionState::Disconnected) {
-        const QString note = message.isEmpty()
-                                 ? tr("%1 connection lost").arg(profileLabel())
-                                 : QStringLiteral("%1: %2").arg(profileLabel(), message);
+    const TradeManager::ConnectionState prev =
+        m_lastConnStateByProfile.value(profile, TradeManager::ConnectionState::Disconnected);
+    m_lastConnStateByProfile.insert(profile, state);
+
+    // Avoid noisy "connection lost" notifications on startup (initial Disconnected state).
+    // Notify only on real drops from Connected, or when we have an explicit error message.
+    const bool wasConnected = (prev == TradeManager::ConnectionState::Connected);
+    const bool hasExplicitMessage = !message.trimmed().isEmpty();
+    const bool isDrop =
+        (state == TradeManager::ConnectionState::Disconnected || state == TradeManager::ConnectionState::Error)
+        && (wasConnected || hasExplicitMessage);
+    if (isDrop) {
+        const QString note = hasExplicitMessage
+                                 ? QStringLiteral("%1: %2").arg(profileLabel(), message)
+                                 : tr("%1 connection lost").arg(profileLabel());
         addNotification(note);
     }
 }
@@ -10303,7 +10322,7 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
     if (obj->objectName() == QLatin1String("NotionalEditOverlay") &&
         event->type() == QEvent::MouseButtonPress) {
         QWidget *column = columnContainerForObject(obj);
-        commitNotionalEdit(column, false);
+        commitNotionalEdit(column, true);
         return true;
     }
 

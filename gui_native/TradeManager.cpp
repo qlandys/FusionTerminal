@@ -3344,6 +3344,8 @@ void TradeManager::placeLimitOrder(const QString &symbol,
     const QString sym = normalizedSymbol(symbol);
     const ConnectionStore::Profile profile = profileFromAccountName(accountName);
     if (profile != ConnectionStore::Profile::Lighter
+        && profile != ConnectionStore::Profile::MexcSpot
+        && profile != ConnectionStore::Profile::MexcFutures
         && profile != ConnectionStore::Profile::UzxSwap
         && profile != ConnectionStore::Profile::UzxSpot) {
         return;
@@ -4302,6 +4304,23 @@ void TradeManager::placeLimitOrder(const QString &symbol,
         return;
     }
 
+    if (profile == ConnectionStore::Profile::MexcSpot) {
+        PendingSpotOrder order;
+        order.symbol = sym;
+        order.price = price;
+        order.quantityBase = quantity;
+        order.side = side;
+
+        const auto metaIt = ctx.spotSymbolMeta.constFind(sym);
+        if (metaIt == ctx.spotSymbolMeta.constEnd() || !metaIt->valid()) {
+            ctx.pendingSpotOrders[sym].push_back(order);
+            ensureMexcSpotSymbolMeta(ctx, sym);
+            return;
+        }
+        submitMexcSpotOrder(ctx, order, metaIt.value());
+        return;
+    }
+
     QUrlQuery query;
     query.addQueryItem(QStringLiteral("symbol"), sym);
     query.addQueryItem(QStringLiteral("side"),
@@ -4378,6 +4397,288 @@ void TradeManager::placeLimitOrder(const QString &symbol,
                                     .arg(side == OrderSide::Buy ? QStringLiteral("BUY")
                                                                 : QStringLiteral("SELL"))
                                     .arg(quantity, 0, 'f', 4)
+                                    .arg(price, 0, 'f', 5));
+            });
+}
+
+void TradeManager::ensureMexcSpotSymbolMeta(Context &ctx, const QString &symbolUpper)
+{
+    if (ctx.profile != ConnectionStore::Profile::MexcSpot) {
+        return;
+    }
+    const QString sym = normalizedSymbol(symbolUpper);
+    if (sym.isEmpty()) {
+        return;
+    }
+    if (ctx.spotSymbolMetaInFlight.contains(sym)) {
+        return;
+    }
+    ctx.spotSymbolMetaInFlight.insert(sym);
+
+    QUrl url(m_baseUrl + QStringLiteral("/api/v3/exchangeInfo"));
+    QUrlQuery q;
+    q.addQueryItem(QStringLiteral("symbol"), sym);
+    url.setQuery(q);
+    QNetworkRequest req(url);
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+    auto *reply = ensureMexcNetwork(ctx)->get(req);
+    applyReplyTimeout(reply, 6000);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, sym, ctxPtr = &ctx]() {
+        ctxPtr->spotSymbolMetaInFlight.remove(sym);
+        const QNetworkReply::NetworkError err = reply->error();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray raw = reply->readAll();
+        reply->deleteLater();
+
+        auto flushPending = [&](const QString &errMsg) {
+            const QVector<PendingSpotOrder> pending = ctxPtr->pendingSpotOrders.take(sym);
+            if (!errMsg.isEmpty()) {
+                for (const auto &o : pending) {
+                    emit orderFailed(ctxPtr->accountName, sym, errMsg);
+                }
+            } else {
+                const auto metaIt = ctxPtr->spotSymbolMeta.constFind(sym);
+                if (metaIt == ctxPtr->spotSymbolMeta.constEnd() || !metaIt->valid()) {
+                    for (const auto &o : pending) {
+                        emit orderFailed(ctxPtr->accountName, sym, tr("Failed to load MEXC symbol meta"));
+                    }
+                    return;
+                }
+                for (const auto &o : pending) {
+                    submitMexcSpotOrder(*ctxPtr, o, metaIt.value());
+                }
+            }
+        };
+
+        if (err != QNetworkReply::NoError || status >= 400) {
+            flushPending(QStringLiteral("MEXC exchangeInfo failed: %1")
+                             .arg(raw.isEmpty() ? reply->errorString() : QString::fromUtf8(raw)));
+            return;
+        }
+
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (doc.isNull() || !doc.isObject()) {
+            flushPending(QStringLiteral("MEXC exchangeInfo: invalid response"));
+            return;
+        }
+        const QJsonObject obj = doc.object();
+        const QJsonArray symbols = obj.value(QStringLiteral("symbols")).toArray();
+        if (symbols.isEmpty()) {
+            flushPending(QStringLiteral("MEXC exchangeInfo: symbol not found"));
+            return;
+        }
+        const QJsonObject s0 = symbols.first().toObject();
+        const QJsonArray filters = s0.value(QStringLiteral("filters")).toArray();
+
+        auto toD = [](const QJsonValue &v) -> double {
+            if (v.isString()) return v.toString().toDouble();
+            if (v.isDouble()) return v.toDouble();
+            return v.toVariant().toDouble();
+        };
+
+        SpotSymbolMeta meta;
+        if (!filters.isEmpty()) {
+            for (const auto &fv : filters) {
+                if (!fv.isObject()) continue;
+                const QJsonObject f = fv.toObject();
+                const QString t = f.value(QStringLiteral("filterType")).toString();
+                if (t == QStringLiteral("LOT_SIZE")) {
+                    meta.minQty = toD(f.value(QStringLiteral("minQty")));
+                    meta.stepSize = toD(f.value(QStringLiteral("stepSize")));
+                } else if (t == QStringLiteral("PRICE_FILTER")) {
+                    meta.tickSize = toD(f.value(QStringLiteral("tickSize")));
+                } else if (t == QStringLiteral("MIN_NOTIONAL")) {
+                    meta.minNotional = toD(f.value(QStringLiteral("minNotional")));
+                }
+            }
+        }
+
+        // MEXC has instruments (e.g. some tokenized stocks) that don't provide Binance-like
+        // LOT_SIZE / PRICE_FILTER filters. Fall back to the precision fields.
+        auto toInt = [](const QJsonValue &v, int def) -> int {
+            if (v.isDouble()) return static_cast<int>(v.toDouble());
+            if (v.isString()) {
+                bool ok = false;
+                const int out = v.toString().trimmed().toInt(&ok);
+                return ok ? out : def;
+            }
+            if (v.isUndefined() || v.isNull()) return def;
+            return v.toVariant().toInt();
+        };
+        auto pow10neg = [](int decimals) -> double {
+            const int d = std::clamp(decimals, 0, 18);
+            return std::pow(10.0, -static_cast<double>(d));
+        };
+        if (!(meta.tickSize > 0.0)) {
+            const int quotePrec = toInt(s0.value(QStringLiteral("quotePrecision")),
+                                        toInt(s0.value(QStringLiteral("quoteAssetPrecision")), 8));
+            meta.tickSize = pow10neg(quotePrec);
+        }
+        if (!(meta.stepSize > 0.0)) {
+            const int baseSizePrec = toInt(s0.value(QStringLiteral("baseSizePrecision")),
+                                           toInt(s0.value(QStringLiteral("baseAssetPrecision")), 8));
+            meta.stepSize = pow10neg(baseSizePrec);
+        }
+        if (!(meta.minQty > 0.0) && meta.stepSize > 0.0) {
+            meta.minQty = meta.stepSize;
+        }
+
+        if (!meta.valid()) {
+            flushPending(QStringLiteral("MEXC exchangeInfo: unsupported symbol meta"));
+            return;
+        }
+        ctxPtr->spotSymbolMeta.insert(sym, meta);
+        flushPending(QString());
+    });
+}
+
+void TradeManager::submitMexcSpotOrder(Context &ctx,
+                                      const PendingSpotOrder &order,
+                                      const SpotSymbolMeta &meta)
+{
+    const QString sym = normalizedSymbol(order.symbol);
+    if (sym.isEmpty()) {
+        emit orderFailed(ctx.accountName, sym, tr("Invalid symbol"));
+        return;
+    }
+    if (!(order.price > 0.0) || !(order.quantityBase > 0.0)) {
+        emit orderFailed(ctx.accountName, sym, tr("Invalid price or quantity"));
+        return;
+    }
+    if (!meta.valid()) {
+        emit orderFailed(ctx.accountName, sym, tr("Missing MEXC symbol meta"));
+        return;
+    }
+
+    auto decimalsForStep = [](double step) -> int {
+        if (!(step > 0.0) || !std::isfinite(step)) return 8;
+        QString s = QString::number(step, 'f', 12);
+        s = s.trimmed();
+        while (s.contains(QLatin1Char('.')) && s.endsWith(QLatin1Char('0'))) s.chop(1);
+        if (s.endsWith(QLatin1Char('.'))) s.chop(1);
+        const int dot = s.indexOf(QLatin1Char('.'));
+        return dot >= 0 ? (s.size() - dot - 1) : 0;
+    };
+    auto floorToStep = [](double v, double step) -> double {
+        if (!(step > 0.0) || !std::isfinite(v) || !std::isfinite(step)) return v;
+        const double n = std::floor((v / step) + 1e-12);
+        return std::max(0.0, n * step);
+    };
+    auto roundToStep = [](double v, double step) -> double {
+        if (!(step > 0.0) || !std::isfinite(v) || !std::isfinite(step)) return v;
+        const double n = std::round(v / step);
+        return std::max(0.0, n * step);
+    };
+
+    const double tick = meta.tickSize > 0.0 ? meta.tickSize : 1e-12;
+    const double step = meta.stepSize > 0.0 ? meta.stepSize : 1e-12;
+
+    double price = roundToStep(order.price, tick);
+    double qty = floorToStep(order.quantityBase, step);
+
+    if (!(price > 0.0) || !(qty > 0.0)) {
+        emit orderFailed(ctx.accountName, sym, tr("Invalid price or quantity"));
+        return;
+    }
+    if (meta.minQty > 0.0 && qty + 1e-12 < meta.minQty) {
+        emit orderFailed(ctx.accountName,
+                         sym,
+                         tr("Order size too small (minQty=%1 step=%2)")
+                             .arg(meta.minQty, 0, 'f', decimalsForStep(step))
+                             .arg(step, 0, 'f', decimalsForStep(step)));
+        return;
+    }
+    if (meta.minNotional > 0.0) {
+        const double notional = price * qty;
+        if (notional + 1e-12 < meta.minNotional) {
+            emit orderFailed(ctx.accountName,
+                             sym,
+                             tr("Order notional too small (minNotional=%1)")
+                                 .arg(meta.minNotional, 0, 'f', 8));
+            return;
+        }
+    }
+
+    const int priceDec = std::clamp(decimalsForStep(tick), 0, 12);
+    const int qtyDec = std::clamp(decimalsForStep(step), 0, 12);
+
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("symbol"), sym);
+    query.addQueryItem(QStringLiteral("side"),
+                       order.side == OrderSide::Buy ? QStringLiteral("BUY") : QStringLiteral("SELL"));
+    query.addQueryItem(QStringLiteral("type"), QStringLiteral("LIMIT"));
+    query.addQueryItem(QStringLiteral("timeInForce"), QStringLiteral("GTC"));
+    query.addQueryItem(QStringLiteral("price"),
+                       trimDecimalZeros(QString::number(price, 'f', priceDec)));
+    query.addQueryItem(QStringLiteral("quantity"),
+                       trimDecimalZeros(QString::number(qty, 'f', qtyDec)));
+    query.addQueryItem(QStringLiteral("recvWindow"), QStringLiteral("5000"));
+    query.addQueryItem(QStringLiteral("timestamp"),
+                       QString::number(QDateTime::currentMSecsSinceEpoch()));
+
+    QUrlQuery signedQuery = query;
+    signedQuery.addQueryItem(QStringLiteral("signature"),
+                             QString::fromLatin1(signPayload(query, ctx)));
+
+    QNetworkRequest request = makePrivateRequest(QStringLiteral("/api/v3/order"),
+                                                 signedQuery,
+                                                 QByteArray(),
+                                                 ctx);
+    auto *reply = ensureMexcNetwork(ctx)->post(request, QByteArray());
+    connect(reply,
+            &QNetworkReply::finished,
+            this,
+            [this, reply, sym, side = order.side, price, qty, ctxPtr = &ctx]() {
+                const QNetworkReply::NetworkError err = reply->error();
+                const int status =
+                    reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                const QByteArray raw = reply->readAll();
+                reply->deleteLater();
+                if (err != QNetworkReply::NoError || status >= 400) {
+                    QString msg = reply->errorString();
+                    if (status >= 400) {
+                        msg = QStringLiteral("HTTP %1: %2")
+                                  .arg(status)
+                                  .arg(QString::fromUtf8(raw));
+                    }
+                    emit orderFailed(ctxPtr->accountName, sym, msg);
+                    emit logMessage(QStringLiteral("%1 Order error: %2")
+                                        .arg(contextTag(ctxPtr->accountName), msg));
+                    return;
+                }
+                emit logMessage(QStringLiteral("%1 MEXC order response: %2")
+                                    .arg(contextTag(ctxPtr->accountName),
+                                         raw.isEmpty() ? QStringLiteral("<empty>")
+                                                       : QString::fromUtf8(raw)));
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                if (doc.isNull() || !doc.isObject()) {
+                    emit orderFailed(ctxPtr->accountName, sym, tr("Invalid response"));
+                    return;
+                }
+                const QJsonObject obj = doc.object();
+                if (obj.contains(QStringLiteral("code"))
+                    && obj.value(QStringLiteral("code")).toInt(0) != 0) {
+                    const QString msg = obj.value(QStringLiteral("msg"))
+                                             .toString(QStringLiteral("Unknown error"));
+                    emit orderFailed(ctxPtr->accountName, sym, msg);
+                    emit logMessage(QStringLiteral("%1 Order rejected: %2")
+                                        .arg(contextTag(ctxPtr->accountName), msg));
+                    return;
+                }
+                QString orderId = obj.value(QStringLiteral("orderId")).toVariant().toString();
+                if (orderId.isEmpty()) {
+                    orderId = obj.value(QStringLiteral("clientOrderId")).toString();
+                }
+                if (orderId.isEmpty()) {
+                    orderId = QStringLiteral("mexc_%1")
+                                  .arg(QDateTime::currentMSecsSinceEpoch());
+                }
+                emit orderPlaced(ctxPtr->accountName, sym, side, price, qty, orderId);
+                emit logMessage(QStringLiteral("%1 Order accepted: %2 %3 @ %4")
+                                    .arg(contextTag(ctxPtr->accountName))
+                                    .arg(side == OrderSide::Buy ? QStringLiteral("BUY")
+                                                                : QStringLiteral("SELL"))
+                                    .arg(qty, 0, 'f', 4)
                                     .arg(price, 0, 'f', 5));
             });
 }
@@ -6994,8 +7295,14 @@ void TradeManager::sendListenKeyKeepAlive(Context &ctx)
     }
     QUrlQuery query;
     query.addQueryItem(QStringLiteral("listenKey"), ctx.listenKey);
+    query.addQueryItem(QStringLiteral("timestamp"),
+                       QString::number(QDateTime::currentMSecsSinceEpoch()));
+    query.addQueryItem(QStringLiteral("recvWindow"), QStringLiteral("5000"));
+    QUrlQuery signedQuery = query;
+    signedQuery.addQueryItem(QStringLiteral("signature"),
+                             QString::fromLatin1(signPayload(query, ctx)));
     QNetworkRequest request = makePrivateRequest(QStringLiteral("/api/v3/userDataStream"),
-                                                 query,
+                                                 signedQuery,
                                                  QByteArray(),
                                                  ctx);
     auto *reply = ensureMexcNetwork(ctx)->put(request, QByteArray());
@@ -7064,7 +7371,7 @@ void TradeManager::fetchOpenOrders(Context &ctx)
                                              signedQuery,
                                              QByteArray(),
                                              ctx);
-    auto *reply = ensureLighterNetwork(ctx)->get(req);
+    auto *reply = ensureMexcNetwork(ctx)->get(req);
     connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr = &ctx]() {
         ctxPtr->openOrdersPending = false;
         const auto err = reply->error();
@@ -8748,33 +9055,40 @@ void TradeManager::processPrivateOrder(Context &ctx,
     } else if (event.tradeType == 2) {
         side = OrderSide::Sell;
     }
-    if (!orderId.isEmpty() && !normalizedSym.isEmpty()) {
-        const double price = event.price;
-        double remain = event.remainQuantity;
-        if (remain <= 0.0 && event.quantity > 0.0) {
-            remain = event.quantity;
-        }
-        const double notional = price > 0.0 && remain > 0.0 ? price * remain : 0.0;
-        if (notional > 0.0 || event.status == 0 || event.status == 1) {
-            OrderRecord record;
-            record.symbol = normalizedSym;
-            record.side = side;
-            record.price = price;
-            record.quantityNotional =
-                notional > 0.0 ? notional : std::abs(price * std::max(remain, 0.0));
-            record.createdMs =
-                event.createTime > 0 ? event.createTime : QDateTime::currentMSecsSinceEpoch();
-            record.orderId = orderId;
-            ctx.activeOrders.insert(orderId, record);
-        } else {
-            ctx.activeOrders.remove(orderId);
-        }
-        emitLocalOrderSnapshot(ctx, normalizedSym);
-    }
     const bool isTerminalStatus = event.status == 2
                                   || event.status == 3
                                   || event.status == 4
                                   || event.status == 5;
+    if (!orderId.isEmpty() && !normalizedSym.isEmpty()) {
+        if (isTerminalStatus) {
+            // Critical: remove terminal orders from activeOrders. Otherwise they can "resurrect"
+            // after cancel/fill when we emit snapshots or when a late WS update arrives.
+            ctx.activeOrders.remove(orderId);
+            emitLocalOrderSnapshot(ctx, normalizedSym);
+        } else {
+            const double price = event.price;
+            double remain = event.remainQuantity;
+            if (remain <= 0.0 && event.quantity > 0.0) {
+                remain = event.quantity;
+            }
+            const double notional = price > 0.0 && remain > 0.0 ? price * remain : 0.0;
+            if (notional > 0.0 || event.status == 0 || event.status == 1) {
+                OrderRecord record;
+                record.symbol = normalizedSym;
+                record.side = side;
+                record.price = price;
+                record.quantityNotional =
+                    notional > 0.0 ? notional : std::abs(price * std::max(remain, 0.0));
+                record.createdMs =
+                    event.createTime > 0 ? event.createTime : QDateTime::currentMSecsSinceEpoch();
+                record.orderId = orderId;
+                ctx.activeOrders.insert(orderId, record);
+            } else {
+                ctx.activeOrders.remove(orderId);
+            }
+            emitLocalOrderSnapshot(ctx, normalizedSym);
+        }
+    }
     if (isTerminalStatus) {
         ctx.pendingCancelSymbols.remove(normalizedSym);
         emit orderCanceled(ctx.accountName, normalizedSym, side, event.price, orderId);

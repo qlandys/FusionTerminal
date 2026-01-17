@@ -550,6 +550,7 @@ private:
     QSet<QString> m_apiOffSymbols;
     QSet<QString> m_mexcFuturesApiOff;
     QSet<QString> m_lighterApiOff;
+    QHash<ConnectionStore::Profile, TradeManager::ConnectionState> m_lastConnStateByProfile;
     int m_levels;
     QVector<QVector<SavedColumn>> m_savedLayout;
     QNetworkAccessManager m_symbolFetcher;

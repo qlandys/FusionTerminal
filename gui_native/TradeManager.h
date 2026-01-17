@@ -144,6 +144,21 @@ private:
         OrderSide side = OrderSide::Buy;
         int leverage = 0;
     };
+
+    struct SpotSymbolMeta {
+        double minQty = 0.0;
+        double stepSize = 0.0;
+        double tickSize = 0.0;
+        double minNotional = 0.0; // quote notional constraint (if provided by exchange)
+        bool valid() const { return stepSize > 0.0 && tickSize > 0.0; }
+    };
+
+    struct PendingSpotOrder {
+        QString symbol;
+        double price = 0.0;
+        double quantityBase = 0.0; // base asset qty from UI
+        OrderSide side = OrderSide::Buy;
+    };
     struct Context {
         enum class LighterStopKind : quint8 {
             Unknown = 0,
@@ -221,6 +236,10 @@ private:
         QHash<QString, FuturesContractMeta> futuresContractMeta; // symbol -> meta
         QSet<QString> futuresContractMetaInFlight;
         QHash<QString, QVector<PendingFuturesOrder>> pendingFuturesOrders; // symbol -> queued orders until meta fetched
+
+        QHash<QString, SpotSymbolMeta> spotSymbolMeta; // symbol -> meta
+        QSet<QString> spotSymbolMetaInFlight;
+        QHash<QString, QVector<PendingSpotOrder>> pendingSpotOrders; // symbol -> queued orders until meta fetched
 
         QHash<QString, BalanceState> balances; // asset -> available/locked
         QHash<QString, double> realizedPnl; // asset -> pnl sum (realized)
@@ -345,6 +364,10 @@ private:
     void submitMexcFuturesOrder(Context &ctx,
                                 const PendingFuturesOrder &order,
                                 const FuturesContractMeta &meta);
+    void ensureMexcSpotSymbolMeta(Context &ctx, const QString &symbolUpper);
+    void submitMexcSpotOrder(Context &ctx,
+                             const PendingSpotOrder &order,
+                             const SpotSymbolMeta &meta);
     void placeMexcFuturesOrder(Context &ctx,
                                const QString &symbol,
                                double price,

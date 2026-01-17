@@ -843,9 +843,18 @@ void LadderClient::restart(const QString &symbol, int levels, const QString &exc
     m_stopRequested = true;
     m_symbol = symbol;
     m_levels = levels;
-    m_cacheLevels = std::max(m_levels, 10000);
     if (!exchange.isEmpty()) {
         m_exchange = exchange;
+    }
+    if (m_exchange == QStringLiteral("mexc") || m_exchange == QStringLiteral("mexc_futures")) {
+        // Prevent huge startup ladders (e.g. 4500) that generate multi‑MB JSON and stall parsing/painting.
+        // MEXC streams are already heavy; cap visible levels for stability/performance.
+        m_levels = std::min(m_levels, 1500);
+    }
+    if (m_exchange == QStringLiteral("mexc") || m_exchange == QStringLiteral("mexc_futures")) {
+        m_cacheLevels = std::max(m_levels, 6000);
+    } else {
+        m_cacheLevels = std::max(m_levels, 10000);
     }
     m_lastTickSize = 0.0;
     m_bestBid = 0.0;
@@ -917,16 +926,35 @@ void LadderClient::restart(const QString &symbol, int levels, const QString &exc
     }
 
     QStringList args;
-    const int fullDepthLevels = std::max(m_levels, 10000);
+    int fullDepthLevels = std::max(m_levels, 10000);
+    if (m_exchange == QStringLiteral("mexc") || m_exchange == QStringLiteral("mexc_futures")) {
+        // MEXC depth streams can be very chatty; keeping an enormous cache window increases
+        // CPU/memory pressure for both backend and GUI without much benefit.
+        fullDepthLevels = std::max(m_levels, 6000);
+    }
     args << "--symbol" << wireSymbol
          << "--ladder-levels" << QString::number(m_levels)
          << "--cache-levels" << QString::number(fullDepthLevels);
+
+    // Reduce backend stdout churn for heavy exchanges (prevents parse backlog and watchdog restarts).
+    // MEXC sends frequent depth updates; emitting a full ladder too often overwhelms the GUI.
+    if (m_exchange == QStringLiteral("mexc") || m_exchange == QStringLiteral("mexc_futures")) {
+        args << "--throttle-ms" << QString::number(150);
+    }
+    if (m_exchange == QStringLiteral("mexc")) {
+        // MEXC spot WS is protobuf-only; keep REST polling as an optional fallback.
+        args << "--mexc-spot-mode" << QStringLiteral("pbws");
+        args << "--mexc-interval-ms" << QString::number(100);
+        args << "--mexc-spot-poll-ms" << QString::number(250);
+    }
     if (!m_exchange.isEmpty()) {
         args << "--exchange" << m_exchange;
     }
     QString proxyRaw = m_proxy.trimmed();
     QString type = m_proxyType.trimmed().toLower();
     bool systemProxyResolved = false;
+    const bool forceNoProxy =
+        (type == QStringLiteral("none") || type == QStringLiteral("direct") || type == QStringLiteral("no"));
     if (proxyRaw.isEmpty()) {
         // Match GUI behavior: empty field => use Windows system proxy settings.
         // Backend can't consume "system", so we resolve it into host:port here.
@@ -934,10 +962,14 @@ void LadderClient::restart(const QString &symbol, int levels, const QString &exc
             (m_exchange.trimmed().toLower().contains(QStringLiteral("lighter")))
                 ? QUrl(QStringLiteral("https://mainnet.zklighter.elliot.ai/"))
                 : QUrl(QStringLiteral("https://www.google.com/generate_204"));
-        systemProxyResolved = resolveSystemProxyForUrl(queryUrl, type, proxyRaw);
+        if (!forceNoProxy) {
+            systemProxyResolved = resolveSystemProxyForUrl(queryUrl, type, proxyRaw);
+        }
     }
 
-    if (!proxyRaw.isEmpty()) {
+    if (forceNoProxy) {
+        args << "--no-proxy";
+    } else if (!proxyRaw.isEmpty()) {
         if (!type.isEmpty()) {
             args << "--proxy-type" << type;
         }
@@ -1123,7 +1155,14 @@ DomSnapshot LadderClient::snapshotForRange(qint64 minTick, qint64 maxTick) const
 
 void LadderClient::handleReadyRead()
 {
-    m_buffer += m_process.readAllStandardOutput();
+    const QByteArray chunk = m_process.readAllStandardOutput();
+    if (!chunk.isEmpty()) {
+        // Treat raw backend output as liveness, even if parsing is still queued.
+        // This prevents watchdog restart loops when a large ladder line (or a burst)
+        // takes longer than the watchdog interval to parse on the GUI side.
+        m_lastUpdateMs = QDateTime::currentMSecsSinceEpoch();
+    }
+    m_buffer += chunk;
     int idx = -1;
     while ((idx = m_buffer.indexOf('\n')) != -1) {
         QByteArray line = m_buffer.left(idx);
@@ -1158,6 +1197,11 @@ void LadderClient::handleReadyReadStderr()
     if (raw.isEmpty()) {
         return;
     }
+    // Count backend stderr as liveness too. Some exchanges (notably MEXC spot protobuf WS)
+    // can spend a while loading snapshots/exchangeInfo before emitting stdout ladders.
+    // Without this, the GUI watchdog may restart the backend mid-startup and cause
+    // long "blank ladder" periods / restart loops.
+    m_lastUpdateMs = QDateTime::currentMSecsSinceEpoch();
     const QList<QByteArray> lines = raw.split('\n');
     for (const QByteArray &line : lines) {
         const QByteArray trimmed = line.trimmed();
@@ -1187,6 +1231,14 @@ void LadderClient::handleErrorOccurred(QProcess::ProcessError error)
 {
     m_lastProcessError = error;
     m_lastProcessErrorString = m_process.errorString();
+    if (error == QProcess::Crashed && (m_restartInProgress || m_stopRequested)) {
+        // QProcess reports CrashExit when we terminate the backend during restart/stop.
+        // Treat that as expected and avoid noisy "crashed" logs.
+        logBackendEvent(QStringLiteral("errorOccurred(expected) code=%1 msg=%2")
+                            .arg(static_cast<int>(error))
+                            .arg(m_lastProcessErrorString));
+        return;
+    }
     qWarning() << "[LadderClient] backend error" << error << m_lastProcessErrorString;
     logBackendEvent(QStringLiteral("errorOccurred code=%1 msg=%2")
                         .arg(static_cast<int>(error))
@@ -1206,15 +1258,15 @@ void LadderClient::handleFinished(int exitCode, QProcess::ExitStatus status)
 {
     m_lastExitCode = exitCode;
     m_lastExitStatus = status;
-    qWarning() << "[LadderClient] backend finished" << exitCode << status;
     logBackendEvent(QStringLiteral("finished exitCode=%1 exitStatus=%2")
                         .arg(exitCode)
                         .arg(status == QProcess::CrashExit ? QStringLiteral("CrashExit") : QStringLiteral("NormalExit")));
-    if (m_restartInProgress) {
-        // Restart already started another process; don't notify and don't chain-restart.
+    if (m_restartInProgress || m_stopRequested) {
+        // Terminated intentionally during restart/stop; don't notify and don't chain-restart.
         m_watchdogTimer.stop();
         return;
     }
+    qWarning() << "[LadderClient] backend finished" << exitCode << status;
     if (status == QProcess::CrashExit && !m_stopRequested) {
         emitStatus(formatCrashSummary(exitCode, status));
     } else {

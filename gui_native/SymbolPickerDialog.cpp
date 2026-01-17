@@ -17,6 +17,9 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
+#include <QClipboard>
+#include <QCursor>
+#include <QGuiApplication>
 #include <QRegularExpression>
 #include <QScrollBar>
 #include <QSignalBlocker>
@@ -24,7 +27,10 @@
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStyle>
+#include <QShortcut>
 #include <QTableView>
+#include <QTimer>
+#include <QToolTip>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QStyledItemDelegate>
@@ -204,6 +210,44 @@ SymbolPickerDialog::SymbolPickerDialog(QWidget *parent)
             &QListWidget::itemSelectionChanged,
             this,
             &SymbolPickerDialog::handleGroupChanged);
+
+    auto *copyShortcut = new QShortcut(QKeySequence::Copy, this);
+    copyShortcut->setContext(Qt::WindowShortcut);
+    connect(copyShortcut, &QShortcut::activated, this, [this]() {
+        // Preserve normal Ctrl+C behavior in the search box.
+        QWidget *focus = QGuiApplication::focusObject() ? qobject_cast<QWidget *>(QGuiApplication::focusObject()) : nullptr;
+        if (!focus) {
+            focus = focusWidget();
+        }
+        if (auto *edit = qobject_cast<QLineEdit *>(focus)) {
+            if (edit->hasSelectedText()) {
+                edit->copy();
+                return;
+            }
+        }
+
+        int row = -1;
+        const QModelIndex current = m_tableView->currentIndex();
+        if (current.isValid()) {
+            row = current.row();
+        } else if (m_hoverRow >= 0) {
+            row = m_hoverRow;
+        }
+        if (row < 0) {
+            return;
+        }
+        const QModelIndex symIdx = m_proxy->index(row, 1);
+        if (!symIdx.isValid()) {
+            return;
+        }
+        const QString sym = symIdx.data().toString().trimmed().toUpper();
+        if (sym.isEmpty()) {
+            return;
+        }
+        QGuiApplication::clipboard()->setText(sym, QClipboard::Clipboard);
+        QToolTip::showText(QCursor::pos(), tr("Copied: %1").arg(sym), this);
+        QTimer::singleShot(900, this, []() { QToolTip::hideText(); });
+    });
 
     // Always seed the list with defaults so the picker never "loses" venues,
     // even if the caller hasn't provided accounts yet.

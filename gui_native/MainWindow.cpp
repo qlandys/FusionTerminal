@@ -3848,6 +3848,16 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     prints->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
     prints->setProperty("domContainerPtr",
                         QVariant::fromValue<quintptr>(reinterpret_cast<quintptr>(column)));
+    {
+        // Restore per-ticker cluster window (same persistence model as notional presets).
+        const QString clusterKey =
+            normalizedAccountKey(result.accountName) + QLatin1Char('|') + normalizedSymbolKey(result.symbol);
+        const int ms = m_clusterWindowMsByKey.value(clusterKey, -1);
+        if (ms > 0) {
+            prints->setClusterWindowMs(ms);
+        }
+    }
+    connect(prints, &PrintsWidget::clusterLabelChanged, this, &MainWindow::handlePrintsClusterLabelChanged);
 
     auto *printsWrap = new QWidget(column);
     printsWrap->setProperty("domContainerPtr",
@@ -6230,6 +6240,38 @@ void MainWindow::updatePositionOverlay(DomColumn &col, const TradePosition &posi
     });
 }
 
+void MainWindow::handlePrintsClusterLabelChanged(const QString &label)
+{
+    Q_UNUSED(label);
+    auto *prints = qobject_cast<PrintsWidget *>(sender());
+    if (!prints) {
+        return;
+    }
+    DomColumn *column = nullptr;
+    for (auto &tab : m_tabs) {
+        for (auto &col : tab.columnsData) {
+            if (col.prints == prints) {
+                column = &col;
+                break;
+            }
+        }
+        if (column) {
+            break;
+        }
+    }
+    if (!column) {
+        return;
+    }
+
+    const QString key =
+        normalizedAccountKey(column->accountName) + QLatin1Char('|') + normalizedSymbolKey(column->symbol);
+    const int ms = std::clamp(prints->clusterWindowMs(), 100, 86400000);
+    if (!key.trimmed().isEmpty()) {
+        m_clusterWindowMsByKey.insert(key, ms);
+        scheduleSaveUserSettings(250);
+    }
+}
+
 void MainWindow::repositionPositionOverlay(DomColumn &col)
 {
     if (!col.positionOverlay) {
@@ -6989,6 +7031,12 @@ void MainWindow::handleConnectionStateChanged(ConnectionStore::Profile profile,
 {
     auto profileLabel = [profile]() {
         switch (profile) {
+        case ConnectionStore::Profile::BinanceSpot:
+            return QStringLiteral("Binance Spot");
+        case ConnectionStore::Profile::BinanceFutures:
+            return QStringLiteral("Binance Futures");
+        case ConnectionStore::Profile::Lighter:
+            return QStringLiteral("Lighter");
         case ConnectionStore::Profile::MexcFutures:
             return QStringLiteral("MEXC Futures");
         case ConnectionStore::Profile::UzxSwap:
@@ -7020,6 +7068,59 @@ void MainWindow::handleConnectionStateChanged(ConnectionStore::Profile profile,
                                  ? QStringLiteral("%1: %2").arg(profileLabel(), message)
                                  : tr("%1 connection lost").arg(profileLabel());
         addNotification(note);
+    }
+
+    // Keep symbol pickers in sync: show only currently online venues.
+    auto isProfileOnline = [this](ConnectionStore::Profile p) {
+        return m_lastConnStateByProfile.value(p, TradeManager::ConnectionState::Disconnected)
+               == TradeManager::ConnectionState::Connected;
+    };
+    auto isSourceOnline = [&](SymbolSource src) {
+        switch (src) {
+        case SymbolSource::Mexc:
+            return isProfileOnline(ConnectionStore::Profile::MexcSpot);
+        case SymbolSource::MexcFutures:
+            return isProfileOnline(ConnectionStore::Profile::MexcFutures);
+        case SymbolSource::UzxSpot:
+            return isProfileOnline(ConnectionStore::Profile::UzxSpot);
+        case SymbolSource::UzxSwap:
+            return isProfileOnline(ConnectionStore::Profile::UzxSwap);
+        case SymbolSource::BinanceSpot:
+            return isProfileOnline(ConnectionStore::Profile::BinanceSpot);
+        case SymbolSource::BinanceFutures:
+            return isProfileOnline(ConnectionStore::Profile::BinanceFutures);
+        case SymbolSource::Lighter:
+            return isProfileOnline(ConnectionStore::Profile::Lighter);
+        }
+        return false;
+    };
+    QVector<QPair<QString, QColor>> onlineAccounts;
+    onlineAccounts.reserve(m_accountColors.size());
+    for (auto it = m_accountColors.constBegin(); it != m_accountColors.constEnd(); ++it) {
+        if (isSourceOnline(symbolSourceForAccount(it.key()))) {
+            onlineAccounts.push_back({it.key(), it.value()});
+        }
+    }
+    for (int i = m_symbolPickers.size() - 1; i >= 0; --i) {
+        SymbolPickerDialog *dlg = m_symbolPickers.at(i).data();
+        if (!dlg) {
+            m_symbolPickers.removeAt(i);
+            continue;
+        }
+        dlg->setAccounts(onlineAccounts);
+        if (!onlineAccounts.isEmpty()) {
+            const QString cur = dlg->selectedAccount().trimmed();
+            bool exists = false;
+            for (const auto &pair : onlineAccounts) {
+                if (pair.first.trimmed().compare(cur, Qt::CaseInsensitive) == 0) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                dlg->setCurrentAccount(onlineAccounts.front().first);
+            }
+        }
     }
 }
 
@@ -11669,6 +11770,26 @@ void MainWindow::loadUserSettings()
     }
     s.endGroup();
 
+    m_clusterWindowMsByKey.clear();
+    s.beginGroup(QStringLiteral("clusterWindows"));
+    const QStringList clusterKeys = s.childKeys();
+    for (const QString &encodedKey : clusterKeys) {
+        const QString rawKey = decodeSettingsKey(encodedKey);
+        if (rawKey.isEmpty()) {
+            continue;
+        }
+        const int ms = s.value(encodedKey, 1000).toInt();
+        const int clamped = std::clamp(ms, 100, 86400000);
+        const QStringList keyParts = rawKey.split(QLatin1Char('|'));
+        if (keyParts.size() == 2) {
+            const QString normalized = makeNotionalPresetKey(keyParts[0], keyParts[1]);
+            m_clusterWindowMsByKey.insert(normalized, clamped);
+        } else {
+            m_clusterWindowMsByKey.insert(rawKey, clamped);
+        }
+    }
+    s.endGroup();
+
     s.beginGroup(QStringLiteral("symbols"));
     const QStringList savedSymbols = s.value(QStringLiteral("list")).toStringList();
     if (!savedSymbols.isEmpty()) {
@@ -11862,6 +11983,19 @@ void MainWindow::saveUserSettings() const
             values << QString::number(v, 'g', 12);
         }
         s.setValue(encodedKey, values);
+    }
+    s.endGroup();
+
+    s.beginGroup(QStringLiteral("clusterWindows"));
+    s.remove(QString());
+    for (auto it = m_clusterWindowMsByKey.constBegin(); it != m_clusterWindowMsByKey.constEnd(); ++it) {
+        const QString rawKey = makeNotionalPresetKey(it.key().section(QLatin1Char('|'), 0, 0),
+                                                     it.key().section(QLatin1Char('|'), 1));
+        const QString encodedKey = encodeSettingsKey(rawKey);
+        if (encodedKey.isEmpty()) {
+            continue;
+        }
+        s.setValue(encodedKey, std::clamp(it.value(), 100, 86400000));
     }
     s.endGroup();
 
@@ -15058,56 +15192,89 @@ SymbolPickerDialog *MainWindow::createSymbolPicker(const QString &title,
         dlg->setWindowTitle(t);
     }
     // Если по какой-то причине api-off внезапно содержит почти все тикеры, не красим всё подряд.
+    auto isProfileOnline = [this](ConnectionStore::Profile p) {
+        return m_lastConnStateByProfile.value(p, TradeManager::ConnectionState::Disconnected)
+               == TradeManager::ConnectionState::Connected;
+    };
+    auto isSourceOnline = [&](SymbolSource s) {
+        switch (s) {
+        case SymbolSource::Mexc:
+            return isProfileOnline(ConnectionStore::Profile::MexcSpot);
+        case SymbolSource::MexcFutures:
+            return isProfileOnline(ConnectionStore::Profile::MexcFutures);
+        case SymbolSource::UzxSpot:
+            return isProfileOnline(ConnectionStore::Profile::UzxSpot);
+        case SymbolSource::UzxSwap:
+            return isProfileOnline(ConnectionStore::Profile::UzxSwap);
+        case SymbolSource::BinanceSpot:
+            return isProfileOnline(ConnectionStore::Profile::BinanceSpot);
+        case SymbolSource::BinanceFutures:
+            return isProfileOnline(ConnectionStore::Profile::BinanceFutures);
+        case SymbolSource::Lighter:
+            return isProfileOnline(ConnectionStore::Profile::Lighter);
+        }
+        return false;
+    };
+
+    // Only show venues that are online right now.
+    QVector<QPair<QString, QColor>> accounts;
+    accounts.reserve(m_accountColors.size());
+    for (auto it = m_accountColors.constBegin(); it != m_accountColors.constEnd(); ++it) {
+        if (isSourceOnline(symbolSourceForAccount(it.key()))) {
+            accounts.push_back({it.key(), it.value()});
+        }
+    }
+
+    QString initialAccount =
+        currentAccount.isEmpty() ? QStringLiteral("MEXC Spot") : currentAccount;
+    if (!accounts.isEmpty()) {
+        bool ok = false;
+        for (const auto &pair : accounts) {
+            if (pair.first.trimmed().compare(initialAccount, Qt::CaseInsensitive) == 0) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            initialAccount = accounts.front().first;
+        }
+    }
+
     const bool apiOffLooksSuspicious =
         !m_apiOffSymbols.isEmpty() && m_apiOffSymbols.size() >= (m_symbolLibrary.size() * 8) / 10;
     const QSet<QString> apiOff = apiOffLooksSuspicious ? QSet<QString>() : m_apiOffSymbols;
-    const QString initialAccount =
-        currentAccount.isEmpty() ? QStringLiteral("MEXC Spot") : currentAccount;
+
     const SymbolSource src = symbolSourceForAccount(initialAccount);
-    applyVenueAppearance(dlg, src, initialAccount);
-    if (src == SymbolSource::Mexc) {
-        dlg->setSymbols(m_symbolLibrary, apiOff);
-    } else if (src == SymbolSource::MexcFutures && !m_mexcFuturesSymbols.isEmpty()) {
-        dlg->setSymbols(m_mexcFuturesSymbols, m_mexcFuturesApiOff);
-        dlg->setRefreshInProgress(m_mexcFuturesRequestInFlight);
-    } else if (src == SymbolSource::BinanceSpot && !m_binanceSpotSymbols.isEmpty()) {
-        dlg->setSymbols(m_binanceSpotSymbols, QSet<QString>());
-        dlg->setRefreshInProgress(m_binanceSpotRequestInFlight);
-    } else if (src == SymbolSource::BinanceFutures && !m_binanceFuturesSymbols.isEmpty()) {
-        dlg->setSymbols(m_binanceFuturesSymbols, QSet<QString>());
-        dlg->setRefreshInProgress(m_binanceFuturesRequestInFlight);
-    } else if (src == SymbolSource::Lighter && !m_lighterSymbols.isEmpty()) {
-        dlg->setSymbols(m_lighterSymbols, m_lighterApiOff);
-        dlg->setRefreshInProgress(m_lighterRequestInFlight);
-    } else if (src == SymbolSource::UzxSwap && !m_uzxSwapSymbols.isEmpty()) {
-        dlg->setSymbols(m_uzxSwapSymbols, m_uzxSwapApiOff);
-    } else if (src == SymbolSource::UzxSpot && !m_uzxSpotSymbols.isEmpty()) {
-        dlg->setSymbols(m_uzxSpotSymbols, m_uzxSpotApiOff);
+    if (accounts.isEmpty() || !isSourceOnline(src)) {
+        dlg->setSymbols(QStringList{}, QSet<QString>{});
     } else {
-        fetchSymbolLibrary(src, dlg);
+        applyVenueAppearance(dlg, src, initialAccount);
+        if (src == SymbolSource::Mexc) {
+            dlg->setSymbols(m_symbolLibrary, apiOff);
+        } else if (src == SymbolSource::MexcFutures && !m_mexcFuturesSymbols.isEmpty()) {
+            dlg->setSymbols(m_mexcFuturesSymbols, m_mexcFuturesApiOff);
+            dlg->setRefreshInProgress(m_mexcFuturesRequestInFlight);
+        } else if (src == SymbolSource::BinanceSpot && !m_binanceSpotSymbols.isEmpty()) {
+            dlg->setSymbols(m_binanceSpotSymbols, QSet<QString>());
+            dlg->setRefreshInProgress(m_binanceSpotRequestInFlight);
+        } else if (src == SymbolSource::BinanceFutures && !m_binanceFuturesSymbols.isEmpty()) {
+            dlg->setSymbols(m_binanceFuturesSymbols, QSet<QString>());
+            dlg->setRefreshInProgress(m_binanceFuturesRequestInFlight);
+        } else if (src == SymbolSource::Lighter && !m_lighterSymbols.isEmpty()) {
+            dlg->setSymbols(m_lighterSymbols, m_lighterApiOff);
+            dlg->setRefreshInProgress(m_lighterRequestInFlight);
+        } else if (src == SymbolSource::UzxSwap && !m_uzxSwapSymbols.isEmpty()) {
+            dlg->setSymbols(m_uzxSwapSymbols, m_uzxSwapApiOff);
+        } else if (src == SymbolSource::UzxSpot && !m_uzxSpotSymbols.isEmpty()) {
+            dlg->setSymbols(m_uzxSpotSymbols, m_uzxSpotApiOff);
+        } else {
+            fetchSymbolLibrary(src, dlg);
+        }
     }
 
-    QVector<QPair<QString, QColor>> accounts;
-    QSet<QString> seen;
-    for (auto it = m_accountColors.constBegin(); it != m_accountColors.constEnd(); ++it) {
-        accounts.push_back({it.key(), it.value()});
-        seen.insert(it.key().toLower());
-    }
-    auto ensureAccount = [&](const QString &name, const QColor &fallback) {
-        if (seen.contains(name.toLower())) return;
-        accounts.push_back({name, fallback});
-        seen.insert(name.toLower());
-    };
-    ensureAccount(QStringLiteral("MEXC Spot"), QColor("#4c9fff"));
-    ensureAccount(QStringLiteral("MEXC Futures"), QColor("#f5b642"));
-    ensureAccount(QStringLiteral("UZX Spot"), QColor("#8bc34a"));
-    ensureAccount(QStringLiteral("UZX Swap"), QColor("#ff7f50"));
-    ensureAccount(QStringLiteral("Binance Spot"), QColor("#f0b90b"));
-    ensureAccount(QStringLiteral("Binance Futures"), QColor("#f5b642"));
-    ensureAccount(QStringLiteral("Lighter"), QColor("#38bdf8"));
     dlg->setAccounts(accounts);
-    dlg->setCurrentSymbol(currentSymbol);
     dlg->setCurrentAccount(initialAccount);
+    dlg->setCurrentSymbol(currentSymbol);
     trackSymbolPicker(dlg);
     if ((src == SymbolSource::Mexc && m_symbolRequestInFlight)
         || (src == SymbolSource::MexcFutures && m_mexcFuturesRequestInFlight)
@@ -15361,6 +15528,14 @@ void MainWindow::applySymbolToColumn(DomColumn &col,
         }
     }
     refreshNotionalOverlay();
+
+    if (col.prints) {
+        const QString clusterKey = normalizedAccountKey(col.accountName) + QLatin1Char('|') + normalizedSymbolKey(col.symbol);
+        const int ms = m_clusterWindowMsByKey.value(clusterKey, -1);
+        if (ms > 0) {
+            col.prints->setClusterWindowMs(ms);
+        }
+    }
 
     col.hasBuffer = false;
     col.bufferMinTick = 0;

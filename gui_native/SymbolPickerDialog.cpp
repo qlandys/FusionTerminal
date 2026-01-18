@@ -249,9 +249,8 @@ SymbolPickerDialog::SymbolPickerDialog(QWidget *parent)
         QTimer::singleShot(900, this, []() { QToolTip::hideText(); });
     });
 
-    // Always seed the list with defaults so the picker never "loses" venues,
-    // even if the caller hasn't provided accounts yet.
-    setAccounts({});
+    // Accounts are provided by the caller (MainWindow). We used to seed defaults here,
+    // but the app now supports showing only online venues in the picker.
 }
 
 bool SymbolPickerDialog::eventFilter(QObject *obj, QEvent *event)
@@ -349,32 +348,10 @@ void SymbolPickerDialog::setSymbols(const QStringList &symbols, const QSet<QStri
 void SymbolPickerDialog::setAccounts(const QVector<QPair<QString, QColor>> &accounts)
 {
     QSignalBlocker blocker(m_connectionsList);
+    const QString prevSelected = selectedAccount().trimmed();
     m_connectionsList->clear();
 
-    QVector<QPair<QString, QColor>> merged = accounts;
-    QSet<QString> seen;
-    for (const auto &pair : merged) {
-        seen.insert(pair.first.trimmed().toLower());
-    }
-
-    auto ensureAccount = [&](const QString &name, const QColor &color) {
-        const QString key = name.trimmed().toLower();
-        if (key.isEmpty() || seen.contains(key)) {
-            return;
-        }
-        merged.push_back({name, color});
-        seen.insert(key);
-    };
-
-    ensureAccount(QStringLiteral("MEXC Spot"), QColor("#4c9fff"));
-    ensureAccount(QStringLiteral("MEXC Futures"), QColor("#f5b642"));
-    ensureAccount(QStringLiteral("UZX Spot"), QColor("#8bc34a"));
-    ensureAccount(QStringLiteral("UZX Swap"), QColor("#ff7f50"));
-    ensureAccount(QStringLiteral("Binance Spot"), QColor("#f0b90b"));
-    ensureAccount(QStringLiteral("Binance Futures"), QColor("#f5b642"));
-    ensureAccount(QStringLiteral("Lighter"), QColor("#38bdf8"));
-
-    for (const auto &pair : merged) {
+    for (const auto &pair : accounts) {
         const QString name = pair.first;
         const QColor color = pair.second;
         QPixmap px(14, 14);
@@ -390,40 +367,15 @@ void SymbolPickerDialog::setAccounts(const QVector<QPair<QString, QColor>> &acco
         m_connectionsList->addItem(item);
     }
 
-    // Safety net: never allow the picker to drop the Binance entries.
-    // (We had reports where caller-provided account lists were incomplete.)
-    auto ensureListItem = [&](const QString &name, const QColor &color) {
-        for (int i = 0; i < m_connectionsList->count(); ++i) {
-            const QString existing = m_connectionsList->item(i)->data(Qt::UserRole).toString();
-            if (existing.trimmed().compare(name, Qt::CaseInsensitive) == 0) {
-                return;
-            }
-        }
-        QPixmap px(14, 14);
-        px.fill(Qt::transparent);
-        QPainter painter(&px);
-        painter.setRenderHint(QPainter::Antialiasing);
-        painter.setBrush(color.isValid() ? color : QColor(QStringLiteral("#4c9fff")));
-        painter.setPen(Qt::NoPen);
-        painter.drawEllipse(px.rect().adjusted(1, 1, -1, -1));
-        painter.end();
-        auto *item = new QListWidgetItem(QIcon(px), name);
-        item->setData(Qt::UserRole, name);
-        m_connectionsList->addItem(item);
-    };
-    ensureListItem(QStringLiteral("Binance Spot"), QColor("#f0b90b"));
-    ensureListItem(QStringLiteral("Binance Futures"), QColor("#f5b642"));
-
-    if (m_connectionsList->count() > 0) {
-        m_connectionsList->setCurrentRow(0);
+    QString target = prevSelected;
+    if (target.isEmpty()) {
+        target = m_selectedAccount;
     }
-    QString target = m_selectedAccount;
-    if (target.isEmpty() && !merged.isEmpty()) {
-        target = merged.first().first;
+    if (target.isEmpty() && m_connectionsList->count() > 0) {
+        target = m_connectionsList->item(0)->data(Qt::UserRole).toString();
     }
-    if (m_connectionsList->count() > 0) {
-        setCurrentAccount(target.isEmpty() ? m_connectionsList->item(0)->data(Qt::UserRole).toString()
-                                           : target);
+    if (!target.isEmpty()) {
+        setCurrentAccount(target);
     }
 }
 

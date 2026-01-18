@@ -111,6 +111,7 @@ private slots:
     void handlePrintsSltpMoveBeginRequested(const QString &kind, double originPrice);
     void handlePrintsSltpMoveCommitRequested(const QString &kind, double newPrice, double fallbackPrice);
     void handlePrintsDragPreviewPriceRequested(double price);
+    void handlePrintsClusterLabelChanged(const QString &label);
     void logLadderStatus(const QString &msg);
     void logMarkerEvent(const QString &msg);
     void updateTimeLabel();
@@ -658,6 +659,7 @@ private:
     std::array<double, 5> m_defaultNotionalPresets{{1.0, 2.5, 5.0, 10.0, 25.0}};
     QHash<QString, int> m_futuresLeverageBySymbol; // key: SYMBOL (upper), value: leverage
     QHash<QString, std::array<double, 5>> m_notionalPresetsByKey; // key: account|symbol, value: quick size presets
+    QHash<QString, int> m_clusterWindowMsByKey; // key: account|symbol, value: cluster bucket window (ms)
     bool m_notionalEditActive = false;
 
     QTimer *m_timeTimer;

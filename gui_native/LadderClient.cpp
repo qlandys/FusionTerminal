@@ -1216,8 +1216,7 @@ void LadderClient::handleReadyReadStderr()
         if (text.contains(QStringLiteral("proxy enabled:"), Qt::CaseInsensitive)
             || text.contains(QStringLiteral("lighter:"), Qt::CaseInsensitive)
             || text.contains(QStringLiteral("lighter ws"), Qt::CaseInsensitive)
-            || text.contains(QStringLiteral("lighter orderBookDetails"), Qt::CaseInsensitive)
-            || text.contains(QStringLiteral("httpGetQt failed"), Qt::CaseInsensitive)) {
+            || text.contains(QStringLiteral("lighter orderBookDetails"), Qt::CaseInsensitive)) {
             emitStatus(QStringLiteral("%1 %2").arg(formatBackendPrefix(), text));
         }
         if (!spam || !dropSpam) {

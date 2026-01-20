@@ -1135,11 +1135,50 @@ namespace
                               nullptr);
     }
 
+#if defined(ORDERBOOK_BACKEND_QT)
+    // Defined later under ORDERBOOK_BACKEND_QT.
+    std::optional<std::string> httpGetQt(const Config &cfg,
+                                         const char *host,
+                                         const std::string &path,
+                                         bool secure,
+                                         int timeoutMs);
+#endif
+
     std::optional<std::string> httpGet(const Config &cfg,
                                        const std::string& host,
                                        const std::string& pathAndQuery,
                                        bool secure)
     {
+#if defined(ORDERBOOK_BACKEND_QT)
+        // WinHTTP does not support SOCKS proxies for plain HTTP(S) requests.
+        // Use Qt network stack when the configured proxy resolves to SOCKS5.
+        {
+            const std::string raw = trimAscii(cfg.proxy);
+            if (!raw.empty() && !cfg.forceNoProxy)
+            {
+                std::string type;
+                std::string hostOut;
+                int portOut = 0;
+                std::string userOut;
+                std::string passOut;
+                std::string errOut;
+                if (parseProxyString(raw, cfg.proxyType, type, hostOut, portOut, userOut, passOut, errOut))
+                {
+                    if (type == "socks5")
+                    {
+                        static bool loggedQtHttp = false;
+                        if (!loggedQtHttp)
+                        {
+                            loggedQtHttp = true;
+                            std::cerr << "[backend] proxy socks5: using Qt for REST\n";
+                        }
+                        return httpGetQt(cfg, host.c_str(), pathAndQuery, secure, 15000);
+                    }
+                }
+            }
+        }
+#endif
+
         WinHttpHandle session = openSession(cfg);
         if (!session.valid())
         {
@@ -1367,9 +1406,6 @@ namespace
             return std::nullopt;
         }
 
-        QNetworkAccessManager nam;
-        nam.setProxy(proxy);
-
         const QString fullUrl = QStringLiteral("%1://%2%3")
                                     .arg(secure ? QStringLiteral("https") : QStringLiteral("http"),
                                          QString::fromLatin1(host),
@@ -1381,37 +1417,61 @@ namespace
             return std::nullopt;
         }
 
-        QNetworkRequest req(url);
-        req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("Ghost/1.0"));
-        req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        // Some authenticated proxies intermittently close connections during the initial handshake.
+        // Retry a couple of times on proxy errors to avoid noisy (but harmless) startup warnings.
+        static constexpr int kMaxAttempts = 3;
+        int attempt = 0;
+        QNetworkReply::NetworkError lastErr = QNetworkReply::NoError;
+        int lastStatus = 0;
+        QByteArray lastBody;
 
-        QEventLoop loop;
-        QTimer timer;
-        timer.setSingleShot(true);
-        QObject::connect(&timer, &QTimer::timeout, &loop, [&]() { loop.quit(); });
-
-        QNetworkReply *reply = nam.get(req);
-        QObject::connect(reply, &QNetworkReply::finished, &loop, [&]() { loop.quit(); });
-        timer.start(timeoutMs);
-        loop.exec();
-
-        if (!timer.isActive())
+        while (attempt < kMaxAttempts)
         {
-            reply->abort();
+            ++attempt;
+
+            QNetworkAccessManager nam;
+            nam.setProxy(proxy);
+
+            QNetworkRequest req(url);
+            req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("Ghost/1.0"));
+            req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+
+            QEventLoop loop;
+            QTimer timer;
+            timer.setSingleShot(true);
+            QObject::connect(&timer, &QTimer::timeout, &loop, [&]() { loop.quit(); });
+
+            QNetworkReply *reply = nam.get(req);
+            QObject::connect(reply, &QNetworkReply::finished, &loop, [&]() { loop.quit(); });
+            timer.start(timeoutMs);
+            loop.exec();
+
+            if (!timer.isActive())
+            {
+                reply->abort();
+            }
+
+            lastErr = reply->error();
+            lastStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            lastBody = reply->readAll();
+            reply->deleteLater();
+
+            if (lastErr == QNetworkReply::NoError && lastStatus > 0 && lastStatus < 400)
+            {
+                return lastBody.toStdString();
+            }
+
+            const int errCode = static_cast<int>(lastErr);
+            const bool proxyErr = (errCode >= 301 && errCode <= 306);
+            if (!proxyErr || attempt >= kMaxAttempts)
+            {
+                break;
+            }
         }
 
-        const auto err = reply->error();
-        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        const QByteArray body = reply->readAll();
-        reply->deleteLater();
-
-        if (err != QNetworkReply::NoError || status <= 0 || status >= 400)
-        {
-            std::cerr << "[backend] httpGetQt failed: host=" << host << " status=" << status
-                      << " err=" << static_cast<int>(err) << std::endl;
-            return std::nullopt;
-        }
-        return body.toStdString();
+        std::cerr << "[backend] httpGetQt failed: host=" << host << " status=" << lastStatus
+                  << " err=" << static_cast<int>(lastErr) << std::endl;
+        return std::nullopt;
     }
 #endif
 
@@ -5145,6 +5205,9 @@ bool runParadexWebSocketQt(const Config& config, dom::OrderBook& book)
     QWebSocket ws;
     ws.setProxy(proxy);
 
+    bool gotAnyData = false;
+    bool gotAnyBook = false;
+
     QEventLoop loop;
     QTimer watchdog;
     watchdog.setSingleShot(true);
@@ -5171,6 +5234,8 @@ bool runParadexWebSocketQt(const Config& config, dom::OrderBook& book)
 
     QObject::connect(&ws, &QWebSocket::errorOccurred, &loop, [&](QAbstractSocket::SocketError) {
         std::cerr << "[backend] paradex ws error (Qt): " << ws.errorString().toStdString() << "\n";
+        ws.close();
+        loop.quit();
     });
 
     auto emitTrade = [&](double price, double qty, bool isBuy, std::int64_t ts) {
@@ -5188,6 +5253,7 @@ bool runParadexWebSocketQt(const Config& config, dom::OrderBook& book)
 
     QObject::connect(&ws, &QWebSocket::textMessageReceived, &loop, [&](const QString& msg) {
         watchdog.start(20000);
+        gotAnyData = true;
         json j;
         try
         {
@@ -5217,6 +5283,7 @@ bool runParadexWebSocketQt(const Config& config, dom::OrderBook& book)
             {
                 return;
             }
+            gotAnyBook = true;
             std::vector<std::pair<dom::OrderBook::Tick, double>> bids;
             std::vector<std::pair<dom::OrderBook::Tick, double>> asks;
             bids.reserve(arr.size());
@@ -5285,8 +5352,17 @@ bool runParadexWebSocketQt(const Config& config, dom::OrderBook& book)
     });
 
     std::cerr << "[backend] paradex: using Qt WebSocket (proxy)\n";
+    // Arm initial watchdog in case proxy/SSL handshake never reaches `connected`.
+    watchdog.start(12000);
     ws.open(url);
     loop.exec();
+    // If Qt path couldn't receive any data, allow falling back to WinHTTP.
+    // This helps when the user selected SOCKS5 but the proxy endpoint is actually an HTTP CONNECT proxy.
+    if (!gotAnyData || !gotAnyBook)
+    {
+        std::cerr << "[backend] paradex: Qt proxy path received no data; falling back to WinHTTP\n";
+        return false;
+    }
     return true;
 }
 #endif

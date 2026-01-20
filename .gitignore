@@ -10,7 +10,7 @@ build/
 **/*.cache
 
 # Server
-server
+/server/
 server/api/fusion.db
 *.env
 *.secret
@@ -23,6 +23,9 @@ server/api/fusion.db
 
 # Local / downloaded stuff
 _tmp/
+/.tmp/
+/docs/
+/external/nlohmann/
 
 # Secrets / local configs (MUST NOT be committed)
 api_keys

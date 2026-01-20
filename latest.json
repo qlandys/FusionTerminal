@@ -1,10 +1,10 @@
 ﻿{
-    "version":  "0.1.43-a",
+    "version":  "0.1.44-a",
     "build":  1,
     "mandatory":  false,
-    "url":  "https://github.com/qlandys/FusionTerminal/releases/download/0.1.43-a/FusionTerminal-0.1.43-a.exe",
-    "sha256":  "e4fe6f0883677ca767cf4899a6e778b25c8309e30030fb9376861d869911f40f",
-    "backend_url":  "https://github.com/qlandys/FusionTerminal/releases/download/0.1.43-a/orderbook_backend.exe",
+    "url":  "https://github.com/qlandys/FusionTerminal/releases/download/0.1.44-a/FusionTerminal-0.1.44-a.exe",
+    "sha256":  "1d7bbc069281fb1592e5d9d6e76d62be9f24dbf2e8d5155a0f5382d5d2c47b32",
+    "backend_url":  "https://github.com/qlandys/FusionTerminal/releases/download/0.1.44-a/orderbook_backend.exe",
     "backend_sha256":  "bfc07693b36a9414e4fd8843b4fefe646d8d0f46bb38af639d66257d97e0e6f5",
     "notes":  [
                   "Auto-generated manifest."

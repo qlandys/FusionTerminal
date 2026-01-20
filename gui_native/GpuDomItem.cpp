@@ -347,11 +347,17 @@ QSGNode *GpuDomItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         }
 
         if (r.orderHighlight) {
+            const bool isTopOfBookRow =
+                (r.bookColor.isValid() && r.bookColor.alpha() >= 100)
+                || (r.priceBgColor.isValid() && r.priceBgColor.alpha() >= 80);
             QColor base = r.markerFillColor.isValid() && r.markerFillColor.alpha() > 0
                               ? r.markerFillColor
                               : (r.bookColor.isValid() && r.bookColor.alpha() > 0 ? r.bookColor : QColor("#ffffff"));
             base = base.toRgb();
-            base.setAlphaF(std::clamp(glowA, 0.0f, 0.25f));
+            // Make top-of-book (best bid/ask) order highlights noticeably blink.
+            // Regular levels keep a subtle glow so the UI doesn't get noisy.
+            const float a = isTopOfBookRow ? (0.06f + pulse * 0.22f) : glowA;
+            base.setAlphaF(std::clamp(a, 0.0f, 0.35f));
             const Color8 glow = toColor8(base);
             if (!safeAddRect(0, y, w, rowH, glow)) break;
         }

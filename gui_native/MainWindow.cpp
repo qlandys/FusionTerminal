@@ -1471,17 +1471,80 @@ MainWindow::MainWindow(const QString &backendPath,
                 this,
                 [this](const QString &profileKey, const MexcCredentials &) {
                     refreshAccountColors();
-                    // Proxy affects backend connectivity (orderbook_backend.exe) for Lighter in restricted regions.
+                    const QString key = profileKey.trimmed().toLower();
+
+                    // Keep TradeManager credentials in sync with ConnectionsWindow edits (proxy, baseUrl, etc).
+                    // For secrets, avoid wiping runtime-loaded keys (e.g. Lighter vault) when saveSecret=false.
+                    if (m_tradeManager) {
+                        auto apply = [&](ConnectionStore::Profile profile) {
+                            MexcCredentials next = m_connectionStore ? m_connectionStore->loadMexcCredentials(profile)
+                                                                    : MexcCredentials{};
+                            MexcCredentials cur = m_tradeManager->credentials(profile);
+                            // Always update non-secret settings.
+                            cur.proxy = next.proxy;
+                            cur.proxyType = next.proxyType;
+                            cur.baseUrl = next.baseUrl;
+                            cur.accountIndex = next.accountIndex;
+                            cur.apiKeyIndex = next.apiKeyIndex;
+                            cur.seedAddressIndex = next.seedAddressIndex;
+                            cur.preferSeedPhrase = next.preferSeedPhrase;
+                            cur.colorHex = next.colorHex;
+                            cur.label = next.label;
+                            cur.autoConnect = next.autoConnect;
+                            cur.viewOnly = next.viewOnly;
+                            cur.saveSecret = next.saveSecret;
+
+                            // Update secrets only when explicitly stored.
+                            if (next.saveSecret) {
+                                cur.apiKey = next.apiKey;
+                                cur.secretKey = next.secretKey;
+                                cur.passphrase = next.passphrase;
+                                cur.uid = next.uid;
+                                cur.seedPhrase = next.seedPhrase;
+                            } else {
+                                // Still allow updating non-empty uid without toggling saveSecret.
+                                if (!next.uid.trimmed().isEmpty()) {
+                                    cur.uid = next.uid;
+                                }
+                            }
+
+                            m_tradeManager->setCredentials(profile, cur);
+                        };
+
+                        if (key == QStringLiteral("paradex")) {
+                            apply(ConnectionStore::Profile::Paradex);
+                        } else if (key == QStringLiteral("lighter")) {
+                            apply(ConnectionStore::Profile::Lighter);
+                        } else if (key == QStringLiteral("mexcspot")) {
+                            apply(ConnectionStore::Profile::MexcSpot);
+                        } else if (key == QStringLiteral("mexcfutures")) {
+                            apply(ConnectionStore::Profile::MexcFutures);
+                        } else if (key == QStringLiteral("uzxspot")) {
+                            apply(ConnectionStore::Profile::UzxSpot);
+                        } else if (key == QStringLiteral("uzxswap")) {
+                            apply(ConnectionStore::Profile::UzxSwap);
+                        } else if (key == QStringLiteral("binancespot")) {
+                            apply(ConnectionStore::Profile::BinanceSpot);
+                        } else if (key == QStringLiteral("binancefutures")) {
+                            apply(ConnectionStore::Profile::BinanceFutures);
+                        }
+                    }
+
+                    // Proxy affects backend connectivity (orderbook_backend.exe).
                     // Push new proxy settings into active ladder clients and restart them.
-                    if (profileKey.trimmed().compare(QStringLiteral("lighter"), Qt::CaseInsensitive) != 0) {
+                    const bool affectsLadders =
+                        (key == QStringLiteral("lighter")) || (key == QStringLiteral("paradex"));
+                    if (!affectsLadders) {
                         return;
                     }
+                    const SymbolSource targetSrc =
+                        (key == QStringLiteral("paradex")) ? SymbolSource::Paradex : SymbolSource::Lighter;
                     for (auto &tab : m_tabs) {
                         for (auto &col : tab.columnsData) {
                             if (!col.client) {
                                 continue;
                             }
-                            if (symbolSourceForAccount(col.accountName) != SymbolSource::Lighter) {
+                            if (symbolSourceForAccount(col.accountName) != targetSrc) {
                                 continue;
                             }
                             restartColumnClient(col);

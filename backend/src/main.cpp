@@ -1289,9 +1289,38 @@ namespace
 #if defined(ORDERBOOK_BACKEND_QT)
     bool shouldUseQtSocks5(const Config &cfg)
     {
-        // Use Qt stack for any proxy type (HTTP/SOCKS5). WinHTTP proxy+WebSocket behavior is
-        // inconsistent across providers, especially with authentication.
-        return !trimAscii(cfg.proxy).empty();
+        // Prefer Qt WebSocket when:
+        // - SOCKS5 proxy is used (WinHTTP doesn't reliably support SOCKS for WebSockets)
+        // - HTTP proxy has no authentication (Qt is usually fine and simpler)
+        //
+        // For authenticated HTTP proxies, Qt's WebSocket proxy auth handling can be unreliable.
+        // In that case prefer WinHTTP (which supports proxy credentials).
+        const std::string raw = trimAscii(cfg.proxy);
+        if (raw.empty())
+        {
+            return false;
+        }
+
+        std::string type;
+        std::string host;
+        int port = 0;
+        std::string user;
+        std::string pass;
+        std::string err;
+        if (!parseProxyString(raw, cfg.proxyType, type, host, port, user, pass, err))
+        {
+            return false;
+        }
+        if (type == "socks5")
+        {
+            return true;
+        }
+        // HTTP proxy with auth -> WinHTTP path.
+        if (!user.empty())
+        {
+            return false;
+        }
+        return true;
     }
 
     QNetworkProxy toQtProxy(const Config &cfg, bool &outOk)

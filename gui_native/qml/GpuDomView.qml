@@ -277,12 +277,16 @@ Item {
                 property real phase: root.orderHighlightPhase
                 // Smooth pulse (0..1), aligned to the same phase timing as marker shine.
                 property real pulse: 0.5 - 0.5 * Math.cos(phase * 6.283185307179586)
+                // Book/price highlight alpha is higher on top-of-book (best bid/ask) rows.
+                // When our order sits at the best, make it noticeably blink.
+                property bool isTopOfBookRow: (rowItem.levelBookColor.a >= 0.45) || (rowItem.levelPriceBgColor.a >= 0.35)
+                property color glowColor: (rowItem.levelMarkerFillColor.a > 0.0) ? rowItem.levelMarkerFillColor : "#ffffff"
 
                 // Uniform full-row glow (no bright bands/strips).
                 Rectangle {
                     anchors.fill: parent
-                    color: "#ffffff"
-                    opacity: 0.020 + orderFx.pulse * 0.090
+                    color: orderFx.glowColor
+                    opacity: orderFx.isTopOfBookRow ? (0.060 + orderFx.pulse * 0.220) : (0.020 + orderFx.pulse * 0.090)
                 }
             }
 

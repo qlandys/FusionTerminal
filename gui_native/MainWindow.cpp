@@ -4658,6 +4658,15 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
                     percentText = QString::number(pct, 'f', std::abs(pct) >= 0.1 ? 2 : 3) + QLatin1String("%");
                 }
 
+                const bool insideSpreadNoQty =
+                    (bestBid > 0.0 && bestAsk > 0.0 && price > bestBid && price < bestAsk
+                     && !(bidQty > 0.0) && !(askQty > 0.0));
+                if (insideSpreadNoQty) {
+                    // Inside spread: percent is still useful, but there is no resting liquidity to sum.
+                    prints->setHoverInfo(row, price, percentText);
+                    return;
+                }
+
                 const double notional = std::max(bidQty, askQty) * std::abs(price);
                 const double cumulative = client ? client->cumulativeNotionalForPrice(price) : 0.0;
 
@@ -5213,8 +5222,9 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
     const bool lighterPerp = (src == SymbolSource::Lighter) && !column->symbol.contains(QLatin1Char('/'));
     const bool uzxAccount = (src == SymbolSource::UzxSwap || src == SymbolSource::UzxSpot);
     if (m_sltpPlaceHeld) {
-        if (!lighterPerp && !uzxAccount && src != SymbolSource::MexcFutures && src != SymbolSource::Mexc) {
-            statusBar()->showMessage(tr("SL/TP placement is available for Lighter Perp, UZX, MEXC Futures, and MEXC Spot"), 2200);
+        if (!lighterPerp && !uzxAccount && src != SymbolSource::MexcFutures && src != SymbolSource::Mexc
+            && src != SymbolSource::Paradex) {
+            statusBar()->showMessage(tr("SL/TP placement is available for Lighter Perp, Paradex, UZX, MEXC Futures, and MEXC Spot"), 2200);
             return;
         }
         if (price <= 0.0) {
@@ -6367,13 +6377,13 @@ void MainWindow::repositionPositionOverlay(DomColumn &col)
         return;
     }
     QWidget *vp = col.scrollArea->viewport();
-    const int pad = 6;
-    const int bottomMargin = 4;
-    const int width = std::max(80, vp->width() - pad * 2);
+    const int pad = 0;
+    const int bottomMargin = 0;
+    const int width = std::max(80, vp->width());
     col.positionOverlay->setFixedWidth(width);
     col.positionOverlay->adjustSize();
     int y = vp->height() - col.positionOverlay->sizeHint().height() - bottomMargin;
-    if (y < 4) y = 4;
+    if (y < 0) y = 0;
     col.positionOverlay->move(pad, y);
     col.positionOverlay->raise();
 }
@@ -12462,15 +12472,22 @@ bool MainWindow::pullSnapshotForColumn(DomColumn &col, qint64 bottomTick, qint64
                 percentText = QString::number(pct, 'f', std::abs(pct) >= 0.1 ? 2 : 3) + QLatin1String("%");
             }
 
-            const double cumulative =
-                col.client ? col.client->cumulativeNotionalForPrice(col.hoverRayPrice) : 0.0;
+            if (bestBid > 0.0 && bestAsk > 0.0
+                && col.hoverRayPrice > bestBid
+                && col.hoverRayPrice < bestAsk) {
+                // Inside spread: keep percent, drop cumulative liquidity.
+                col.prints->setHoverInfo(-1, col.hoverRayPrice, percentText);
+            } else {
+                const double cumulative =
+                    col.client ? col.client->cumulativeNotionalForPrice(col.hoverRayPrice) : 0.0;
 
-            QStringList parts;
-            parts << percentText;
-            if (cumulative > 0.0) {
-                parts << formatValueShort(cumulative);
+                QStringList parts;
+                parts << percentText;
+                if (cumulative > 0.0) {
+                    parts << formatValueShort(cumulative);
+                }
+                col.prints->setHoverInfo(-1, col.hoverRayPrice, parts.join(QStringLiteral(" | ")));
             }
-            col.prints->setHoverInfo(-1, col.hoverRayPrice, parts.join(QStringLiteral(" | ")));
         }
     }
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();

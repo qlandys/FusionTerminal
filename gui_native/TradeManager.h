@@ -229,6 +229,7 @@ private:
         QString paradexJwt;
         QString paradexAccount;
         qint64 paradexJwtExpiresAt{0};
+        qint64 paradexLastAuthRefreshMs{0};
         bool paradexWsAuthed{false};
         bool paradexAuthInFlight{false};
         quint64 paradexAuthToken{0};
@@ -257,6 +258,10 @@ private:
         QHash<QString, LighterStopKindInfo> lighterStopKindByOrderId;
         QSet<QString> pendingCancelSymbols;
         QSet<QString> paradexPendingCancelOrderIds;
+        QHash<QString, QString> paradexSlOrderIdBySymbol;
+        QHash<QString, QString> paradexTpOrderIdBySymbol;
+        QHash<QString, double> paradexSlTriggerBySymbol;
+        QHash<QString, double> paradexTpTriggerBySymbol;
         QSet<QString> myTradesInFlight;
         QHash<QString, qint64> lastTradeIdBySymbol;
         QHash<QString, qint64> paradexLastTradeTsBySymbol;
@@ -359,6 +364,7 @@ private:
     void ensureParadexMarketMeta(Context &ctx, const QString &symbolUpper);
     void subscribeParadexPrivate(Context &ctx);
     void fetchParadexMyTrades(Context &ctx, const QString &symbolUpper);
+    void refreshParadexAuth(Context &ctx);
     void placeMexcFuturesStopPlanOrder(Context &ctx,
                                        const QString &symbol,
                                        double triggerPrice,

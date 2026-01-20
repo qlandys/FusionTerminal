@@ -51,4 +51,8 @@ const (
 const (
 	OrderTypeMarket OrderType = "MARKET"
 	OrderTypeLimit  OrderType = "LIMIT"
+	// Stop/trigger orders (execute as market when trigger fires).
+	OrderTypeStopMarket       OrderType = "STOP_MARKET"
+	OrderTypeStopLossMarket   OrderType = "STOP_LOSS_MARKET"
+	OrderTypeTakeProfitMarket OrderType = "TAKE_PROFIT_MARKET"
 )

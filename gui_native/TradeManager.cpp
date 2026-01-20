@@ -3248,7 +3248,8 @@ void TradeManager::connectToExchange(ConnectionStore::Profile profile)
                 args << QStringLiteral("--l1-address") << ethAddr.trimmed();
             }
             args << QStringLiteral("--l2-private-key-stdin");
-            args << QStringLiteral("--expiry-seconds") << QStringLiteral("300");
+            // Reduce auth churn/spam: request a longer-lived auth signature/JWT where supported.
+            args << QStringLiteral("--expiry-seconds") << QStringLiteral("3600");
 
             proc->setProgram(helperPath);
             proc->setArguments(args);
@@ -3320,6 +3321,7 @@ void TradeManager::connectToExchange(ConnectionStore::Profile profile)
                                  ctxPtr->paradexJwt = jwt;
                                  ctxPtr->paradexAccount = account;
                                  ctxPtr->paradexJwtExpiresAt = expiresAt;
+                                 ctxPtr->paradexLastAuthRefreshMs = QDateTime::currentMSecsSinceEpoch();
 
                                  setState(*ctxPtr, ConnectionState::Connecting, tr("Connecting to Paradex WS..."));
                                  emit logMessage(QStringLiteral("%1 Paradex: connecting to private WebSocket...")
@@ -6364,6 +6366,150 @@ void TradeManager::placeLighterStopOrder(const QString &symbol,
         return;
     }
 
+    if (profile == ConnectionStore::Profile::Paradex) {
+        const TradePosition pos = ctx.positions.value(sym, TradePosition{});
+        if (!pos.hasPosition || !(pos.quantity > 0.0)) {
+            emit orderFailed(ctx.accountName, sym, tr("No active position for SL/TP"));
+            return;
+        }
+        if (ctx.paradexJwt.trimmed().isEmpty() || ctx.paradexAccount.trimmed().isEmpty()) {
+            emit orderFailed(ctx.accountName, sym, tr("Not authenticated"));
+            return;
+        }
+
+        const auto metaIt = ctx.paradexMarketMeta.constFind(sym);
+        if (metaIt == ctx.paradexMarketMeta.constEnd() || !metaIt->valid()) {
+            ensureParadexMarketMeta(ctx, sym);
+            emit logMessage(QStringLiteral("%1 Paradex: loading market meta for %2...")
+                                .arg(contextTag(ctx.accountName), sym));
+            emit orderFailed(ctx.accountName, sym, tr("Paradex market meta not loaded"));
+            return;
+        }
+        const ParadexMarketMeta meta = metaIt.value();
+
+        const OrderSide closeSide = (pos.side == OrderSide::Buy) ? OrderSide::Sell : OrderSide::Buy;
+        const QString sideStr = (closeSide == OrderSide::Sell) ? QStringLiteral("SELL") : QStringLiteral("BUY");
+        const QString orderType =
+            isStopLoss ? QStringLiteral("STOP_LOSS_MARKET") : QStringLiteral("TAKE_PROFIT_MARKET");
+
+        // Trigger price tick snapping: SL should be more conservative (long: floor, short: ceil).
+        const bool longPos = (pos.side == OrderSide::Buy);
+        const bool wantFloor = (isStopLoss == longPos);
+        const double adjTrigger =
+            wantFloor ? paradexQuantizeDown(triggerPrice, meta.priceTickSize, meta.priceDecimals)
+                      : paradexQuantizeUp(triggerPrice, meta.priceTickSize, meta.priceDecimals);
+        if (!(adjTrigger > 0.0)) {
+            emit orderFailed(ctx.accountName, sym, tr("Invalid trigger price"));
+            return;
+        }
+
+        const double rawSize = pos.quantity * std::max(1.0, pos.qtyMultiplier);
+        const double adjSize = paradexQuantizeUp(rawSize, meta.orderSizeIncrement, meta.sizeDecimals);
+        if (!(adjSize > 0.0)) {
+            emit orderFailed(ctx.accountName,
+                             sym,
+                             tr("Size too small (min step %1)")
+                                 .arg(paradexFormatFixed(meta.orderSizeIncrement, meta.sizeDecimals)));
+            return;
+        }
+
+        const QString sizeStr = paradexFormatFixed(adjSize, meta.sizeDecimals);
+        const QString triggerStr = paradexFormatFixed(adjTrigger, meta.priceDecimals);
+        const QString priceStr = QStringLiteral("0");
+
+        const QString existingId = isStopLoss ? ctx.paradexSlOrderIdBySymbol.value(sym)
+                                              : ctx.paradexTpOrderIdBySymbol.value(sym);
+        if (!existingId.isEmpty()) {
+            emit logMessage(QStringLiteral("%1 Paradex cancel existing %2 stop: sym=%3 id=%4")
+                                .arg(contextTag(ctx.accountName))
+                                .arg(isStopLoss ? QStringLiteral("SL") : QStringLiteral("TP"))
+                                .arg(sym)
+                                .arg(existingId));
+            cancelOrder(sym, ctx.accountName, existingId);
+        }
+
+        if (isStopLoss) {
+            ctx.paradexSlTriggerBySymbol.insert(sym, adjTrigger);
+        } else {
+            ctx.paradexTpTriggerBySymbol.insert(sym, adjTrigger);
+        }
+        emit lighterStopOrdersUpdated(ctx.accountName,
+                                      sym,
+                                      ctx.paradexSlTriggerBySymbol.value(sym, 0.0) > 0.0,
+                                      ctx.paradexSlTriggerBySymbol.value(sym, 0.0),
+                                      ctx.paradexTpTriggerBySymbol.value(sym, 0.0) > 0.0,
+                                      ctx.paradexTpTriggerBySymbol.value(sym, 0.0));
+
+        const QString jwt = ctx.paradexJwt.trimmed();
+        Context *ctxPtr = &ctx;
+        requestParadexOrderSignature(
+            ctx,
+            sym,
+            sym,
+            sideStr,
+            orderType,
+            sizeStr,
+            priceStr,
+            [this, ctxPtr, sym, jwt, sideStr, orderType, sizeStr, triggerStr, isStopLoss](QString signature, qint64 ts, QString signErr) {
+                if (!ctxPtr) return;
+                if (!signErr.trimmed().isEmpty() || signature.trimmed().isEmpty() || ts <= 0) {
+                    emit orderFailed(ctxPtr->accountName, sym, tr("Paradex sign-order failed"));
+                    emit logMessage(QStringLiteral("%1 Paradex sign-order failed: %2")
+                                        .arg(contextTag(ctxPtr->accountName),
+                                             signErr.trimmed().isEmpty() ? QStringLiteral("empty signature") : signErr.trimmed()));
+                    return;
+                }
+
+                QJsonObject body;
+                body.insert(QStringLiteral("market"), sym);
+                body.insert(QStringLiteral("side"), sideStr);
+                body.insert(QStringLiteral("type"), orderType);
+                body.insert(QStringLiteral("size"), sizeStr);
+                body.insert(QStringLiteral("trigger_price"), triggerStr);
+                body.insert(QStringLiteral("flags"), QJsonArray{QStringLiteral("REDUCE_ONLY")});
+                body.insert(QStringLiteral("signature"), signature);
+                body.insert(QStringLiteral("signature_timestamp"), ts);
+                const QByteArray payload = QJsonDocument(body).toJson(QJsonDocument::Compact);
+
+                QUrl url(paradexHttpBase() + QStringLiteral("/orders"));
+                QNetworkRequest req(url);
+                req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+                req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+                req.setRawHeader("authorization", QByteArray("Bearer ") + jwt.toUtf8());
+                auto *reply = ensureParadexNetwork(*ctxPtr)->post(req, payload);
+                applyReplyTimeout(reply, 8000);
+                connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr, sym, isStopLoss]() {
+                    const auto nerr = reply->error();
+                    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                    const QByteArray raw = reply->readAll();
+                    const QString errStr = reply->errorString();
+                    reply->deleteLater();
+                    if (!ctxPtr) return;
+                    if (nerr != QNetworkReply::NoError || status >= 400) {
+                        emit orderFailed(ctxPtr->accountName, sym, tr("Paradex SL/TP failed"));
+                        emit logMessage(QStringLiteral("%1 Paradex SL/TP failed: %2")
+                                            .arg(contextTag(ctxPtr->accountName),
+                                                 raw.isEmpty() ? errStr : QString::fromUtf8(raw)));
+                        return;
+                    }
+                    QString orderId;
+                    const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                    if (doc.isObject()) {
+                        orderId = doc.object().value(QStringLiteral("id")).toString().trimmed();
+                    }
+                    if (!orderId.isEmpty()) {
+                        if (isStopLoss) {
+                            ctxPtr->paradexSlOrderIdBySymbol.insert(sym, orderId);
+                        } else {
+                            ctxPtr->paradexTpOrderIdBySymbol.insert(sym, orderId);
+                        }
+                    }
+                    fetchOpenOrders(*ctxPtr);
+                });
+            });
+        return;
+    }
+
     if (profile == ConnectionStore::Profile::UzxSwap
         || profile == ConnectionStore::Profile::UzxSpot) {
         const TradePosition pos = ctx.positions.value(sym, TradePosition{});
@@ -6569,7 +6715,7 @@ void TradeManager::placeLighterStopOrder(const QString &symbol,
     if (profile != ConnectionStore::Profile::Lighter) {
         emit orderFailed(ctx.accountName,
                          sym,
-                         tr("SL/TP is only supported for Lighter, UZX, MEXC Futures, or MEXC Spot"));
+                         tr("SL/TP is only supported for Lighter, Paradex, UZX, MEXC Futures, or MEXC Spot"));
         return;
     }
 
@@ -7524,6 +7670,32 @@ void TradeManager::cancelLighterStopOrders(const QString &symbol,
         } else {
             ctx.uzxTpOrderIdBySymbol.remove(sym);
         }
+        return;
+    }
+    if (profile == ConnectionStore::Profile::Paradex) {
+        const QString id = isStopLoss ? ctx.paradexSlOrderIdBySymbol.value(sym)
+                                      : ctx.paradexTpOrderIdBySymbol.value(sym);
+        if (!id.isEmpty()) {
+            emit logMessage(QStringLiteral("%1 Paradex cancel %2 stop: sym=%3 id=%4")
+                                .arg(contextTag(ctx.accountName))
+                                .arg(isStopLoss ? QStringLiteral("SL") : QStringLiteral("TP"))
+                                .arg(sym)
+                                .arg(id));
+            cancelOrder(sym, ctx.accountName, id);
+        }
+        if (isStopLoss) {
+            ctx.paradexSlOrderIdBySymbol.remove(sym);
+            ctx.paradexSlTriggerBySymbol.remove(sym);
+        } else {
+            ctx.paradexTpOrderIdBySymbol.remove(sym);
+            ctx.paradexTpTriggerBySymbol.remove(sym);
+        }
+        emit lighterStopOrdersUpdated(ctx.accountName,
+                                      sym,
+                                      ctx.paradexSlTriggerBySymbol.value(sym, 0.0) > 0.0,
+                                      ctx.paradexSlTriggerBySymbol.value(sym, 0.0),
+                                      ctx.paradexTpTriggerBySymbol.value(sym, 0.0) > 0.0,
+                                      ctx.paradexTpTriggerBySymbol.value(sym, 0.0));
         return;
     }
     if (profile == ConnectionStore::Profile::MexcFutures) {
@@ -8865,6 +9037,36 @@ void TradeManager::ensureParadexMarketMeta(Context &ctx, const QString &symbolUp
     });
 }
 
+static bool paradexLooksLikeInvalidToken(const QByteArray &raw)
+{
+    const QByteArray s = raw.trimmed();
+    if (s.isEmpty()) return false;
+    if (s.contains("INVALID_TOKEN")) return true;
+    if (s.contains("token is expired")) return true;
+    if (s.contains("token has invalid claims")) return true;
+    return false;
+}
+
+void TradeManager::refreshParadexAuth(Context &ctx)
+{
+    if (ctx.profile != ConnectionStore::Profile::Paradex) {
+        return;
+    }
+    if (ctx.paradexAuthInFlight) {
+        return;
+    }
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (ctx.paradexLastAuthRefreshMs > 0 && (nowMs - ctx.paradexLastAuthRefreshMs) < 8000) {
+        return;
+    }
+    ctx.paradexLastAuthRefreshMs = nowMs;
+    // Stop polling while we re-auth to avoid log spam.
+    if (ctx.openOrdersTimer.isActive()) {
+        ctx.openOrdersTimer.stop();
+    }
+    connectToExchange(ConnectionStore::Profile::Paradex);
+}
+
 void TradeManager::fetchParadexOpenOrders(Context &ctx)
 {
     if (ctx.openOrdersPending) {
@@ -8893,6 +9095,10 @@ void TradeManager::fetchParadexOpenOrders(Context &ctx)
         reply->deleteLater();
 
         if (err != QNetworkReply::NoError || status >= 400) {
+            if (paradexLooksLikeInvalidToken(raw)) {
+                refreshParadexAuth(*ctxPtr);
+                return;
+            }
             emit logMessage(QStringLiteral("%1 Paradex openOrders fetch failed: %2")
                                 .arg(contextTag(ctxPtr->accountName),
                                      raw.isEmpty() ? errStr : QString::fromUtf8(raw)));
@@ -8908,6 +9114,11 @@ void TradeManager::fetchParadexOpenOrders(Context &ctx)
         QSet<QString> newSymbols;
         QHash<QString, OrderRecord> fetchedOrders;
         QSet<QString> fetchedSymbols;
+        QSet<QString> sltpSeenSymbols;
+        QHash<QString, double> nextSlBySymbol;
+        QHash<QString, double> nextTpBySymbol;
+        QHash<QString, QString> nextSlIdBySymbol;
+        QHash<QString, QString> nextTpIdBySymbol;
 
         for (const auto &value : arr) {
             if (!value.isObject()) {
@@ -8922,11 +9133,49 @@ void TradeManager::fetchParadexOpenOrders(Context &ctx)
             if (orderId.isEmpty()) {
                 continue;
             }
+            const QString typeStr = order.value(QStringLiteral("type")).toString().trimmed().toUpper();
+            const QString triggerStr = order.value(QStringLiteral("trigger_price")).toString().trimmed();
+            const double triggerPx = triggerStr.toDouble();
+
             const double price = order.value(QStringLiteral("price")).toString().toDouble();
             const double remainQty = order.value(QStringLiteral("remaining_size")).toString().toDouble();
             if (!(remainQty > 0.0)) {
                 continue;
             }
+
+            const bool isStopLike = (triggerPx > 0.0) || typeStr.contains(QStringLiteral("STOP")) || typeStr.contains(QStringLiteral("TAKE_PROFIT"));
+            if (isStopLike) {
+                // Track SL/TP orders (reduce-only trigger orders).
+                sltpSeenSymbols.insert(market);
+                if (triggerPx > 0.0) {
+                    bool isStopLossOrder = typeStr.contains(QStringLiteral("STOP_LOSS"));
+                    bool isTakeProfitOrder = typeStr.contains(QStringLiteral("TAKE_PROFIT"));
+                    if (!isStopLossOrder && !isTakeProfitOrder) {
+                        // Infer from position average price when possible.
+                        const TradePosition pos = ctxPtr->positions.value(market, TradePosition{});
+                        if (pos.hasPosition && pos.averagePrice > 0.0) {
+                            const bool longPos = (pos.side == OrderSide::Buy);
+                            if (longPos) {
+                                isStopLossOrder = triggerPx < pos.averagePrice;
+                                isTakeProfitOrder = triggerPx > pos.averagePrice;
+                            } else {
+                                isStopLossOrder = triggerPx > pos.averagePrice;
+                                isTakeProfitOrder = triggerPx < pos.averagePrice;
+                            }
+                        }
+                    }
+                    if (isStopLossOrder && !nextSlBySymbol.contains(market)) {
+                        nextSlBySymbol.insert(market, triggerPx);
+                        nextSlIdBySymbol.insert(market, orderId);
+                    } else if (isTakeProfitOrder && !nextTpBySymbol.contains(market)) {
+                        nextTpBySymbol.insert(market, triggerPx);
+                        nextTpIdBySymbol.insert(market, orderId);
+                    }
+                }
+                // Don't render stop orders as yellow limit markers.
+                continue;
+            }
+
             if (!(price > 0.0)) {
                 continue;
             }
@@ -8952,6 +9201,37 @@ void TradeManager::fetchParadexOpenOrders(Context &ctx)
             if (!ctxPtr->paradexPendingCancelOrderIds.contains(orderId)) {
                 symbolMap[market].push_back(marker);
             }
+        }
+
+        // Update SL/TP state from the open orders snapshot.
+        QSet<QString> allStopSymbols = sltpSeenSymbols;
+        for (auto it = ctxPtr->paradexSlTriggerBySymbol.constBegin(); it != ctxPtr->paradexSlTriggerBySymbol.constEnd(); ++it) {
+            allStopSymbols.insert(it.key());
+        }
+        for (auto it = ctxPtr->paradexTpTriggerBySymbol.constBegin(); it != ctxPtr->paradexTpTriggerBySymbol.constEnd(); ++it) {
+            allStopSymbols.insert(it.key());
+        }
+        for (const QString &sym : allStopSymbols) {
+            const double sl = nextSlBySymbol.value(sym, 0.0);
+            const double tp = nextTpBySymbol.value(sym, 0.0);
+            const QString slId = nextSlIdBySymbol.value(sym);
+            const QString tpId = nextTpIdBySymbol.value(sym);
+
+            if (sl > 0.0) ctxPtr->paradexSlTriggerBySymbol.insert(sym, sl);
+            else ctxPtr->paradexSlTriggerBySymbol.remove(sym);
+            if (tp > 0.0) ctxPtr->paradexTpTriggerBySymbol.insert(sym, tp);
+            else ctxPtr->paradexTpTriggerBySymbol.remove(sym);
+            if (!slId.isEmpty()) ctxPtr->paradexSlOrderIdBySymbol.insert(sym, slId);
+            else ctxPtr->paradexSlOrderIdBySymbol.remove(sym);
+            if (!tpId.isEmpty()) ctxPtr->paradexTpOrderIdBySymbol.insert(sym, tpId);
+            else ctxPtr->paradexTpOrderIdBySymbol.remove(sym);
+
+            emit lighterStopOrdersUpdated(ctxPtr->accountName,
+                                          sym,
+                                          sl > 0.0,
+                                          sl,
+                                          tp > 0.0,
+                                          tp);
         }
 
         QList<OrderRecord> removedOrders;
@@ -9012,6 +9292,10 @@ void TradeManager::fetchParadexPositions(Context &ctx)
         const QString errStr = reply->errorString();
         reply->deleteLater();
         if (err != QNetworkReply::NoError || status >= 400) {
+            if (paradexLooksLikeInvalidToken(raw)) {
+                refreshParadexAuth(*ctxPtr);
+                return;
+            }
             emit logMessage(QStringLiteral("%1 Paradex positions fetch failed: %2")
                                 .arg(contextTag(ctxPtr->accountName),
                                      raw.isEmpty() ? errStr : QString::fromUtf8(raw)));

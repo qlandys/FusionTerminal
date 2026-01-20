@@ -30,6 +30,19 @@ type errOutput struct {
 	Error string `json:"error"`
 }
 
+func isSupportedOrderType(typ string) bool {
+	switch typ {
+	case string(OrderTypeLimit),
+		string(OrderTypeMarket),
+		string(OrderTypeStopMarket),
+		string(OrderTypeStopLossMarket),
+		string(OrderTypeTakeProfitMarket):
+		return true
+	default:
+		return false
+	}
+}
+
 func fatalJSON(msg string) {
 	enc := json.NewEncoder(os.Stdout)
 	_ = enc.Encode(errOutput{Error: msg})
@@ -66,7 +79,7 @@ func main() {
 	orderAccount := flag.String("account", "", "Paradex Starknet account address (0x...) for sign-order")
 	orderMarket := flag.String("market", "", "Market symbol, e.g. ETH-USD-PERP")
 	orderSide := flag.String("side", "", "BUY or SELL")
-	orderType := flag.String("order-type", "", "LIMIT or MARKET")
+	orderType := flag.String("order-type", "", "LIMIT | MARKET | STOP_MARKET | STOP_LOSS_MARKET | TAKE_PROFIT_MARKET")
 	orderSize := flag.String("size", "", "Order size (base units, decimal)")
 	orderPrice := flag.String("price", "", "Order price (decimal); for MARKET use 0 or leave empty")
 	orderTsMs := flag.Int64("timestamp-ms", 0, "Signature timestamp (ms). 0 = now")
@@ -119,13 +132,13 @@ func main() {
 		if market == "" || side == "" || typ == "" || size == "" {
 			fatalJSON("missing order params (need --market --side --order-type --size)")
 		}
-		if typ != string(OrderTypeLimit) && typ != string(OrderTypeMarket) {
-			fatalJSON("invalid --order-type (LIMIT or MARKET)")
+		if !isSupportedOrderType(typ) {
+			fatalJSON("invalid --order-type")
 		}
 		if side != string(OrderSideBuy) && side != string(OrderSideSell) {
 			fatalJSON("invalid --side (BUY or SELL)")
 		}
-		if typ == string(OrderTypeMarket) && price == "" {
+		if strings.Contains(typ, "MARKET") && price == "" {
 			price = "0"
 		}
 		if price == "" {
@@ -219,7 +232,7 @@ func main() {
 				_ = enc.Encode(resp)
 				continue
 			}
-			if typ != string(OrderTypeLimit) && typ != string(OrderTypeMarket) {
+			if !isSupportedOrderType(typ) {
 				resp.Error = "invalid orderType"
 				_ = enc.Encode(resp)
 				continue
@@ -229,7 +242,7 @@ func main() {
 				_ = enc.Encode(resp)
 				continue
 			}
-			if typ == string(OrderTypeMarket) && price == "" {
+			if strings.Contains(typ, "MARKET") && price == "" {
 				price = "0"
 			}
 			if price == "" {

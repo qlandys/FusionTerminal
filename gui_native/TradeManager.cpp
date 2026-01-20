@@ -17,6 +17,7 @@
 #include <QStringList>
 #include <QSet>
 #include <QFile>
+#include <QProcess>
 #include <QProcessEnvironment>
 #include <QDir>
 #include <QTextStream>
@@ -42,6 +43,11 @@
 #include <windows.h>
 #include <wincrypt.h>
 #endif
+
+static QString paradexHttpBase();
+static double paradexQuantizeDown(double value, double step, int decimals);
+static double paradexQuantizeUp(double value, double step, int decimals);
+static QString paradexFormatFixed(double value, int decimals);
 
 namespace {
 // Lighter HTTP endpoints are rate-limited pretty aggressively; keep baseline polling conservative
@@ -1063,6 +1069,45 @@ QString uzxBaseAsset(const QString &userSymbol)
     return wire.trimmed().toUpper();
 }
 
+static QString baseAssetFromFusedSymbol(const QString &symbol)
+{
+    QString sym = symbol.trimmed().toUpper();
+    if (sym.isEmpty()) {
+        return sym;
+    }
+    sym.remove(QLatin1Char('-'));
+    sym.remove(QLatin1Char('_'));
+    sym.remove(QLatin1Char('/'));
+    sym.remove(QLatin1Char(' '));
+
+    static const QStringList quotes = {
+        QStringLiteral("USDT"),
+        QStringLiteral("USDC"),
+        QStringLiteral("USDR"),
+        QStringLiteral("USDQ"),
+        QStringLiteral("EURQ"),
+        QStringLiteral("EURR"),
+        QStringLiteral("EUR"),
+        QStringLiteral("TRY"),
+        QStringLiteral("BTC"),
+        QStringLiteral("ETH"),
+    };
+
+    QStringList sorted = quotes;
+    std::sort(sorted.begin(), sorted.end(), [](const QString &a, const QString &b) {
+        return a.size() > b.size();
+    });
+    for (const QString &q : sorted) {
+        if (sym.endsWith(q, Qt::CaseInsensitive)) {
+            const QString base = sym.left(sym.size() - q.size());
+            if (!base.isEmpty()) {
+                return base;
+            }
+        }
+    }
+    return sym;
+}
+
 
 QString uzxErrorDescription(int code)
 {
@@ -1194,6 +1239,7 @@ void TradeManager::applyExecutedTradeMeta(Context &ctx, const QString &symbol, E
     const bool lighterPerp = (ctx.profile == ConnectionStore::Profile::Lighter) && !sym.contains(QLatin1Char('/'));
     const bool futures = (ctx.profile == ConnectionStore::Profile::MexcFutures)
                          || (ctx.profile == ConnectionStore::Profile::UzxSwap)
+                         || (ctx.profile == ConnectionStore::Profile::Paradex)
                          || lighterPerp;
     trade.isFutures = futures;
 
@@ -1555,6 +1601,244 @@ QNetworkAccessManager *TradeManager::ensureUzxNetwork(Context &ctx)
     }
 
     return ctx.uzxNetwork;
+}
+
+QNetworkAccessManager *TradeManager::ensureParadexNetwork(Context &ctx)
+{
+    if (ctx.profile != ConnectionStore::Profile::Paradex) {
+        return &m_network;
+    }
+    if (!ctx.paradexNetwork) {
+        ctx.paradexNetwork = new QNetworkAccessManager(this);
+    }
+
+    QNetworkProxy proxy;
+    QString err;
+    const QString proxyRaw = ctx.credentials.proxy.trimmed();
+    if (!parseHttpProxy(proxyRaw, ctx.credentials.proxyType, proxy, &err)) {
+        if (!proxyRaw.isEmpty()) {
+            emit logMessage(QStringLiteral("%1 Invalid proxy: %2").arg(contextTag(ctx.accountName), err));
+        }
+        proxy = QNetworkProxy(QNetworkProxy::NoProxy);
+    }
+    ctx.paradexNetwork->setProxy(proxy);
+    ctx.privateSocket.setProxy(proxy);
+
+    const QString status = proxySummaryForLog(proxy);
+    const QString logKey = QStringLiteral("paradex:%1").arg(status);
+    if (ctx.proxyStatusLog != logKey) {
+        ctx.proxyStatusLog = logKey;
+        emit logMessage(QStringLiteral("%1 Proxy: %2").arg(contextTag(ctx.accountName), status));
+    }
+    return ctx.paradexNetwork;
+}
+
+bool TradeManager::ensureParadexSigner(Context &ctx, QString &errOut)
+{
+    errOut.clear();
+    if (ctx.profile != ConnectionStore::Profile::Paradex) {
+        errOut = QStringLiteral("wrong profile");
+        return false;
+    }
+    const QString key = ctx.credentials.secretKey.trimmed();
+    if (key.isEmpty()) {
+        errOut = tr("Missing Paradex private key");
+        return false;
+    }
+
+    const QString helperBase = QCoreApplication::applicationDirPath();
+#ifdef _WIN32
+    const QString helperPath = helperBase + QDir::separator() + QStringLiteral("paradex_auth.exe");
+#else
+    const QString helperPath = helperBase + QDir::separator() + QStringLiteral("paradex_auth");
+#endif
+    if (!QFile::exists(helperPath)) {
+        errOut = tr("Missing Paradex helper");
+        return false;
+    }
+
+    const QByteArray keyHash = QCryptographicHash::hash(key.toUtf8(), QCryptographicHash::Sha256).toHex();
+    const bool procOk = (ctx.paradexSignerProc && ctx.paradexSignerProc->state() == QProcess::Running
+                         && ctx.paradexSignerProc->property("keyHash").toByteArray() == keyHash);
+    if (procOk) {
+        return true;
+    }
+
+    auto failWaiters = [&](const QString &msg) {
+        const auto waiters = std::move(ctx.paradexSignWaiters);
+        ctx.paradexSignWaiters.clear();
+        for (auto it = waiters.constBegin(); it != waiters.constEnd(); ++it) {
+            if (it->cb) {
+                it->cb(QString(), 0, msg);
+            }
+        }
+    };
+
+    if (ctx.paradexSignerProc) {
+        ctx.paradexSignerProc->kill();
+        ctx.paradexSignerProc->deleteLater();
+        ctx.paradexSignerProc = nullptr;
+        ctx.paradexSignerStdoutBuf.clear();
+        ctx.paradexSignerNextId = 1;
+        failWaiters(tr("Paradex signer restarted"));
+    }
+
+    auto *proc = new QProcess(this);
+    proc->setProcessChannelMode(QProcess::SeparateChannels);
+    proc->setProgram(helperPath);
+    proc->setArguments(QStringList{QStringLiteral("--mode"),
+                                   QStringLiteral("serve-sign"),
+                                   QStringLiteral("--api-base"),
+                                   QStringLiteral("https://api.prod.paradex.trade/v1"),
+                                   QStringLiteral("--l2-private-key-stdin")});
+    proc->setProperty("keyHash", keyHash);
+    ctx.paradexSignerProc = proc;
+
+    connect(proc, &QProcess::readyReadStandardOutput, this, [this, &ctx]() {
+        if (!ctx.paradexSignerProc) {
+            return;
+        }
+        ctx.paradexSignerStdoutBuf.append(ctx.paradexSignerProc->readAllStandardOutput());
+        for (;;) {
+            const int nl = ctx.paradexSignerStdoutBuf.indexOf('\n');
+            if (nl < 0) {
+                break;
+            }
+            const QByteArray lineRaw = ctx.paradexSignerStdoutBuf.left(nl);
+            ctx.paradexSignerStdoutBuf.remove(0, nl + 1);
+            const QByteArray line = lineRaw.trimmed();
+            if (line.isEmpty()) {
+                continue;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(line);
+            if (!doc.isObject()) {
+                emit logMessage(QStringLiteral("%1 Paradex signer: bad json: %2")
+                                    .arg(contextTag(ctx.accountName), QString::fromUtf8(line.left(256))));
+                continue;
+            }
+            const QJsonObject obj = doc.object();
+            const qint64 id = obj.value(QStringLiteral("id")).toVariant().toLongLong();
+            const QString errStr = obj.value(QStringLiteral("error")).toString();
+            const QString sig = obj.value(QStringLiteral("signature")).toString();
+            const qint64 ts = obj.value(QStringLiteral("signatureTimestamp")).toVariant().toLongLong();
+            if (id <= 0) {
+                if (!errStr.isEmpty()) {
+                    emit logMessage(QStringLiteral("%1 Paradex signer error: %2")
+                                        .arg(contextTag(ctx.accountName), errStr));
+                }
+                continue;
+            }
+            const auto it = ctx.paradexSignWaiters.find(id);
+            if (it == ctx.paradexSignWaiters.end()) {
+                continue;
+            }
+            const auto waiter = it.value();
+            ctx.paradexSignWaiters.erase(it);
+            if (waiter.cb) {
+                waiter.cb(sig, ts, errStr);
+            }
+        }
+    });
+
+    connect(proc,
+            qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+            this,
+            [this, &ctx](int, QProcess::ExitStatus) {
+                const QString msg = tr("Paradex signer stopped");
+                if (!ctx.paradexSignWaiters.isEmpty()) {
+                    for (auto it = ctx.paradexSignWaiters.begin(); it != ctx.paradexSignWaiters.end(); ++it) {
+                        if (it->cb) {
+                            it->cb(QString(), 0, msg);
+                        }
+                    }
+                    ctx.paradexSignWaiters.clear();
+                }
+                if (ctx.paradexSignerProc) {
+                    ctx.paradexSignerProc->deleteLater();
+                    ctx.paradexSignerProc = nullptr;
+                }
+                ctx.paradexSignerStdoutBuf.clear();
+            });
+
+    connect(proc, &QProcess::errorOccurred, this, [this, &ctx](QProcess::ProcessError) {
+        const QString msg = tr("Paradex signer failed");
+        if (!ctx.paradexSignWaiters.isEmpty()) {
+            for (auto it = ctx.paradexSignWaiters.begin(); it != ctx.paradexSignWaiters.end(); ++it) {
+                if (it->cb) {
+                    it->cb(QString(), 0, msg);
+                }
+            }
+            ctx.paradexSignWaiters.clear();
+        }
+        if (ctx.paradexSignerProc) {
+            ctx.paradexSignerProc->deleteLater();
+            ctx.paradexSignerProc = nullptr;
+        }
+        ctx.paradexSignerStdoutBuf.clear();
+    });
+
+    proc->start();
+    if (!proc->waitForStarted(1500)) {
+        errOut = tr("Paradex signer failed to start");
+        proc->deleteLater();
+        ctx.paradexSignerProc = nullptr;
+        return false;
+    }
+    proc->write(key.toUtf8());
+    proc->write("\n");
+    return true;
+}
+
+void TradeManager::requestParadexOrderSignature(Context &ctx,
+                                                const QString &symbol,
+                                                const QString &market,
+                                                const QString &side,
+                                                const QString &orderType,
+                                                const QString &size,
+                                                const QString &price,
+                                                std::function<void(QString signature, qint64 signatureTsMs, QString err)> cb)
+{
+    QString err;
+    if (!ensureParadexSigner(ctx, err)) {
+        if (cb) {
+            cb(QString(), 0, err);
+        }
+        return;
+    }
+    if (!ctx.paradexSignerProc || ctx.paradexSignerProc->state() != QProcess::Running) {
+        if (cb) {
+            cb(QString(), 0, tr("Paradex signer not running"));
+        }
+        return;
+    }
+    const qint64 id = std::max<qint64>(1, ctx.paradexSignerNextId++);
+    Context::ParadexSignWaiter waiter;
+    waiter.symbol = symbol;
+    waiter.cb = std::move(cb);
+    ctx.paradexSignWaiters.insert(id, waiter);
+
+    QJsonObject req;
+    req.insert(QStringLiteral("id"), id);
+    req.insert(QStringLiteral("account"), ctx.paradexAccount.trimmed());
+    req.insert(QStringLiteral("market"), market);
+    req.insert(QStringLiteral("side"), side);
+    req.insert(QStringLiteral("orderType"), orderType);
+    req.insert(QStringLiteral("size"), size);
+    req.insert(QStringLiteral("price"), price);
+    req.insert(QStringLiteral("timestampMs"), 0);
+    const QByteArray payload = QJsonDocument(req).toJson(QJsonDocument::Compact) + "\n";
+    const qint64 wrote = ctx.paradexSignerProc->write(payload);
+    if (wrote != payload.size()) {
+        const auto it = ctx.paradexSignWaiters.find(id);
+        if (it != ctx.paradexSignWaiters.end()) {
+            auto w = it.value();
+            ctx.paradexSignWaiters.erase(it);
+            if (w.cb) {
+                w.cb(QString(), 0, tr("Failed to write to Paradex signer"));
+            }
+        }
+        return;
+    }
 }
 
 void TradeManager::ensureLighterStreamWired(Context &ctx)
@@ -2095,6 +2379,59 @@ void TradeManager::sendLighterTx(Context &ctx,
                             .arg(contextTag(ctxPtr->accountName)));
         httpSend(txType2, txInfo2, std::move(cb2));
     });
+}
+
+void TradeManager::subscribeParadexPrivate(Context &ctx)
+{
+    if (ctx.profile != ConnectionStore::Profile::Paradex) {
+        return;
+    }
+    if (ctx.privateSocket.state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+    if (!ctx.paradexWsAuthed) {
+        return;
+    }
+
+    // Best-effort: subscribe fills per watched symbol.
+    // Paradex public trade feed is `trades.<market>`; private fills are `fills.<market>`.
+    // We subscribe to both the wildcard (if supported) and per-market channels.
+    auto wantChannel = [&](const QString &channel) -> bool {
+        const QString key = channel.trimmed();
+        if (key.isEmpty()) return false;
+        if (ctx.paradexSubscribedChannels.contains(key)) return false;
+        ctx.paradexSubscribedChannels.insert(key);
+        return true;
+    };
+
+    QStringList channels;
+    channels.reserve(ctx.watchedSymbols.size() + 2);
+    channels.push_back(QStringLiteral("fills"));
+    for (const QString &sym : ctx.watchedSymbols) {
+        channels.push_back(QStringLiteral("fills.%1").arg(sym));
+    }
+
+    int sent = 0;
+    for (const QString &channel : channels) {
+        if (!wantChannel(channel)) {
+            continue;
+        }
+        const int id = std::max(1, ctx.paradexNextRpcId++);
+        QJsonObject params;
+        params.insert(QStringLiteral("channel"), channel);
+        QJsonObject msg;
+        msg.insert(QStringLiteral("id"), id);
+        msg.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
+        msg.insert(QStringLiteral("method"), QStringLiteral("subscribe"));
+        msg.insert(QStringLiteral("params"), params);
+        ctx.privateSocket.sendTextMessage(QString::fromUtf8(QJsonDocument(msg).toJson(QJsonDocument::Compact)));
+        ++sent;
+    }
+    if (sent > 0) {
+        emit logMessage(QStringLiteral("%1 Paradex: subscribed (private) fills (%2 channels)")
+                            .arg(contextTag(ctx.accountName))
+                            .arg(sent));
+    }
 }
 
 void TradeManager::subscribeLighterPrivateWs(Context &ctx)
@@ -2789,6 +3126,10 @@ void TradeManager::resetFinrez(ConnectionStore::Profile profile)
 
 bool TradeManager::ensureCredentials(const Context &ctx) const
 {
+    if (ctx.profile == ConnectionStore::Profile::Paradex) {
+        // Market data works without credentials, but private WS auth requires an L2 private key.
+        return !ctx.credentials.secretKey.trimmed().isEmpty();
+    }
     if (ctx.profile == ConnectionStore::Profile::Lighter) {
         const QString url = normalizeLighterUrl(ctx.credentials.baseUrl);
         if (url.isEmpty()) {
@@ -2818,6 +3159,183 @@ void TradeManager::connectToExchange(ConnectionStore::Profile profile)
 {
     Context &ctx = ensureContext(profile);
     ctx.proxyStatusLog.clear();
+    if (profile == ConnectionStore::Profile::Paradex) {
+        if (!ensureCredentials(ctx)) {
+            setState(ctx, ConnectionState::Error, tr("Missing Paradex private key"));
+            emit logMessage(QStringLiteral("%1 Paradex: enter private key (0x...)")
+                                .arg(contextTag(ctx.accountName)));
+            return;
+        }
+
+        QNetworkProxy proxy;
+        QString proxyErr;
+        const QString proxyRaw = ctx.credentials.proxy.trimmed();
+        if (!parseHttpProxy(proxyRaw, ctx.credentials.proxyType, proxy, &proxyErr)) {
+            if (!proxyRaw.isEmpty()) {
+                emit logMessage(QStringLiteral("%1 Invalid proxy: %2").arg(contextTag(ctx.accountName), proxyErr));
+            }
+            proxy = QNetworkProxy(QNetworkProxy::NoProxy);
+        }
+        ctx.privateSocket.setProxy(proxy);
+
+        const QString status = proxySummaryForLog(proxy);
+        const QString logKey = QStringLiteral("paradex:%1").arg(status);
+        if (ctx.proxyStatusLog != logKey) {
+            ctx.proxyStatusLog = logKey;
+            emit logMessage(QStringLiteral("%1 Proxy: %2").arg(contextTag(ctx.accountName), status));
+        }
+
+        if (ctx.paradexAuthInFlight && ctx.state == ConnectionState::Connecting) {
+            return;
+        }
+
+        const QString helperBase = QCoreApplication::applicationDirPath();
+#ifdef _WIN32
+        const QString helperPath = helperBase + QDir::separator() + QStringLiteral("paradex_auth.exe");
+#else
+        const QString helperPath = helperBase + QDir::separator() + QStringLiteral("paradex_auth");
+#endif
+        if (!QFile::exists(helperPath)) {
+            setState(ctx, ConnectionState::Error, tr("Missing Paradex helper"));
+            emit logMessage(QStringLiteral("%1 Paradex helper not found: %2")
+                                .arg(contextTag(ctx.accountName), helperPath));
+            return;
+        }
+
+        ctx.paradexWsAuthed = false;
+        ctx.paradexAuthMsgId = 0;
+        ctx.paradexNextRpcId = 1;
+        ctx.paradexJwt.clear();
+        ctx.paradexAccount.clear();
+        ctx.paradexJwtExpiresAt = 0;
+
+        auto startHelper = [this, helperPath, proxy, profile](Context &ctxRef, const QString &ethAddr) {
+            setState(ctxRef, ConnectionState::Connecting, tr("Generating auth token..."));
+            emit logMessage(QStringLiteral("%1 Paradex: generating auth token...").arg(contextTag(ctxRef.accountName)));
+
+            ctxRef.paradexAuthInFlight = true;
+            const quint64 token = ++ctxRef.paradexAuthToken;
+            Context *ctxPtr = &ctxRef;
+
+            auto *proc = new QProcess(this);
+            proc->setProcessChannelMode(QProcess::MergedChannels);
+
+            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+            if (proxy.type() == QNetworkProxy::HttpProxy || proxy.type() == QNetworkProxy::Socks5Proxy) {
+                const QString scheme =
+                    (proxy.type() == QNetworkProxy::Socks5Proxy) ? QStringLiteral("socks5") : QStringLiteral("http");
+                QString proxyUrl = scheme + QStringLiteral("://");
+                if (!proxy.user().isEmpty()) {
+                    proxyUrl += proxy.user();
+                    if (!proxy.password().isEmpty()) {
+                        proxyUrl += QStringLiteral(":") + proxy.password();
+                    }
+                    proxyUrl += QStringLiteral("@");
+                }
+                proxyUrl += proxy.hostName() + QStringLiteral(":") + QString::number(proxy.port());
+                if (proxy.type() == QNetworkProxy::Socks5Proxy) {
+                    env.insert(QStringLiteral("ALL_PROXY"), proxyUrl);
+                } else {
+                    env.insert(QStringLiteral("HTTP_PROXY"), proxyUrl);
+                    env.insert(QStringLiteral("HTTPS_PROXY"), proxyUrl);
+                }
+            }
+            proc->setProcessEnvironment(env);
+
+            QStringList args;
+            args << QStringLiteral("--api-base") << QStringLiteral("https://api.prod.paradex.trade/v1");
+            if (!ethAddr.trimmed().isEmpty()) {
+                args << QStringLiteral("--l1-address") << ethAddr.trimmed();
+            }
+            args << QStringLiteral("--l2-private-key-stdin");
+            args << QStringLiteral("--expiry-seconds") << QStringLiteral("300");
+
+            proc->setProgram(helperPath);
+            proc->setArguments(args);
+
+            QObject::connect(proc, &QProcess::errorOccurred, this, [this, proc, ctxPtr, token](QProcess::ProcessError) {
+                if (!ctxPtr || ctxPtr->paradexAuthToken != token) {
+                    proc->deleteLater();
+                    return;
+                }
+                ctxPtr->paradexAuthInFlight = false;
+                const QString err = proc->errorString();
+                setState(*ctxPtr, ConnectionState::Error, tr("Paradex helper failed"));
+                emit logMessage(QStringLiteral("%1 Paradex helper error: %2").arg(contextTag(ctxPtr->accountName), err));
+                proc->deleteLater();
+            });
+
+            QObject::connect(proc,
+                             qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                             this,
+                             [this, proc, ctxPtr, token, profile](int code, QProcess::ExitStatus) {
+                                 if (!ctxPtr || ctxPtr->paradexAuthToken != token) {
+                                     proc->deleteLater();
+                                     return;
+                                 }
+                                 ctxPtr->paradexAuthInFlight = false;
+                                 const QByteArray out = proc->readAll();
+                                 proc->deleteLater();
+
+                                 QJsonParseError jerr;
+                                 const QJsonDocument doc = QJsonDocument::fromJson(out, &jerr);
+                                 if (!doc.isObject()) {
+                                     setState(*ctxPtr, ConnectionState::Error, tr("Paradex helper output invalid"));
+                                     emit logMessage(QStringLiteral("%1 Paradex helper output invalid (exit=%2): %3")
+                                                         .arg(contextTag(ctxPtr->accountName))
+                                                         .arg(code)
+                                                         .arg(QString::fromUtf8(out.left(512))));
+                                     return;
+                                 }
+                                  const QJsonObject obj = doc.object();
+                                  const QString errStr = obj.value(QStringLiteral("error")).toString();
+                                  if (!errStr.isEmpty() || code != 0) {
+                                      const QString raw = errStr.isEmpty() ? QString::fromUtf8(out) : errStr;
+                                      if (raw.contains(QStringLiteral("NOT_ONBOARDED"), Qt::CaseInsensitive)) {
+                                          setState(*ctxPtr, ConnectionState::Error, tr("Paradex onboarding required"));
+                                          emit logMessage(QStringLiteral("%1 Paradex: NOT_ONBOARDED. Open the Paradex website, connect your wallet, and complete onboarding once, then retry.")
+                                                              .arg(contextTag(ctxPtr->accountName)));
+                                          return;
+                                      }
+
+                                      setState(*ctxPtr, ConnectionState::Error, tr("Paradex auth failed"));
+                                      emit logMessage(QStringLiteral("%1 Paradex auth failed: %2")
+                                                          .arg(contextTag(ctxPtr->accountName),
+                                                               errStr.isEmpty() ? QString::fromUtf8(out.left(512)) : errStr));
+                                     scheduleReconnect(*ctxPtr);
+                                     return;
+                                 }
+
+                                 const QString jwt = obj.value(QStringLiteral("jwt")).toString();
+                                 const QString account = obj.value(QStringLiteral("account")).toString();
+                                 const qint64 expiresAt = obj.value(QStringLiteral("expiresAt")).toVariant().toLongLong();
+                                 if (jwt.trimmed().isEmpty()) {
+                                     setState(*ctxPtr, ConnectionState::Error, tr("Paradex auth failed"));
+                                     emit logMessage(QStringLiteral("%1 Paradex auth failed: empty jwt")
+                                                         .arg(contextTag(ctxPtr->accountName)));
+                                     scheduleReconnect(*ctxPtr);
+                                     return;
+                                 }
+
+                                 ctxPtr->paradexJwt = jwt;
+                                 ctxPtr->paradexAccount = account;
+                                 ctxPtr->paradexJwtExpiresAt = expiresAt;
+
+                                 setState(*ctxPtr, ConnectionState::Connecting, tr("Connecting to Paradex WS..."));
+                                 emit logMessage(QStringLiteral("%1 Paradex: connecting to private WebSocket...")
+                                                     .arg(contextTag(ctxPtr->accountName)));
+                                 initializeParadexWebSocket(*ctxPtr);
+                             });
+
+            proc->start();
+            proc->write(ctxPtr->credentials.secretKey.trimmed().toUtf8());
+            proc->write("\n");
+            proc->closeWriteChannel();
+        };
+
+        startHelper(ctx, QString());
+        return;
+    }
     if (profile == ConnectionStore::Profile::Lighter) {
         if (ctx.credentials.apiKey.trimmed().isEmpty()) {
             MexcCredentials vaultCreds;
@@ -3141,9 +3659,13 @@ void TradeManager::connectToExchange(ConnectionStore::Profile profile)
     if (ctx.profile == ConnectionStore::Profile::MexcFutures) {
         ctx.futuresLoggedIn = false;
         ctx.hasSubscribed = false;
+        ctx.futuresAuthPending = false;
+        ctx.futuresRestAuthed = false;
+        ctx.futuresAuthToken++;
         setState(ctx, ConnectionState::Connecting, tr("Connecting to MEXC futures..."));
         emit logMessage(QStringLiteral("%1 Connecting to MEXC futures WebSocket...")
                             .arg(contextTag(ctx.accountName)));
+        ensureMexcNetwork(ctx);
         initializeFuturesWebSocket(ctx);
         return;
     }
@@ -3171,6 +3693,15 @@ void TradeManager::disconnect(ConnectionStore::Profile profile)
     }
     ctx->proxyPreflightToken++;
     ctx->proxyPreflightInFlight = false;
+    if (profile == ConnectionStore::Profile::Paradex) {
+        ctx->paradexAuthToken++;
+        ctx->paradexAuthInFlight = false;
+        ctx->paradexWsAuthed = false;
+        ctx->paradexAuthMsgId = 0;
+        ctx->paradexJwt.clear();
+        ctx->paradexAccount.clear();
+        ctx->paradexJwtExpiresAt = 0;
+    }
     closeWebSocket(*ctx);
     ctx->keepAliveTimer.stop();
     ctx->reconnectTimer.stop();
@@ -3224,6 +3755,9 @@ ConnectionStore::Profile TradeManager::profileFromAccountName(const QString &acc
     if (lower.contains(QStringLiteral("lighter"))) {
         return ConnectionStore::Profile::Lighter;
     }
+    if (lower.contains(QStringLiteral("paradex"))) {
+        return ConnectionStore::Profile::Paradex;
+    }
     if (lower.contains(QStringLiteral("futures"))) {
         return ConnectionStore::Profile::MexcFutures;
     }
@@ -3240,7 +3774,27 @@ TradePosition TradeManager::positionForSymbol(const QString &symbol, const QStri
 {
     const ConnectionStore::Profile profile = profileFromAccountName(accountName);
     if (Context *ctx = contextForProfile(profile)) {
-        return ctx->positions.value(normalizedSymbol(symbol), TradePosition{});
+        const QString sym = normalizedSymbol(symbol);
+        const auto it = ctx->positions.constFind(sym);
+        if (it != ctx->positions.constEnd()) {
+            return it.value();
+        }
+        if (profile == ConnectionStore::Profile::MexcSpot) {
+            const QString baseAsset = baseAssetFromFusedSymbol(sym);
+            if (!baseAsset.isEmpty()) {
+                const auto balIt = ctx->balances.constFind(baseAsset);
+                if (balIt != ctx->balances.constEnd() && balIt->available > 0.0) {
+                    TradePosition pos;
+                    pos.hasPosition = true;
+                    pos.side = OrderSide::Buy;
+                    pos.quantity = balIt->available;
+                    pos.qtyMultiplier = 1.0;
+                    pos.averagePrice = 0.0;
+                    return pos;
+                }
+            }
+        }
+        return TradePosition{};
     }
     return TradePosition{};
 }
@@ -3321,6 +3875,10 @@ void TradeManager::setWatchedSymbols(const QString &accountName, const QSet<QStr
                 }
             }
         }
+        if (profile == ConnectionStore::Profile::Paradex && ctx.state == ConnectionState::Connected) {
+            subscribeParadexPrivate(ctx);
+            fetchOpenOrders(ctx);
+        }
         return;
     }
     if (ctx.state == ConnectionState::Connected) {
@@ -3344,6 +3902,7 @@ void TradeManager::placeLimitOrder(const QString &symbol,
     const QString sym = normalizedSymbol(symbol);
     const ConnectionStore::Profile profile = profileFromAccountName(accountName);
     if (profile != ConnectionStore::Profile::Lighter
+        && profile != ConnectionStore::Profile::Paradex
         && profile != ConnectionStore::Profile::MexcSpot
         && profile != ConnectionStore::Profile::MexcFutures
         && profile != ConnectionStore::Profile::UzxSwap
@@ -3367,13 +3926,144 @@ void TradeManager::placeLimitOrder(const QString &symbol,
         emit orderFailed(ctx.accountName, sym, tr("Invalid price or quantity"));
         return;
     }
+    if (profile != ConnectionStore::Profile::Paradex) {
+        emit logMessage(QStringLiteral("%1 Placing limit order: %2 %3 @ %4 qty=%5")
+                            .arg(contextTag(ctx.accountName))
+                            .arg(sym)
+                            .arg(side == OrderSide::Buy ? QStringLiteral("BUY") : QStringLiteral("SELL"))
+                            .arg(QString::number(price, 'f', 6))
+                            .arg(QString::number(quantity, 'f', 6)));
+    }
 
-    emit logMessage(QStringLiteral("%1 Placing limit order: %2 %3 @ %4 qty=%5")
-                        .arg(contextTag(ctx.accountName))
-                        .arg(sym)
-                        .arg(side == OrderSide::Buy ? QStringLiteral("BUY") : QStringLiteral("SELL"))
-                        .arg(QString::number(price, 'f', 6))
-                        .arg(QString::number(quantity, 'f', 6)));
+    if (profile == ConnectionStore::Profile::Paradex) {
+        if (ctx.paradexJwt.trimmed().isEmpty()) {
+            emit orderFailed(ctx.accountName, sym, tr("Not authenticated"));
+            return;
+        }
+        if (ctx.paradexAccount.trimmed().isEmpty()) {
+            emit orderFailed(ctx.accountName, sym, tr("Missing Paradex account address"));
+            return;
+        }
+
+        const auto metaIt = ctx.paradexMarketMeta.constFind(sym);
+        if (metaIt == ctx.paradexMarketMeta.constEnd() || !metaIt->valid()) {
+            PendingParadexOrder pending;
+            pending.symbol = sym;
+            pending.price = price;
+            pending.quantityBase = quantity;
+            pending.side = side;
+            pending.leverage = leverage;
+            ctx.pendingParadexOrders[sym].push_back(pending);
+            ensureParadexMarketMeta(ctx, sym);
+            emit logMessage(QStringLiteral("%1 Paradex: loading market meta for %2...")
+                                .arg(contextTag(ctx.accountName), sym));
+            return;
+        }
+        const ParadexMarketMeta meta = metaIt.value();
+        const double adjSize = paradexQuantizeDown(quantity, meta.orderSizeIncrement, meta.sizeDecimals);
+        if (!(adjSize > 0.0)) {
+            emit orderFailed(ctx.accountName,
+                             sym,
+                             tr("Size too small (min step %1)")
+                                 .arg(paradexFormatFixed(meta.orderSizeIncrement, meta.sizeDecimals)));
+            return;
+        }
+        const double adjPrice =
+            (side == OrderSide::Sell)
+                ? paradexQuantizeUp(price, meta.priceTickSize, meta.priceDecimals)
+                : paradexQuantizeDown(price, meta.priceTickSize, meta.priceDecimals);
+        if (!(adjPrice > 0.0)) {
+            emit orderFailed(ctx.accountName,
+                             sym,
+                             tr("Invalid price tick (step %1)")
+                                 .arg(paradexFormatFixed(meta.priceTickSize, meta.priceDecimals)));
+            return;
+        }
+
+        const QString sizeStr = paradexFormatFixed(adjSize, meta.sizeDecimals);
+        const QString priceStr = paradexFormatFixed(adjPrice, meta.priceDecimals);
+        const QString sideStr = (side == OrderSide::Sell) ? QStringLiteral("SELL") : QStringLiteral("BUY");
+        const double finalQty = adjSize;
+        const double finalPrice = adjPrice;
+
+        emit logMessage(QStringLiteral("%1 Placing limit order: %2 %3 @ %4 qty=%5")
+                            .arg(contextTag(ctx.accountName))
+                            .arg(sym)
+                            .arg(sideStr)
+                            .arg(priceStr)
+                            .arg(sizeStr));
+
+        const QString jwt = ctx.paradexJwt.trimmed();
+        Context *ctxPtr = &ctx;
+        requestParadexOrderSignature(
+            ctx,
+            sym,
+            sym,
+            sideStr,
+            QStringLiteral("LIMIT"),
+            sizeStr,
+            priceStr,
+            [this, ctxPtr, sym, side, finalPrice, finalQty, jwt, sideStr, sizeStr, priceStr](QString signature, qint64 ts, QString signErr) {
+                if (!ctxPtr) {
+                    return;
+                }
+                if (!signErr.trimmed().isEmpty() || signature.trimmed().isEmpty() || ts <= 0) {
+                    emit orderFailed(ctxPtr->accountName, sym, tr("Paradex sign-order failed"));
+                    emit logMessage(QStringLiteral("%1 Paradex sign-order failed: %2")
+                                        .arg(contextTag(ctxPtr->accountName),
+                                             signErr.trimmed().isEmpty() ? QStringLiteral("empty signature") : signErr.trimmed()));
+                    return;
+                }
+                             QJsonObject body;
+                             body.insert(QStringLiteral("market"), sym);
+                             body.insert(QStringLiteral("side"), sideStr);
+                             body.insert(QStringLiteral("type"), QStringLiteral("LIMIT"));
+                             body.insert(QStringLiteral("size"), sizeStr);
+                             body.insert(QStringLiteral("price"), priceStr);
+                             body.insert(QStringLiteral("signature"), signature);
+                             body.insert(QStringLiteral("signature_timestamp"), ts);
+                             const QByteArray payload = QJsonDocument(body).toJson(QJsonDocument::Compact);
+
+                             QUrl url(paradexHttpBase() + QStringLiteral("/orders"));
+                             QNetworkRequest req(url);
+                             req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+                             req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+                             req.setRawHeader("authorization", QByteArray("Bearer ") + jwt.toUtf8());
+                             auto *reply = ensureParadexNetwork(*ctxPtr)->post(req, payload);
+                             applyReplyTimeout(reply, 8000);
+                             connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr, sym, side, finalPrice, finalQty]() {
+                                 const auto nerr = reply->error();
+                                 const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                                 const QByteArray raw = reply->readAll();
+                                 const QString errStr = reply->errorString();
+                                 reply->deleteLater();
+                                 if (!ctxPtr) return;
+                                 if (nerr != QNetworkReply::NoError || status >= 400) {
+                                     emit orderFailed(ctxPtr->accountName, sym, tr("Paradex order failed"));
+                                     emit logMessage(QStringLiteral("%1 Paradex order failed: %2")
+                                                         .arg(contextTag(ctxPtr->accountName),
+                                                              raw.isEmpty() ? errStr : QString::fromUtf8(raw)));
+                                     return;
+                                 }
+                                 QString orderId;
+                                 const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                                 if (doc.isObject()) {
+                                     orderId = doc.object().value(QStringLiteral("id")).toString().trimmed();
+                                 }
+                                 if (!orderId.isEmpty()) {
+                                     emit orderPlaced(ctxPtr->accountName, sym, side, finalPrice, finalQty, orderId);
+                                 }
+                                 // Refresh markers/orders.
+                                 fetchOpenOrders(*ctxPtr);
+                                 if (!ctxPtr->openOrdersTimer.isActive()) {
+                                     ctxPtr->openOrdersTimer.start();
+                                 }
+                                 // Fill feedback (sound/print) depends on tradeExecuted; poll trades after placing.
+                                 fetchParadexMyTrades(*ctxPtr, sym);
+                             });
+            });
+        return;
+    }
 
     if (profile == ConnectionStore::Profile::Lighter) {
         const QString baseUrl = normalizeLighterUrl(ctx.credentials.baseUrl);
@@ -4427,6 +5117,7 @@ void TradeManager::ensureMexcSpotSymbolMeta(Context &ctx, const QString &symbolU
         ctxPtr->spotSymbolMetaInFlight.remove(sym);
         const QNetworkReply::NetworkError err = reply->error();
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString errString = reply->errorString();
         const QByteArray raw = reply->readAll();
         reply->deleteLater();
 
@@ -4704,6 +5395,110 @@ void TradeManager::closePositionMarket(const QString &symbol,
     }
 
     const TradePosition pos = ctx.positions.value(sym, TradePosition{});
+
+    if (profile == ConnectionStore::Profile::Paradex) {
+        if (!pos.hasPosition || !(pos.quantity > 0.0)) {
+            emit orderFailed(ctx.accountName, sym, tr("No active position"));
+            return;
+        }
+        if (ctx.paradexJwt.trimmed().isEmpty() || ctx.paradexAccount.trimmed().isEmpty()) {
+            emit orderFailed(ctx.accountName, sym, tr("Not authenticated"));
+            return;
+        }
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        const qint64 lastCloseMs = ctx.paradexCloseInFlightMsBySymbol.value(sym, 0);
+        if (lastCloseMs > 0 && (nowMs - lastCloseMs) < 900) {
+            emit logMessage(QStringLiteral("%1 Paradex close suppressed (in-flight) for %2")
+                                .arg(contextTag(ctx.accountName), sym));
+            return;
+        }
+
+        const auto metaIt = ctx.paradexMarketMeta.constFind(sym);
+        if (metaIt == ctx.paradexMarketMeta.constEnd() || !metaIt->valid()) {
+            ctx.pendingParadexCloseSymbols.insert(sym);
+            ensureParadexMarketMeta(ctx, sym);
+            emit logMessage(QStringLiteral("%1 Paradex: loading market meta for %2...")
+                                .arg(contextTag(ctx.accountName), sym));
+            return;
+        }
+        const ParadexMarketMeta meta = metaIt.value();
+        const OrderSide closeSide = (pos.side == OrderSide::Buy) ? OrderSide::Sell : OrderSide::Buy;
+        const QString sideStr = (closeSide == OrderSide::Sell) ? QStringLiteral("SELL") : QStringLiteral("BUY");
+        const double rawSize = pos.quantity * std::max(1.0, pos.qtyMultiplier);
+        const double adjSize = paradexQuantizeUp(rawSize, meta.orderSizeIncrement, meta.sizeDecimals);
+        if (!(adjSize > 0.0)) {
+            emit orderFailed(ctx.accountName,
+                             sym,
+                             tr("Size too small (min step %1)")
+                                 .arg(paradexFormatFixed(meta.orderSizeIncrement, meta.sizeDecimals)));
+            return;
+        }
+        const QString sizeStr = paradexFormatFixed(adjSize, meta.sizeDecimals);
+        const QString priceStr = QStringLiteral("0");
+
+        const QString jwt = ctx.paradexJwt.trimmed();
+        Context *ctxPtr = &ctx;
+        ctx.paradexCloseInFlightMsBySymbol.insert(sym, nowMs);
+        requestParadexOrderSignature(
+            ctx,
+            sym,
+            sym,
+            sideStr,
+            QStringLiteral("MARKET"),
+            sizeStr,
+            priceStr,
+            [this, ctxPtr, sym, closeSide, jwt, sideStr, sizeStr, priceStr](QString signature, qint64 ts, QString signErr) {
+                if (!ctxPtr) return;
+                if (!signErr.trimmed().isEmpty() || signature.trimmed().isEmpty() || ts <= 0) {
+                    ctxPtr->paradexCloseInFlightMsBySymbol.remove(sym);
+                    emit orderFailed(ctxPtr->accountName, sym, tr("Paradex sign-order failed"));
+                    emit logMessage(QStringLiteral("%1 Paradex sign-order failed: %2")
+                                        .arg(contextTag(ctxPtr->accountName),
+                                             signErr.trimmed().isEmpty() ? QStringLiteral("empty signature") : signErr.trimmed()));
+                    return;
+                }
+                             QJsonObject body;
+                             body.insert(QStringLiteral("market"), sym);
+                             body.insert(QStringLiteral("side"), sideStr);
+                             body.insert(QStringLiteral("type"), QStringLiteral("MARKET"));
+                             body.insert(QStringLiteral("size"), sizeStr);
+                             // Paradex rejects `price` for MARKET orders (must be omitted).
+                             body.insert(QStringLiteral("flags"), QJsonArray{QStringLiteral("REDUCE_ONLY")});
+                             body.insert(QStringLiteral("signature"), signature);
+                             body.insert(QStringLiteral("signature_timestamp"), ts);
+                             const QByteArray payload = QJsonDocument(body).toJson(QJsonDocument::Compact);
+
+                             QUrl url(paradexHttpBase() + QStringLiteral("/orders"));
+                             QNetworkRequest req(url);
+                             req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+                             req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+                             req.setRawHeader("authorization", QByteArray("Bearer ") + jwt.toUtf8());
+                             auto *reply = ensureParadexNetwork(*ctxPtr)->post(req, payload);
+                             applyReplyTimeout(reply, 8000);
+                             connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr, sym, closeSide]() {
+                                 const auto nerr = reply->error();
+                                 const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                                 const QByteArray raw = reply->readAll();
+                                 const QString errStr = reply->errorString();
+                                 reply->deleteLater();
+                                 if (!ctxPtr) return;
+                                 ctxPtr->paradexCloseInFlightMsBySymbol.remove(sym);
+                                 if (nerr != QNetworkReply::NoError || status >= 400) {
+                                     emit orderFailed(ctxPtr->accountName, sym, tr("Paradex close failed"));
+                                     emit logMessage(QStringLiteral("%1 Paradex close failed: %2")
+                                                         .arg(contextTag(ctxPtr->accountName),
+                                                              raw.isEmpty() ? errStr : QString::fromUtf8(raw)));
+                                     return;
+                                 }
+                                 emit logMessage(QStringLiteral("%1 Paradex close order sent for %2")
+                                                     .arg(contextTag(ctxPtr->accountName), sym));
+                                 fetchOpenOrders(*ctxPtr);
+                                 fetchParadexPositions(*ctxPtr);
+                                 fetchParadexMyTrades(*ctxPtr, sym);
+                             });
+            });
+        return;
+    }
 
     if (profile == ConnectionStore::Profile::Lighter) {
         const QString baseUrl = normalizeLighterUrl(ctx.credentials.baseUrl);
@@ -5746,8 +6541,35 @@ void TradeManager::placeLighterStopOrder(const QString &symbol,
         return;
     }
 
+    if (profile == ConnectionStore::Profile::MexcFutures) {
+        placeMexcFuturesStopPlanOrder(ctx, sym, triggerPrice, isStopLoss);
+        return;
+    }
+
+    if (profile == ConnectionStore::Profile::MexcSpot) {
+        // Exchange-side stop orders (STOP_LOSS/TAKE_PROFIT) are rejected on the live API for many
+        // MEXC Spot accounts ("invalid type"). Use local SL/TP triggers instead:
+        // UI shows markers; trigger => cancel orders + market close of base balance.
+        if (isStopLoss) {
+            ctx.mexcSpotSlOrderIdBySymbol.remove(sym);
+            ctx.mexcSpotSlTriggerBySymbol.insert(sym, triggerPrice);
+        } else {
+            ctx.mexcSpotTpOrderIdBySymbol.remove(sym);
+            ctx.mexcSpotTpTriggerBySymbol.insert(sym, triggerPrice);
+        }
+        emit lighterStopOrdersUpdated(ctx.accountName,
+                                      sym,
+                                      ctx.mexcSpotSlTriggerBySymbol.value(sym, 0.0) > 0.0,
+                                      ctx.mexcSpotSlTriggerBySymbol.value(sym, 0.0),
+                                      ctx.mexcSpotTpTriggerBySymbol.value(sym, 0.0) > 0.0,
+                                      ctx.mexcSpotTpTriggerBySymbol.value(sym, 0.0));
+        return;
+    }
+
     if (profile != ConnectionStore::Profile::Lighter) {
-        emit orderFailed(ctx.accountName, sym, tr("SL/TP is only supported for Lighter or UZX"));
+        emit orderFailed(ctx.accountName,
+                         sym,
+                         tr("SL/TP is only supported for Lighter, UZX, MEXC Futures, or MEXC Spot"));
         return;
     }
 
@@ -6211,6 +7033,38 @@ void TradeManager::cancelOrder(const QString &symbol, const QString &accountName
         return;
     }
 
+    if (profile == ConnectionStore::Profile::Paradex) {
+        if (ctx.paradexJwt.trimmed().isEmpty()) {
+            emit orderFailed(ctx.accountName, sym, tr("Not authenticated"));
+            return;
+        }
+        ctx.paradexPendingCancelOrderIds.insert(id);
+        QUrl url(paradexHttpBase() + QStringLiteral("/orders/") + QUrl::toPercentEncoding(id));
+        QNetworkRequest req(url);
+        req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        req.setRawHeader("authorization", QByteArray("Bearer ") + ctx.paradexJwt.trimmed().toUtf8());
+        auto *reply = ensureParadexNetwork(ctx)->deleteResource(req);
+        applyReplyTimeout(reply, 8000);
+        connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr = &ctx, sym, id]() {
+            const auto nerr = reply->error();
+            const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const QByteArray raw = reply->readAll();
+            const QString errStr = reply->errorString();
+            reply->deleteLater();
+            if (!ctxPtr) return;
+            if (nerr != QNetworkReply::NoError || status >= 400) {
+                emit orderFailed(ctxPtr->accountName, sym, tr("Paradex cancel failed"));
+                emit logMessage(QStringLiteral("%1 Paradex cancel failed: %2")
+                                    .arg(contextTag(ctxPtr->accountName),
+                                         raw.isEmpty() ? errStr : QString::fromUtf8(raw)));
+            } else {
+                emit logMessage(QStringLiteral("%1 Paradex cancel requested: %2").arg(contextTag(ctxPtr->accountName), id));
+            }
+            fetchOpenOrders(*ctxPtr);
+        });
+        return;
+    }
+
     if (profile == ConnectionStore::Profile::Lighter) {
         const QString baseUrl = normalizeLighterUrl(ctx.credentials.baseUrl);
         const QString account = ctx.accountName;
@@ -6482,8 +7336,110 @@ void TradeManager::cancelOrder(const QString &symbol, const QString &accountName
     }
 
     if (profile == ConnectionStore::Profile::MexcFutures) {
-        // Not implemented yet; fall back to cancel-all for the symbol.
-        cancelAllMexcFuturesOrders(ctx, sym);
+        emit logMessage(QStringLiteral("%1 Futures cancel requested: %2 id=%3")
+                            .arg(contextTag(ctx.accountName), sym, id));
+        bool okNum = false;
+        const qint64 orderIdNum = id.toLongLong(&okNum);
+        if (!okNum || orderIdNum <= 0) {
+            const QString msg = tr("Invalid futures order id: %1").arg(id);
+            emit orderFailed(ctx.accountName, sym, msg);
+            emit logMessage(QStringLiteral("%1 Futures cancel blocked: %2")
+                                .arg(contextTag(ctx.accountName), msg));
+            return;
+        }
+
+        // Per mexc-futures-sdk: /private/order/cancel expects JSON array of order IDs (numbers).
+        QJsonArray ids;
+        ids.append(orderIdNum);
+        const QByteArray body = QJsonDocument(ids).toJson(QJsonDocument::Compact);
+        emit logMessage(QStringLiteral("%1 Futures cancel body=%2")
+                            .arg(contextTag(ctx.accountName), QString::fromUtf8(body)));
+
+        QNetworkRequest request =
+            makeFuturesRequest(QStringLiteral("/private/order/cancel"), ctx, body, true);
+        auto *reply = ensureMexcNetwork(ctx)->post(request, body);
+        applyReplyTimeout(reply, 4500);
+        connect(reply, &QNetworkReply::finished, this, [this, reply, sym, id, ctxPtr2 = &ctx, orderIdNum]() {
+            const QNetworkReply::NetworkError err = reply->error();
+            const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const QByteArray raw = reply->readAll();
+            const QString errString = reply->errorString();
+            reply->deleteLater();
+
+            if (err != QNetworkReply::NoError || status >= 400) {
+                QString msg = errString;
+                if (status >= 400) {
+                    msg = QStringLiteral("HTTP %1: %2").arg(status).arg(QString::fromUtf8(raw));
+                } else if (!raw.isEmpty()) {
+                    msg = QString::fromUtf8(raw);
+                }
+                emit orderFailed(ctxPtr2->accountName, sym, msg);
+                emit logMessage(QStringLiteral("%1 Futures cancel error: %2")
+                                    .arg(contextTag(ctxPtr2->accountName), msg));
+                return;
+            }
+
+            const QJsonDocument doc = QJsonDocument::fromJson(raw);
+            if (!doc.isObject()) {
+                const QString msg = QStringLiteral("Bad response");
+                emit orderFailed(ctxPtr2->accountName, sym, msg);
+                emit logMessage(QStringLiteral("%1 Futures cancel bad response: %2")
+                                    .arg(contextTag(ctxPtr2->accountName), msg));
+                return;
+            }
+            const QJsonObject obj = doc.object();
+            const bool success = obj.value(QStringLiteral("success")).toBool(true);
+            const int code = obj.value(QStringLiteral("code")).toInt(0);
+            if (!success || code != 0) {
+                const QString errMsg =
+                    obj.value(QStringLiteral("message"))
+                        .toString(obj.value(QStringLiteral("msg")).toString(QStringLiteral("request rejected")));
+                emit orderFailed(ctxPtr2->accountName, sym, errMsg);
+                emit logMessage(QStringLiteral("%1 Futures cancel rejected: %2 (code %3) raw=%4")
+                                    .arg(contextTag(ctxPtr2->accountName))
+                                    .arg(errMsg)
+                                    .arg(code)
+                                    .arg(QString::fromUtf8(raw.left(512))));
+                return;
+            }
+
+            // data: [{orderId, errorCode, errorMsg}, ...]
+            const QJsonArray dataArr = obj.value(QStringLiteral("data")).toArray();
+            for (const auto &v : dataArr) {
+                if (!v.isObject()) {
+                    continue;
+                }
+                const QJsonObject row = v.toObject();
+                const qint64 rowId = row.value(QStringLiteral("orderId")).toVariant().toLongLong();
+                if (rowId != orderIdNum) {
+                    continue;
+                }
+                const int errCode = row.value(QStringLiteral("errorCode")).toInt(0);
+                if (errCode != 0) {
+                    const QString errMsg = row.value(QStringLiteral("errorMsg")).toString(QStringLiteral("Cancel failed"));
+                    emit orderFailed(ctxPtr2->accountName, sym, errMsg);
+                    emit logMessage(QStringLiteral("%1 Futures cancel failed: %2 (errorCode %3)")
+                                        .arg(contextTag(ctxPtr2->accountName))
+                                        .arg(errMsg)
+                                        .arg(errCode));
+                    return;
+                }
+            }
+
+            emit logMessage(QStringLiteral("%1 Futures cancel ok")
+                                .arg(contextTag(ctxPtr2->accountName)));
+            if (ctxPtr2) {
+                auto it = ctxPtr2->activeOrders.constFind(id);
+                if (it != ctxPtr2->activeOrders.constEnd()) {
+                    const OrderRecord rec = it.value();
+                    ctxPtr2->activeOrders.remove(id);
+                    emitLocalOrderSnapshot(*ctxPtr2, rec.symbol);
+                    emit orderCanceled(ctxPtr2->accountName, rec.symbol, rec.side, rec.price, id);
+                } else {
+                    emit orderCanceled(ctxPtr2->accountName, sym, OrderSide::Buy, 0.0, id);
+                }
+            }
+        });
         return;
     }
 
@@ -6570,6 +7526,26 @@ void TradeManager::cancelLighterStopOrders(const QString &symbol,
         }
         return;
     }
+    if (profile == ConnectionStore::Profile::MexcFutures) {
+        cancelMexcFuturesStopPlanOrder(ctx, sym, isStopLoss);
+        return;
+    }
+    if (profile == ConnectionStore::Profile::MexcSpot) {
+        if (isStopLoss) {
+            ctx.mexcSpotSlOrderIdBySymbol.remove(sym);
+            ctx.mexcSpotSlTriggerBySymbol.remove(sym);
+        } else {
+            ctx.mexcSpotTpOrderIdBySymbol.remove(sym);
+            ctx.mexcSpotTpTriggerBySymbol.remove(sym);
+        }
+        emit lighterStopOrdersUpdated(ctx.accountName,
+                                      sym,
+                                      ctx.mexcSpotSlTriggerBySymbol.value(sym, 0.0) > 0.0,
+                                      ctx.mexcSpotSlTriggerBySymbol.value(sym, 0.0),
+                                      ctx.mexcSpotTpTriggerBySymbol.value(sym, 0.0) > 0.0,
+                                      ctx.mexcSpotTpTriggerBySymbol.value(sym, 0.0));
+        return;
+    }
     if (profile != ConnectionStore::Profile::Lighter) {
         return;
     }
@@ -6618,6 +7594,28 @@ void TradeManager::cancelAllOrders(const QString &symbol, const QString &account
     }
     if (ctx.state != ConnectionState::Connected) {
         emit orderFailed(ctx.accountName, sym, tr("Connect to the exchange first"));
+        return;
+    }
+    if (profile == ConnectionStore::Profile::Paradex) {
+        QList<QString> ids;
+        ids.reserve(ctx.activeOrders.size());
+        for (auto it = ctx.activeOrders.constBegin(); it != ctx.activeOrders.constEnd(); ++it) {
+            if (it.value().symbol == sym) {
+                ids.push_back(it.key());
+            }
+        }
+        if (ids.isEmpty()) {
+            emit logMessage(QStringLiteral("%1 Paradex cancel-all: no active orders for %2")
+                                .arg(contextTag(ctx.accountName), sym));
+            return;
+        }
+        emit logMessage(QStringLiteral("%1 Paradex cancel-all: %2 orders (%3)")
+                            .arg(contextTag(ctx.accountName))
+                            .arg(ids.size())
+                            .arg(sym));
+        for (const QString &id : ids) {
+            cancelOrder(sym, ctx.accountName, id);
+        }
         return;
     }
     if (profile == ConnectionStore::Profile::Lighter) {
@@ -7226,6 +8224,57 @@ void TradeManager::initializeUzxWebSocket(Context &ctx)
                         .arg(contextTag(ctx.accountName), url.toString(QUrl::RemoveUserInfo)));
     ctx.privateSocket.open(url);
 }
+
+void TradeManager::initializeParadexWebSocket(Context &ctx)
+{
+    if (ctx.privateSocket.state() != QAbstractSocket::UnconnectedState) {
+        ctx.closingSocket = true;
+        ctx.privateSocket.close();
+    }
+    ctx.hasSubscribed = false;
+    ctx.paradexWsAuthed = false;
+    ctx.paradexAuthMsgId = 0;
+    ctx.paradexNextRpcId = 1;
+    ctx.paradexSubscribedChannels.clear();
+
+    QUrl url(QStringLiteral("wss://ws.api.prod.paradex.trade/v1"));
+    emit logMessage(QStringLiteral("%1 Connecting to %2")
+                        .arg(contextTag(ctx.accountName), url.toString(QUrl::RemoveUserInfo)));
+    ctx.privateSocket.open(url);
+}
+
+void TradeManager::sendParadexWsAuth(Context &ctx)
+{
+    if (ctx.privateSocket.state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+    if (ctx.paradexJwt.trimmed().isEmpty()) {
+        setState(ctx, ConnectionState::Error, tr("Missing Paradex JWT"));
+        emit logMessage(QStringLiteral("%1 Paradex: missing JWT token").arg(contextTag(ctx.accountName)));
+        scheduleReconnect(ctx);
+        return;
+    }
+
+    ctx.paradexAuthMsgId = std::max(1, ctx.paradexNextRpcId++);
+    QJsonObject params;
+    params.insert(QStringLiteral("bearer"), ctx.paradexJwt);
+    QJsonObject msg;
+    msg.insert(QStringLiteral("id"), ctx.paradexAuthMsgId);
+    msg.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
+    msg.insert(QStringLiteral("method"), QStringLiteral("auth"));
+    msg.insert(QStringLiteral("params"), params);
+    ctx.privateSocket.sendTextMessage(QString::fromUtf8(QJsonDocument(msg).toJson(QJsonDocument::Compact)));
+}
+
+static QJsonObject paradexHeartbeatMsg(int id)
+{
+    QJsonObject msg;
+    msg.insert(QStringLiteral("id"), id);
+    msg.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
+    msg.insert(QStringLiteral("method"), QStringLiteral("heartbeat"));
+    return msg;
+}
+
 void TradeManager::subscribePrivateChannels(Context &ctx)
 {
     if (ctx.profile == ConnectionStore::Profile::UzxSwap
@@ -7331,6 +8380,9 @@ void TradeManager::closeWebSocket(Context &ctx)
     ctx.wsPingTimer.stop();
     ctx.hasSubscribed = false;
     ctx.futuresLoggedIn = false;
+    ctx.futuresAuthPending = false;
+    ctx.futuresRestAuthed = false;
+    ctx.futuresAuthToken++;
     if (ctx.privateSocket.state() != QAbstractSocket::UnconnectedState) {
         ctx.closingSocket = true;
         ctx.privateSocket.close();
@@ -7343,10 +8395,23 @@ void TradeManager::closeWebSocket(Context &ctx)
     ctx.lighterStreamReady = false;
     ctx.lighterPrivateSubscribed = false;
     ctx.lighterWsTxWaiters.clear();
+
+    // Paradex: reset per-connection state.
+    if (ctx.profile == ConnectionStore::Profile::Paradex) {
+        ctx.paradexSubscribedChannels.clear();
+        ctx.pendingParadexCloseSymbols.clear();
+        ctx.paradexCloseInFlightMsBySymbol.clear();
+        ctx.myTradesInFlight.clear();
+    }
 }
 
 void TradeManager::fetchOpenOrders(Context &ctx)
 {
+    if (ctx.profile == ConnectionStore::Profile::Paradex) {
+        fetchParadexOpenOrders(ctx);
+        fetchParadexPositions(ctx);
+        return;
+    }
     if (ctx.profile == ConnectionStore::Profile::MexcFutures) {
         fetchFuturesOpenOrders(ctx);
         return;
@@ -7412,10 +8477,16 @@ void TradeManager::fetchOpenOrders(Context &ctx)
                 continue;
             }
             const double price = order.value(QStringLiteral("price")).toString().toDouble();
+            const QString type =
+                order.value(QStringLiteral("type")).toString().trimmed().toUpper();
             const double origQty = order.value(QStringLiteral("origQty")).toString().toDouble();
             const double execQty = order.value(QStringLiteral("executedQty")).toString().toDouble();
             const double remainQty = origQty - execQty;
-            if (price <= 0.0 || remainQty <= 0.0) {
+            if (remainQty <= 0.0) {
+                continue;
+            }
+
+            if (price <= 0.0) {
                 continue;
             }
             DomWidget::LocalOrderMarker marker;
@@ -7468,6 +8539,7 @@ void TradeManager::fetchOpenOrders(Context &ctx)
             }
             emit localOrdersUpdated(ctxPtr->accountName, symbol, output);
         }
+
         ctxPtr->trackedSymbols = newSymbols;
     });
 }
@@ -7634,6 +8706,414 @@ void TradeManager::fetchUzxOpenOrders(Context &ctx)
             emit localOrdersUpdated(ctxPtr->accountName, symbol, output);
         }
         ctxPtr->trackedSymbols = newSymbols;
+    });
+}
+
+static QString paradexHttpBase()
+{
+    return QStringLiteral("https://api.prod.paradex.trade/v1");
+}
+
+static int paradexDecimalsFromStep(const QString &stepStr, int fallback)
+{
+    QString s = stepStr.trimmed();
+    if (s.isEmpty()) {
+        return std::clamp(fallback, 0, 8);
+    }
+    const int dot = s.indexOf(QLatin1Char('.'));
+    if (dot < 0) {
+        return 0;
+    }
+    int decimals = s.size() - dot - 1;
+    while (decimals > 0 && s.endsWith(QLatin1Char('0'))) {
+        s.chop(1);
+        --decimals;
+    }
+    return std::clamp(decimals, 0, 8);
+}
+
+static qint64 paradexPow10(int decimals)
+{
+    decimals = std::clamp(decimals, 0, 12);
+    qint64 v = 1;
+    for (int i = 0; i < decimals; ++i) {
+        v *= 10;
+    }
+    return v;
+}
+
+static double paradexQuantizeDown(double value, double step, int decimals)
+{
+    if (!(value > 0.0) || !(step > 0.0)) {
+        return 0.0;
+    }
+    const qint64 scale = paradexPow10(decimals);
+    const long double scaledValLd = static_cast<long double>(value) * static_cast<long double>(scale);
+    const qint64 scaledVal = static_cast<qint64>(std::floor(scaledValLd + 1e-9L));
+    const long double scaledStepLd = static_cast<long double>(step) * static_cast<long double>(scale);
+    const qint64 scaledStep = std::max<qint64>(1, static_cast<qint64>(std::llround(scaledStepLd)));
+    const qint64 outScaled = (scaledVal / scaledStep) * scaledStep;
+    return static_cast<double>(outScaled) / static_cast<double>(scale);
+}
+
+static double paradexQuantizeUp(double value, double step, int decimals)
+{
+    if (!(value > 0.0) || !(step > 0.0)) {
+        return 0.0;
+    }
+    const qint64 scale = paradexPow10(decimals);
+    const long double scaledValLd = static_cast<long double>(value) * static_cast<long double>(scale);
+    const qint64 scaledVal = static_cast<qint64>(std::ceil(scaledValLd - 1e-9L));
+    const long double scaledStepLd = static_cast<long double>(step) * static_cast<long double>(scale);
+    const qint64 scaledStep = std::max<qint64>(1, static_cast<qint64>(std::llround(scaledStepLd)));
+    const qint64 outScaled = ((scaledVal + scaledStep - 1) / scaledStep) * scaledStep;
+    return static_cast<double>(outScaled) / static_cast<double>(scale);
+}
+
+static QString paradexFormatFixed(double value, int decimals)
+{
+    if (decimals < 0) decimals = 0;
+    QString out = QString::number(value, 'f', decimals);
+    if (decimals > 0) {
+        while (out.endsWith('0')) out.chop(1);
+        if (out.endsWith('.')) out.chop(1);
+    }
+    return out;
+}
+
+void TradeManager::ensureParadexMarketMeta(Context &ctx, const QString &symbolUpper)
+{
+    if (ctx.profile != ConnectionStore::Profile::Paradex) {
+        return;
+    }
+    const QString sym = normalizedSymbol(symbolUpper);
+    if (sym.isEmpty()) {
+        return;
+    }
+    const auto it = ctx.paradexMarketMeta.constFind(sym);
+    if (it != ctx.paradexMarketMeta.constEnd() && it->valid()) {
+        return;
+    }
+    if (ctx.paradexMarketMetaInFlight.contains(sym)) {
+        return;
+    }
+    ctx.paradexMarketMetaInFlight.insert(sym);
+
+    QUrl url(paradexHttpBase() + QStringLiteral("/markets"));
+    QUrlQuery q;
+    q.addQueryItem(QStringLiteral("market"), sym);
+    url.setQuery(q);
+    QNetworkRequest req(url);
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+    auto *reply = ensureParadexNetwork(ctx)->get(req);
+    applyReplyTimeout(reply, 6500);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr = &ctx, sym]() {
+        ctxPtr->paradexMarketMetaInFlight.remove(sym);
+        const auto err = reply->error();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray raw = reply->readAll();
+        const QString errStr = reply->errorString();
+        reply->deleteLater();
+
+        auto flushPendingError = [&](const QString &msg) {
+            const auto pending = ctxPtr->pendingParadexOrders.take(sym);
+            for (const auto &p : pending) {
+                emit orderFailed(ctxPtr->accountName, sym, msg);
+            }
+        };
+
+        if (err != QNetworkReply::NoError || status >= 400) {
+            emit logMessage(QStringLiteral("%1 Paradex market meta fetch failed for %2: %3")
+                                .arg(contextTag(ctxPtr->accountName),
+                                     sym,
+                                     raw.isEmpty() ? errStr : QString::fromUtf8(raw.left(512))));
+            flushPendingError(tr("Paradex market meta fetch failed"));
+            return;
+        }
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            flushPendingError(tr("Paradex market meta parse failed"));
+            return;
+        }
+        const QJsonArray arr = doc.object().value(QStringLiteral("results")).toArray();
+        if (arr.isEmpty() || !arr.first().isObject()) {
+            flushPendingError(tr("Paradex market meta missing"));
+            return;
+        }
+        const QJsonObject obj = arr.first().toObject();
+        const QString sizeStepStr = obj.value(QStringLiteral("order_size_increment")).toString().trimmed();
+        const QString tickStr = obj.value(QStringLiteral("price_tick_size")).toString().trimmed();
+        ParadexMarketMeta meta;
+        meta.orderSizeIncrement = sizeStepStr.toDouble();
+        meta.priceTickSize = tickStr.toDouble();
+        meta.sizeDecimals = paradexDecimalsFromStep(sizeStepStr, 8);
+        meta.priceDecimals = paradexDecimalsFromStep(tickStr, 8);
+        if (!meta.valid()) {
+            flushPendingError(tr("Paradex market meta invalid"));
+            return;
+        }
+        ctxPtr->paradexMarketMeta.insert(sym, meta);
+
+        const auto pending = ctxPtr->pendingParadexOrders.take(sym);
+        for (const auto &p : pending) {
+            placeLimitOrder(p.symbol, ctxPtr->accountName, p.price, p.quantityBase, p.side, p.leverage);
+        }
+        if (ctxPtr->pendingParadexCloseSymbols.contains(sym)) {
+            ctxPtr->pendingParadexCloseSymbols.remove(sym);
+            closePositionMarket(sym, ctxPtr->accountName, 0.0);
+        }
+    });
+}
+
+void TradeManager::fetchParadexOpenOrders(Context &ctx)
+{
+    if (ctx.openOrdersPending) {
+        return;
+    }
+    if (ctx.state != ConnectionState::Connected) {
+        return;
+    }
+    if (ctx.paradexJwt.trimmed().isEmpty()) {
+        return;
+    }
+    ctx.openOrdersPending = true;
+
+    QUrl url(paradexHttpBase() + QStringLiteral("/orders"));
+    QNetworkRequest req(url);
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+    req.setRawHeader("authorization", QByteArray("Bearer ") + ctx.paradexJwt.trimmed().toUtf8());
+    auto *reply = ensureParadexNetwork(ctx)->get(req);
+    applyReplyTimeout(reply, 6500);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr = &ctx]() {
+        ctxPtr->openOrdersPending = false;
+        const auto err = reply->error();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray raw = reply->readAll();
+        const QString errStr = reply->errorString();
+        reply->deleteLater();
+
+        if (err != QNetworkReply::NoError || status >= 400) {
+            emit logMessage(QStringLiteral("%1 Paradex openOrders fetch failed: %2")
+                                .arg(contextTag(ctxPtr->accountName),
+                                     raw.isEmpty() ? errStr : QString::fromUtf8(raw)));
+            return;
+        }
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            return;
+        }
+        const QJsonArray arr = doc.object().value(QStringLiteral("results")).toArray();
+
+        QHash<QString, QVector<DomWidget::LocalOrderMarker>> symbolMap;
+        QSet<QString> newSymbols;
+        QHash<QString, OrderRecord> fetchedOrders;
+        QSet<QString> fetchedSymbols;
+
+        for (const auto &value : arr) {
+            if (!value.isObject()) {
+                continue;
+            }
+            const QJsonObject order = value.toObject();
+            const QString market = normalizedSymbol(order.value(QStringLiteral("market")).toString());
+            if (market.isEmpty()) {
+                continue;
+            }
+            const QString orderId = order.value(QStringLiteral("id")).toString().trimmed();
+            if (orderId.isEmpty()) {
+                continue;
+            }
+            const double price = order.value(QStringLiteral("price")).toString().toDouble();
+            const double remainQty = order.value(QStringLiteral("remaining_size")).toString().toDouble();
+            if (!(remainQty > 0.0)) {
+                continue;
+            }
+            if (!(price > 0.0)) {
+                continue;
+            }
+            DomWidget::LocalOrderMarker marker;
+            marker.price = price;
+            marker.quantity = std::abs(price * remainQty);
+            const QString side = order.value(QStringLiteral("side")).toString().trimmed().toUpper();
+            marker.side = side == QStringLiteral("SELL") ? OrderSide::Sell : OrderSide::Buy;
+            marker.createdMs = order.value(QStringLiteral("created_at")).toVariant().toLongLong();
+            marker.orderId = orderId;
+            newSymbols.insert(market);
+
+            OrderRecord record;
+            record.symbol = market;
+            record.price = price;
+            record.quantityNotional = marker.quantity;
+            record.side = marker.side;
+            record.createdMs = marker.createdMs;
+            record.orderId = orderId;
+            fetchedOrders.insert(orderId, record);
+
+            // Hide only orders that are in the middle of a cancel/replace flow; keep other markers visible.
+            if (!ctxPtr->paradexPendingCancelOrderIds.contains(orderId)) {
+                symbolMap[market].push_back(marker);
+            }
+        }
+
+        QList<OrderRecord> removedOrders;
+        for (auto it = ctxPtr->activeOrders.constBegin(); it != ctxPtr->activeOrders.constEnd(); ++it) {
+            if (!fetchedOrders.contains(it.key())) {
+                OrderRecord record = it.value();
+                record.orderId = it.key();
+                removedOrders.push_back(record);
+            }
+        }
+        ctxPtr->activeOrders = fetchedOrders;
+        for (const auto &record : removedOrders) {
+            emit orderCanceled(ctxPtr->accountName, record.symbol, record.side, record.price, record.orderId);
+        }
+        for (auto it = ctxPtr->paradexPendingCancelOrderIds.begin(); it != ctxPtr->paradexPendingCancelOrderIds.end();) {
+            if (!fetchedOrders.contains(*it)) {
+                it = ctxPtr->paradexPendingCancelOrderIds.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        QSet<QString> allSymbols = ctxPtr->trackedSymbols;
+        allSymbols.unite(newSymbols);
+        for (const QString &symbol : allSymbols) {
+            emit localOrdersUpdated(ctxPtr->accountName, symbol, symbolMap.value(symbol));
+        }
+        ctxPtr->trackedSymbols = newSymbols;
+    });
+}
+
+void TradeManager::fetchParadexPositions(Context &ctx)
+{
+    if (ctx.state != ConnectionState::Connected) {
+        return;
+    }
+    if (ctx.paradexJwt.trimmed().isEmpty()) {
+        return;
+    }
+    const auto toDouble = [](const QJsonValue &v) -> double {
+        if (v.isDouble()) return v.toDouble();
+        if (v.isString()) return v.toString().toDouble();
+        return v.toVariant().toDouble();
+    };
+    const auto toUpperString = [](const QJsonValue &v) -> QString {
+        if (v.isString()) return v.toString().trimmed().toUpper();
+        return v.toVariant().toString().trimmed().toUpper();
+    };
+    QUrl url(paradexHttpBase() + QStringLiteral("/positions"));
+    QNetworkRequest req(url);
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+    req.setRawHeader("authorization", QByteArray("Bearer ") + ctx.paradexJwt.trimmed().toUtf8());
+    auto *reply = ensureParadexNetwork(ctx)->get(req);
+    applyReplyTimeout(reply, 6500);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr = &ctx, toDouble, toUpperString]() {
+        const auto err = reply->error();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray raw = reply->readAll();
+        const QString errStr = reply->errorString();
+        reply->deleteLater();
+        if (err != QNetworkReply::NoError || status >= 400) {
+            emit logMessage(QStringLiteral("%1 Paradex positions fetch failed: %2")
+                                .arg(contextTag(ctxPtr->accountName),
+                                     raw.isEmpty() ? errStr : QString::fromUtf8(raw)));
+            return;
+        }
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            return;
+        }
+        const QJsonArray arr = doc.object().value(QStringLiteral("results")).toArray();
+        QSet<QString> seenSymbols;
+        for (const auto &v : arr) {
+            if (!v.isObject()) continue;
+            const QJsonObject obj = v.toObject();
+            const QString market =
+                normalizedSymbol(obj.contains(QStringLiteral("market"))
+                                     ? obj.value(QStringLiteral("market")).toString()
+                                     : obj.value(QStringLiteral("symbol")).toString());
+            if (market.isEmpty()) continue;
+
+            double qty = 0.0;
+            if (obj.contains(QStringLiteral("size"))) qty = toDouble(obj.value(QStringLiteral("size")));
+            if (!(qty > 0.0) && obj.contains(QStringLiteral("quantity"))) qty = toDouble(obj.value(QStringLiteral("quantity")));
+            if (!(qty > 0.0) && obj.contains(QStringLiteral("position_size"))) qty = toDouble(obj.value(QStringLiteral("position_size")));
+
+            const QString sideStr = toUpperString(obj.value(QStringLiteral("side")));
+            OrderSide side = (sideStr == QStringLiteral("SELL") || sideStr == QStringLiteral("SHORT")) ? OrderSide::Sell
+                                                                                                       : OrderSide::Buy;
+            if (qty < 0.0) {
+                qty = std::abs(qty);
+                side = OrderSide::Sell;
+            }
+
+            TradePosition pos;
+            pos.hasPosition = qty > 0.0;
+            pos.side = side;
+            pos.quantity = qty;
+            pos.qtyMultiplier = 1.0;
+            double entry = 0.0;
+            const QStringList priceKeys = {
+                QStringLiteral("average_entry_price"),
+                QStringLiteral("averageEntryPrice"),
+                QStringLiteral("average_price"),
+                QStringLiteral("avg_price"),
+                QStringLiteral("entry_price"),
+                QStringLiteral("avg_entry_price"),
+                QStringLiteral("avgEntryPrice"),
+                QStringLiteral("entryPrice"),
+                QStringLiteral("open_price"),
+                QStringLiteral("openPrice"),
+                QStringLiteral("average_entry_price_usd"),
+                QStringLiteral("entry_price_usd"),
+            };
+            for (const QString &k : priceKeys) {
+                if (obj.contains(k)) {
+                    entry = toDouble(obj.value(k));
+                    if (entry > 0.0) break;
+                }
+            }
+            pos.averagePrice = entry;
+            if (pos.hasPosition && !(pos.averagePrice > 0.0)) {
+                const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+                const qint64 lastLog = ctxPtr->paradexMissingEntryLogMsBySymbol.value(market, 0);
+                if (lastLog <= 0 || (nowMs - lastLog) > 4000) {
+                    ctxPtr->paradexMissingEntryLogMsBySymbol.insert(market, nowMs);
+                    emit logMessage(QStringLiteral("%1 Paradex position missing entry price for %2 (qty=%3) raw=%4")
+                                        .arg(contextTag(ctxPtr->accountName))
+                                        .arg(market)
+                                        .arg(qty, 0, 'f', 8)
+                                        .arg(QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact).left(256))));
+                }
+            }
+
+            seenSymbols.insert(market);
+
+            const auto it = ctxPtr->positions.constFind(market);
+            const bool changed = (it == ctxPtr->positions.constEnd())
+                                 || it->hasPosition != pos.hasPosition
+                                 || it->side != pos.side
+                                 || std::abs(it->quantity - pos.quantity) > 1e-12
+                                 || std::abs(it->averagePrice - pos.averagePrice) > 1e-12;
+            if (changed) {
+                ctxPtr->positions.insert(market, pos);
+                emitPositionChanged(*ctxPtr, market);
+            }
+        }
+
+        // Clear positions no longer present.
+        QStringList toClear;
+        toClear.reserve(ctxPtr->positions.size());
+        for (auto it = ctxPtr->positions.constBegin(); it != ctxPtr->positions.constEnd(); ++it) {
+            if (!seenSymbols.contains(it.key())) {
+                toClear.push_back(it.key());
+            }
+        }
+        for (const QString &sym : toClear) {
+            const auto it = ctxPtr->positions.constFind(sym);
+            if (it != ctxPtr->positions.constEnd() && it->hasPosition) {
+                ctxPtr->positions.insert(sym, TradePosition{});
+                emitPositionChanged(*ctxPtr, sym);
+            }
+        }
     });
 }
 
@@ -8430,6 +9910,744 @@ void TradeManager::fetchFuturesPositions(Context &ctx)
             }
         }
     });
+}
+
+void TradeManager::finishMexcFuturesConnect(Context &ctx)
+{
+    ctx.futuresAuthPending = false;
+    ctx.futuresRestAuthed = true;
+
+    setState(ctx, ConnectionState::Connected, tr("Connected to MEXC futures"));
+    fetchOpenOrders(ctx);
+    fetchFuturesPositions(ctx);
+    fetchMexcFuturesPlanOrders(ctx);
+
+    if (!ctx.openOrdersTimer.isActive()) {
+        ctx.openOrdersTimer.start();
+    }
+    if (!ctx.futuresDealsTimer.isActive() && !ctx.watchedSymbols.isEmpty()) {
+        ctx.futuresDealsTimer.start();
+    }
+}
+
+void TradeManager::verifyMexcFuturesRestAuth(Context &ctx)
+{
+    if (ctx.profile != ConnectionStore::Profile::MexcFutures) {
+        return;
+    }
+    if (ctx.futuresAuthPending) {
+        return;
+    }
+    if (ctx.futuresRestAuthed && ctx.state == ConnectionState::Connected) {
+        return;
+    }
+
+    ctx.futuresAuthPending = true;
+    const quint64 token = ++ctx.futuresAuthToken;
+    setState(ctx, ConnectionState::Connecting, tr("Validating MEXC futures token..."));
+
+    QNetworkRequest req = makeFuturesRequest(QStringLiteral("/private/position/open_positions"), ctx);
+    auto *reply = ensureMexcNetwork(ctx)->get(req);
+    applyReplyTimeout(reply, 6000);
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr = &ctx, token]() {
+        if (!ctxPtr) {
+            reply->deleteLater();
+            return;
+        }
+        if (ctxPtr->futuresAuthToken != token) {
+            reply->deleteLater();
+            return;
+        }
+        ctxPtr->futuresAuthPending = false;
+
+        const QNetworkReply::NetworkError err = reply->error();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString errString = reply->errorString();
+        const QByteArray raw = reply->readAll();
+        reply->deleteLater();
+
+        auto authFail = [this, ctxPtr](const QString &reason) {
+            ctxPtr->futuresRestAuthed = false;
+            // This is a non-transient error (bad/missing WEB token). Don't auto-reconnect:
+            // user needs to update credentials.
+            closeWebSocket(*ctxPtr);
+            clearLocalOrderSnapshots(*ctxPtr);
+            ctxPtr->hasSubscribed = false;
+            setState(*ctxPtr, ConnectionState::Error, reason);
+            emit logMessage(QStringLiteral("%1 %2 (no auto-reconnect)")
+                                .arg(contextTag(ctxPtr->accountName), reason));
+        };
+
+        if (err != QNetworkReply::NoError || status >= 400) {
+            const QString body = raw.isEmpty() ? errString : QString::fromUtf8(raw);
+            authFail(tr("MEXC futures auth failed: %1").arg(body));
+            return;
+        }
+
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            authFail(tr("MEXC futures auth failed: bad response"));
+            return;
+        }
+        const QJsonObject obj = doc.object();
+        const bool success = obj.value(QStringLiteral("success")).toBool(true);
+        const int code = obj.value(QStringLiteral("code")).toInt(0);
+        if (!success || code != 0) {
+            const QString errMsg =
+                obj.value(QStringLiteral("message"))
+                    .toString(obj.value(QStringLiteral("msg")).toString(QStringLiteral("Auth rejected")));
+            authFail(tr("MEXC futures auth rejected: %1 (code %2)").arg(errMsg).arg(code));
+            return;
+        }
+
+        emit logMessage(QStringLiteral("%1 MEXC futures auth OK")
+                            .arg(contextTag(ctxPtr->accountName)));
+        finishMexcFuturesConnect(*ctxPtr);
+    });
+}
+
+void TradeManager::fetchMexcFuturesPlanOrders(Context &ctx, const QString &symbol)
+{
+    if (ctx.profile != ConnectionStore::Profile::MexcFutures) {
+        return;
+    }
+    if (ctx.state != ConnectionState::Connected || !ctx.futuresRestAuthed) {
+        return;
+    }
+
+    const QString sym = normalizedSymbol(symbol);
+    QStringList symbols;
+    if (!sym.isEmpty()) {
+        symbols.push_back(sym);
+    } else {
+        for (const auto &s : ctx.watchedSymbols) {
+            const QString n = normalizedSymbol(s);
+            if (!n.isEmpty()) {
+                symbols.push_back(n);
+            }
+        }
+        symbols.removeDuplicates();
+    }
+    if (symbols.isEmpty()) {
+        return;
+    }
+
+    // Best-effort: plan order endpoints are not part of the SDK we use for normal futures orders.
+    const QStringList paths = {
+        QStringLiteral("/private/planorder/list/orders"),
+        QStringLiteral("/private/planorder/list"),
+        QStringLiteral("/private/plan_order/list/orders"),
+        QStringLiteral("/private/plan_order/list"),
+    };
+
+    auto toDouble = [](const QJsonValue &value) -> double {
+        if (value.isDouble()) {
+            return value.toDouble();
+        }
+        if (value.isString()) {
+            return value.toString().toDouble();
+        }
+        return value.toVariant().toDouble();
+    };
+
+    auto makeReq = [](const Context &ctx0, const QUrl &url) -> QNetworkRequest {
+        QNetworkRequest req(url);
+        req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+        req.setRawHeader("accept", "*/*");
+        req.setRawHeader("accept-language", "en-US,en;q=0.9,ru;q=0.8");
+        req.setRawHeader("cache-control", "no-cache");
+        req.setRawHeader("pragma", "no-cache");
+        req.setRawHeader("origin", "https://www.mexc.com");
+        req.setRawHeader("referer", "https://www.mexc.com/");
+        req.setRawHeader("user-agent",
+                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                         "Chrome/118.0.0.0 Safari/537.36");
+        req.setRawHeader("x-language", "en-US");
+        if (!ctx0.credentials.uid.trimmed().isEmpty()) {
+            req.setRawHeader("authorization", ctx0.credentials.uid.trimmed().toUtf8());
+        }
+        return req;
+    };
+
+    for (const auto &sym0 : symbols) {
+        auto attempt = std::make_shared<std::function<void(int pathIndex)>>();
+        *attempt = [this,
+                    ctxPtr = &ctx,
+                    sym0,
+                    paths,
+                    toDouble,
+                    attempt,
+                    makeReq](int pathIndex) {
+            if (!ctxPtr || ctxPtr->state != ConnectionState::Connected || !ctxPtr->futuresRestAuthed) {
+                return;
+            }
+            if (pathIndex >= paths.size()) {
+                return;
+            }
+
+            QUrl url(m_futuresBaseUrl + paths[pathIndex]);
+            QUrlQuery q;
+            q.addQueryItem(QStringLiteral("symbol"), sym0);
+            // 1=untriggered per bypass docs; keep only active stops.
+            q.addQueryItem(QStringLiteral("states"), QStringLiteral("1"));
+            q.addQueryItem(QStringLiteral("page_num"), QStringLiteral("1"));
+            q.addQueryItem(QStringLiteral("page_size"), QStringLiteral("50"));
+            url.setQuery(q);
+
+            QNetworkRequest req = makeReq(*ctxPtr, url);
+            auto *reply = ensureMexcNetwork(*ctxPtr)->get(req);
+            applyReplyTimeout(reply, 6000);
+            connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr, sym0, paths, pathIndex, toDouble, attempt]() {
+                const auto err = reply->error();
+                const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                const QByteArray raw = reply->readAll();
+                const QString errString = reply->errorString();
+                reply->deleteLater();
+
+                if (!ctxPtr) {
+                    return;
+                }
+
+                if (err != QNetworkReply::NoError || status >= 400) {
+                    const QString msg = status >= 400
+                                            ? QStringLiteral("HTTP %1: %2").arg(status).arg(QString::fromUtf8(raw))
+                                            : errString;
+                    emit logMessage(QStringLiteral("%1 Futures plan orders fetch failed (%2) for %3: %4")
+                                        .arg(contextTag(ctxPtr->accountName), paths.value(pathIndex), sym0, msg));
+                    (*attempt)(pathIndex + 1);
+                    return;
+                }
+
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                if (doc.isNull()) {
+                    (*attempt)(pathIndex + 1);
+                    return;
+                }
+                QJsonArray arr;
+                if (doc.isObject()) {
+                    const QJsonObject obj = doc.object();
+                    const bool success = obj.value(QStringLiteral("success")).toBool(true);
+                    const int code = obj.value(QStringLiteral("code")).toInt(0);
+                    if (!success || code != 0) {
+                        const QString msg =
+                            obj.value(QStringLiteral("message"))
+                                .toString(obj.value(QStringLiteral("msg")).toString(QStringLiteral("request rejected")));
+                        emit logMessage(QStringLiteral("%1 Futures plan orders rejected for %2: %3 (code %4)")
+                                            .arg(contextTag(ctxPtr->accountName), sym0, msg)
+                                            .arg(code));
+                        return;
+                    }
+                    const QJsonValue dataVal = obj.value(QStringLiteral("data"));
+                    if (dataVal.isArray()) {
+                        arr = dataVal.toArray();
+                    } else if (dataVal.isObject()) {
+                        const QJsonObject dataObj = dataVal.toObject();
+                        if (dataObj.value(QStringLiteral("data")).isArray()) {
+                            arr = dataObj.value(QStringLiteral("data")).toArray();
+                        } else if (dataObj.value(QStringLiteral("orders")).isArray()) {
+                            arr = dataObj.value(QStringLiteral("orders")).toArray();
+                        }
+                    }
+                } else if (doc.isArray()) {
+                    arr = doc.array();
+                }
+
+                if (arr.isEmpty()) {
+                    ctxPtr->mexcFuturesSlPlanOrderIdBySymbol.remove(sym0);
+                    ctxPtr->mexcFuturesSlTriggerBySymbol.remove(sym0);
+                    ctxPtr->mexcFuturesTpPlanOrderIdBySymbol.remove(sym0);
+                    ctxPtr->mexcFuturesTpTriggerBySymbol.remove(sym0);
+                    emit lighterStopOrdersUpdated(ctxPtr->accountName, sym0, false, 0.0, false, 0.0);
+                    return;
+                }
+
+                bool hasSl = false;
+                bool hasTp = false;
+                double slPx = 0.0;
+                double tpPx = 0.0;
+                QString slId;
+                QString tpId;
+
+                const TradePosition pos = ctxPtr->positions.value(sym0, TradePosition{});
+                const bool longPos = (pos.hasPosition && pos.side == OrderSide::Buy);
+                const bool shortPos = (pos.hasPosition && pos.side == OrderSide::Sell);
+
+                for (const auto &v : arr) {
+                    if (!v.isObject()) {
+                        continue;
+                    }
+                    const QJsonObject o = v.toObject();
+                    const QString s = normalizedSymbol(o.value(QStringLiteral("symbol")).toString(sym0));
+                    if (s != sym0) {
+                        continue;
+                    }
+
+                    QString id = o.value(QStringLiteral("orderId")).toVariant().toString();
+                    if (id.isEmpty()) {
+                        id = o.value(QStringLiteral("id")).toVariant().toString();
+                    }
+                    const int triggerType = o.value(QStringLiteral("triggerType")).toInt(
+                        o.value(QStringLiteral("trigger_type")).toInt(-1));
+                    const double triggerPrice = toDouble(o.value(QStringLiteral("triggerPrice")).isUndefined()
+                                                             ? o.value(QStringLiteral("trigger_price"))
+                                                             : o.value(QStringLiteral("triggerPrice")));
+                    if (!(triggerPrice > 0.0) || triggerType <= 0) {
+                        continue;
+                    }
+
+                    // Prefer the close-side from the plan order itself:
+                    // 4=close long, 2=close short (same mapping we use for normal futures orders).
+                    int sideVal = o.value(QStringLiteral("side")).toInt(
+                        o.value(QStringLiteral("sideType")).toInt(-1));
+                    bool longSide = (sideVal == 4);
+                    bool shortSide = (sideVal == 2);
+                    if (!longSide && !shortSide) {
+                        longSide = longPos;
+                        shortSide = shortPos;
+                    }
+                    if (!longSide && !shortSide) {
+                        continue;
+                    }
+
+                    // triggerType: 1 >=, 2 <=  (per bypass docs)
+                    const bool isSl = longSide ? (triggerType == 2) : (triggerType == 1);
+                    const bool isTp = longSide ? (triggerType == 1) : (triggerType == 2);
+
+                    if (isSl && !hasSl) {
+                        hasSl = true;
+                        slPx = triggerPrice;
+                        slId = id;
+                    } else if (isTp && !hasTp) {
+                        hasTp = true;
+                        tpPx = triggerPrice;
+                        tpId = id;
+                    }
+                }
+
+                if (hasSl) {
+                    ctxPtr->mexcFuturesSlPlanOrderIdBySymbol.insert(sym0, slId);
+                    ctxPtr->mexcFuturesSlTriggerBySymbol.insert(sym0, slPx);
+                } else {
+                    ctxPtr->mexcFuturesSlPlanOrderIdBySymbol.remove(sym0);
+                    ctxPtr->mexcFuturesSlTriggerBySymbol.remove(sym0);
+                }
+                if (hasTp) {
+                    ctxPtr->mexcFuturesTpPlanOrderIdBySymbol.insert(sym0, tpId);
+                    ctxPtr->mexcFuturesTpTriggerBySymbol.insert(sym0, tpPx);
+                } else {
+                    ctxPtr->mexcFuturesTpPlanOrderIdBySymbol.remove(sym0);
+                    ctxPtr->mexcFuturesTpTriggerBySymbol.remove(sym0);
+                }
+
+                emit lighterStopOrdersUpdated(ctxPtr->accountName, sym0, hasSl, slPx, hasTp, tpPx);
+            });
+        };
+
+        (*attempt)(0);
+    }
+}
+
+void TradeManager::cancelMexcFuturesStopPlanOrder(Context &ctx,
+                                                 const QString &symbol,
+                                                 bool isStopLoss,
+                                                 std::function<void(bool ok)> after)
+{
+    const QString sym = normalizedSymbol(symbol);
+    if (sym.isEmpty()) {
+        if (after) after(false);
+        return;
+    }
+
+    const QString id = isStopLoss ? ctx.mexcFuturesSlPlanOrderIdBySymbol.value(sym)
+                                  : ctx.mexcFuturesTpPlanOrderIdBySymbol.value(sym);
+    if (id.isEmpty()) {
+        if (after) after(true);
+        return;
+    }
+
+    const QStringList paths = {
+        QStringLiteral("/private/planorder/cancel"),
+        QStringLiteral("/private/plan_order/cancel"),
+        QStringLiteral("/private/planorder/cancel_order"),
+        QStringLiteral("/private/plan_order/cancel_order"),
+    };
+
+    bool okNum = false;
+    const qint64 idNum = id.toLongLong(&okNum);
+
+    QVector<QByteArray> bodies;
+    {
+        auto addObj = [&](const QJsonObject &o) {
+            bodies.push_back(QJsonDocument(o).toJson(QJsonDocument::Compact));
+        };
+        auto addArr = [&](const QJsonArray &a) {
+            bodies.push_back(QJsonDocument(a).toJson(QJsonDocument::Compact));
+        };
+
+        addObj(QJsonObject{
+            {QStringLiteral("symbol"), sym},
+            {QStringLiteral("orderId"), id},
+        });
+        addObj(QJsonObject{
+            {QStringLiteral("orderId"), id},
+        });
+        if (okNum && idNum > 0) {
+            addObj(QJsonObject{
+                {QStringLiteral("symbol"), sym},
+                {QStringLiteral("orderId"), idNum},
+            });
+            addObj(QJsonObject{
+                {QStringLiteral("orderId"), idNum},
+            });
+            addArr(QJsonArray{QJsonValue(idNum)});
+        }
+        addArr(QJsonArray{QJsonObject{
+            {QStringLiteral("symbol"), sym},
+            {QStringLiteral("orderId"), id},
+        }});
+    }
+
+    const int bodyCount = std::max(1, static_cast<int>(bodies.size()));
+    const int totalAttempts = paths.size() * bodyCount;
+
+    auto attempt = std::make_shared<std::function<void(int idx)>>();
+    *attempt = [this, ctxPtr = &ctx, sym, id, isStopLoss, after, paths, bodies, bodyCount, totalAttempts, attempt](int idx) {
+        if (!ctxPtr || ctxPtr->state != ConnectionState::Connected || !ctxPtr->futuresRestAuthed) {
+            if (after) after(false);
+            return;
+        }
+        if (idx >= totalAttempts) {
+            emit orderFailed(ctxPtr->accountName, sym, tr("Failed to cancel MEXC futures stop"));
+            if (after) after(false);
+            return;
+        }
+
+        const int pathIndex = idx / bodyCount;
+        const int bodyIndex = idx % bodyCount;
+        const QByteArray body = bodies.value(bodyIndex);
+
+        QNetworkRequest req = makeFuturesRequest(paths[pathIndex], *ctxPtr, body, true);
+        auto *reply = ensureMexcNetwork(*ctxPtr)->post(req, body);
+        applyReplyTimeout(reply, 6000);
+        connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr, sym, id, isStopLoss, paths, pathIndex, idx, attempt, after]() {
+            const auto err = reply->error();
+            const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const QByteArray raw = reply->readAll();
+            const QString errString = reply->errorString();
+            reply->deleteLater();
+
+            if (!ctxPtr) {
+                if (after) after(false);
+                return;
+            }
+
+            if (err != QNetworkReply::NoError || status >= 400) {
+                const QString msg = status >= 400
+                                        ? QStringLiteral("HTTP %1: %2").arg(status).arg(QString::fromUtf8(raw))
+                                        : errString;
+                emit logMessage(QStringLiteral("%1 Futures stop cancel failed (%2) sym=%3 id=%4: %5")
+                                    .arg(contextTag(ctxPtr->accountName), paths.value(pathIndex), sym, id, msg));
+                (*attempt)(idx + 1);
+                return;
+            }
+
+            const QJsonDocument doc = QJsonDocument::fromJson(raw);
+            if (!doc.isObject()) {
+                (*attempt)(idx + 1);
+                return;
+            }
+            const QJsonObject obj = doc.object();
+            const bool success = obj.value(QStringLiteral("success")).toBool(true);
+            const int code = obj.value(QStringLiteral("code")).toInt(0);
+            if (!success || code != 0) {
+                const QString errMsg =
+                    obj.value(QStringLiteral("message"))
+                        .toString(obj.value(QStringLiteral("msg")).toString(QStringLiteral("Cancel rejected")));
+                emit logMessage(QStringLiteral("%1 Futures stop cancel rejected (%2): %3 (code %4)")
+                                    .arg(contextTag(ctxPtr->accountName), paths.value(pathIndex), errMsg)
+                                    .arg(code));
+                (*attempt)(idx + 1);
+                return;
+            }
+
+            emit logMessage(QStringLiteral("%1 Futures stop cancel ok: %2 %3")
+                                .arg(contextTag(ctxPtr->accountName), sym, id));
+            if (isStopLoss) {
+                ctxPtr->mexcFuturesSlPlanOrderIdBySymbol.remove(sym);
+                ctxPtr->mexcFuturesSlTriggerBySymbol.remove(sym);
+            } else {
+                ctxPtr->mexcFuturesTpPlanOrderIdBySymbol.remove(sym);
+                ctxPtr->mexcFuturesTpTriggerBySymbol.remove(sym);
+            }
+            emit lighterStopOrdersUpdated(ctxPtr->accountName,
+                                          sym,
+                                          ctxPtr->mexcFuturesSlTriggerBySymbol.contains(sym),
+                                          ctxPtr->mexcFuturesSlTriggerBySymbol.value(sym, 0.0),
+                                          ctxPtr->mexcFuturesTpTriggerBySymbol.contains(sym),
+                                          ctxPtr->mexcFuturesTpTriggerBySymbol.value(sym, 0.0));
+            if (after) after(true);
+        });
+    };
+
+    (*attempt)(0);
+}
+
+void TradeManager::placeMexcFuturesStopPlanOrder(Context &ctx,
+                                                const QString &symbol,
+                                                double triggerPrice,
+                                                bool isStopLoss)
+{
+    const QString sym = normalizedSymbol(symbol);
+    if (sym.isEmpty()) {
+        emit orderFailed(ctx.accountName, symbol, tr("Invalid symbol"));
+        return;
+    }
+    if (!(triggerPrice > 0.0)) {
+        emit orderFailed(ctx.accountName, sym, tr("Invalid trigger price"));
+        return;
+    }
+
+    const TradePosition pos = ctx.positions.value(sym, TradePosition{});
+    if (!pos.hasPosition || !(pos.quantity > 0.0) || !(pos.averagePrice > 0.0)) {
+        emit orderFailed(ctx.accountName, sym, tr("No active position for SL/TP"));
+        return;
+    }
+
+    // Determine trigger condition for SL/TP based on position side.
+    // triggerType: 1 >=, 2 <= (per bypass docs)
+    int triggerType = 0;
+    if (pos.side == OrderSide::Buy) {
+        triggerType = isStopLoss ? 2 : 1;
+    } else {
+        triggerType = isStopLoss ? 1 : 2;
+    }
+    const int closeSide = (pos.side == OrderSide::Buy) ? 4 : 2; // close long / close short
+
+    auto decimalsForStep = [](double step) -> int {
+        if (!(step > 0.0)) {
+            return 8;
+        }
+        QString s = QString::number(step, 'f', 12);
+        while (s.contains('.') && s.endsWith('0')) {
+            s.chop(1);
+        }
+        if (s.endsWith('.')) {
+            s.chop(1);
+        }
+        const int dot = s.indexOf('.');
+        return dot >= 0 ? (s.size() - dot - 1) : 0;
+    };
+    auto formatToDecimals = [](double value, int decimals) -> QString {
+        if (decimals < 0) {
+            decimals = 0;
+        }
+        QString out = QString::number(value, 'f', decimals);
+        if (decimals > 0) {
+            while (out.endsWith('0')) {
+                out.chop(1);
+            }
+            if (out.endsWith('.')) {
+                out.chop(1);
+            }
+        }
+        return out;
+    };
+
+    double tickSize = 0.0;
+    const auto metaIt = ctx.futuresContractMeta.constFind(sym);
+    if (metaIt != ctx.futuresContractMeta.constEnd() && metaIt->valid()) {
+        tickSize = metaIt->tickSize;
+    }
+    const int priceDecimals = decimalsForStep(tickSize > 0.0 ? tickSize : 1e-8);
+    const QString triggerStr = formatToDecimals(triggerPrice, priceDecimals);
+
+    // Best-effort plan order creation paths.
+    const QStringList paths = {
+        QStringLiteral("/private/planorder/place"),
+        QStringLiteral("/private/plan_order/place"),
+        QStringLiteral("/private/planorder/submit"),
+        QStringLiteral("/private/plan_order/submit"),
+    };
+
+    // Create a trigger order that closes the whole position by MARKET when hit.
+    // executeCycle: 2 = 7 days (per bypass docs)
+    QVector<QByteArray> bodies;
+    {
+        auto add = [&](const QJsonObject &o) {
+            bodies.push_back(QJsonDocument(o).toJson(QJsonDocument::Compact));
+        };
+
+        QJsonObject base;
+        base.insert(QStringLiteral("symbol"), sym);
+        base.insert(QStringLiteral("vol"), pos.quantity);
+        base.insert(QStringLiteral("side"), closeSide);
+        base.insert(QStringLiteral("openType"), pos.openType > 0 ? pos.openType : 1);
+        base.insert(QStringLiteral("leverage"), pos.leverage > 0 ? pos.leverage : 20);
+        base.insert(QStringLiteral("triggerType"), triggerType);
+        base.insert(QStringLiteral("executeCycle"), 2);
+        base.insert(QStringLiteral("orderType"), 5); // market
+        base.insert(QStringLiteral("trend"), 1); // last price
+
+        // Preferred: string trigger price (avoid float precision errors).
+        QJsonObject v1 = base;
+        v1.insert(QStringLiteral("triggerPrice"), triggerStr);
+        add(v1);
+
+        // Alt: numeric trigger price.
+        QJsonObject v2 = base;
+        v2.insert(QStringLiteral("triggerPrice"), triggerPrice);
+        add(v2);
+
+        // Alt snake_case keys.
+        QJsonObject v3 = base;
+        v3.remove(QStringLiteral("triggerType"));
+        v3.insert(QStringLiteral("trigger_type"), triggerType);
+        v3.insert(QStringLiteral("trigger_price"), triggerStr);
+        add(v3);
+    }
+
+    const int bodyCount = std::max(1, static_cast<int>(bodies.size()));
+    const int totalAttempts = paths.size() * bodyCount;
+
+    auto doPlace = [this,
+                    ctxPtr = &ctx,
+                    sym,
+                    isStopLoss,
+                    triggerPrice,
+                    paths,
+                    bodies,
+                    bodyCount,
+                    totalAttempts](int startIdx) {
+        auto attempt = std::make_shared<std::function<void(int idx)>>();
+        *attempt = [this,
+                    ctxPtr,
+                    sym,
+                    isStopLoss,
+                    triggerPrice,
+                    paths,
+                    bodies,
+                    bodyCount,
+                    totalAttempts,
+                    attempt](int idx) {
+            if (!ctxPtr || ctxPtr->state != ConnectionState::Connected || !ctxPtr->futuresRestAuthed) {
+                return;
+            }
+            if (idx >= totalAttempts) {
+                emit orderFailed(ctxPtr->accountName, sym, tr("Failed to place futures SL/TP"));
+                return;
+            }
+
+            const int pathIndex = idx / bodyCount;
+            const int bodyIndex = idx % bodyCount;
+            const QByteArray body = bodies.value(bodyIndex);
+
+            QNetworkRequest req = makeFuturesRequest(paths[pathIndex], *ctxPtr, body, true);
+            auto *reply = ensureMexcNetwork(*ctxPtr)->post(req, body);
+            applyReplyTimeout(reply, 6000);
+            connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr, sym, isStopLoss, triggerPrice, paths, pathIndex, idx, attempt]() {
+                const auto err = reply->error();
+                const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                const QByteArray raw = reply->readAll();
+                const QString errString = reply->errorString();
+                reply->deleteLater();
+
+                if (!ctxPtr) {
+                    return;
+                }
+
+                if (err != QNetworkReply::NoError || status >= 400) {
+                    const QString msg = status >= 400
+                                            ? QStringLiteral("HTTP %1: %2").arg(status).arg(QString::fromUtf8(raw))
+                                            : errString;
+                    emit logMessage(QStringLiteral("%1 Futures plan place failed (%2) for %3: %4")
+                                        .arg(contextTag(ctxPtr->accountName), paths.value(pathIndex), sym, msg));
+                    (*attempt)(idx + 1);
+                    return;
+                }
+
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
+                if (!doc.isObject()) {
+                    (*attempt)(idx + 1);
+                    return;
+                }
+                const QJsonObject obj = doc.object();
+                const bool success = obj.value(QStringLiteral("success")).toBool(true);
+                const int code = obj.value(QStringLiteral("code")).toInt(0);
+                if (!success || code != 0) {
+                    const QString errMsg =
+                        obj.value(QStringLiteral("message"))
+                            .toString(obj.value(QStringLiteral("msg")).toString(QStringLiteral("request rejected")));
+                    emit logMessage(QStringLiteral("%1 Futures plan place rejected (%2): %3 (code %4)")
+                                        .arg(contextTag(ctxPtr->accountName), paths.value(pathIndex), errMsg)
+                                        .arg(code));
+                    (*attempt)(idx + 1);
+                    return;
+                }
+
+                QString planId = obj.value(QStringLiteral("data")).toVariant().toString();
+                if (planId.isEmpty() && obj.value(QStringLiteral("data")).isObject()) {
+                    planId = obj.value(QStringLiteral("data")).toObject().value(QStringLiteral("id")).toVariant().toString();
+                }
+                if (planId.isEmpty()) {
+                    planId = QStringLiteral("plan_%1").arg(QDateTime::currentMSecsSinceEpoch());
+                }
+
+                if (isStopLoss) {
+                    ctxPtr->mexcFuturesSlPlanOrderIdBySymbol.insert(sym, planId);
+                    ctxPtr->mexcFuturesSlTriggerBySymbol.insert(sym, triggerPrice);
+                } else {
+                    ctxPtr->mexcFuturesTpPlanOrderIdBySymbol.insert(sym, planId);
+                    ctxPtr->mexcFuturesTpTriggerBySymbol.insert(sym, triggerPrice);
+                }
+
+                emit logMessage(QStringLiteral("%1 Futures plan placed: %2 %3 id=%4 @%5")
+                                    .arg(contextTag(ctxPtr->accountName))
+                                    .arg(sym)
+                                    .arg(isStopLoss ? QStringLiteral("SL") : QStringLiteral("TP"))
+                                    .arg(planId)
+                                    .arg(triggerPrice, 0, 'f', 8));
+
+                emit lighterStopOrdersUpdated(ctxPtr->accountName,
+                                              sym,
+                                              ctxPtr->mexcFuturesSlTriggerBySymbol.contains(sym),
+                                              ctxPtr->mexcFuturesSlTriggerBySymbol.value(sym, 0.0),
+                                              ctxPtr->mexcFuturesTpTriggerBySymbol.contains(sym),
+                                              ctxPtr->mexcFuturesTpTriggerBySymbol.value(sym, 0.0));
+
+                fetchMexcFuturesPlanOrders(*ctxPtr, sym);
+            });
+        };
+
+        (*attempt)(startIdx);
+    };
+
+    // Optimistic UI update (same behavior as Lighter/UZX): show immediately, then reconcile from exchange.
+    if (isStopLoss) {
+        ctx.mexcFuturesSlTriggerBySymbol.insert(sym, triggerPrice);
+    } else {
+        ctx.mexcFuturesTpTriggerBySymbol.insert(sym, triggerPrice);
+    }
+    emit lighterStopOrdersUpdated(ctx.accountName,
+                                  sym,
+                                  ctx.mexcFuturesSlTriggerBySymbol.contains(sym),
+                                  ctx.mexcFuturesSlTriggerBySymbol.value(sym, 0.0),
+                                  ctx.mexcFuturesTpTriggerBySymbol.contains(sym),
+                                  ctx.mexcFuturesTpTriggerBySymbol.value(sym, 0.0));
+
+    const QString existingId = isStopLoss ? ctx.mexcFuturesSlPlanOrderIdBySymbol.value(sym)
+                                          : ctx.mexcFuturesTpPlanOrderIdBySymbol.value(sym);
+    if (existingId.isEmpty()) {
+        doPlace(0);
+        return;
+    }
+
+    emit logMessage(QStringLiteral("%1 Futures SL/TP replacing existing %2 id=%3")
+                        .arg(contextTag(ctx.accountName))
+                        .arg(isStopLoss ? QStringLiteral("SL") : QStringLiteral("TP"))
+                        .arg(existingId));
+
+    cancelMexcFuturesStopPlanOrder(ctx, sym, isStopLoss, [doPlace](bool /*ok*/) { doPlace(0); });
 }
 
 void TradeManager::fetchLighterAccount(Context &ctx)
@@ -9327,6 +11545,13 @@ void TradeManager::ensureFuturesContractMeta(Context &ctx, const QString &symbol
                 meta.minVol = dataObj.value(QStringLiteral("minVol")).toInt(1);
                 meta.minLeverage = dataObj.value(QStringLiteral("minLeverage")).toInt(1);
                 meta.maxLeverage = dataObj.value(QStringLiteral("maxLeverage")).toInt(200);
+                meta.tickSize = dataObj.value(QStringLiteral("priceUnit")).toDouble(0.0);
+                if (!(meta.tickSize > 0.0)) {
+                    const int pricePrecision = dataObj.value(QStringLiteral("pricePrecision")).toInt(-1);
+                    if (pricePrecision >= 0) {
+                        meta.tickSize = std::pow(10.0, -static_cast<double>(pricePrecision));
+                    }
+                }
                 meta.minLeverage = std::max(1, meta.minLeverage);
                 meta.maxLeverage = std::max(meta.minLeverage, meta.maxLeverage);
                 ok = meta.valid();
@@ -9348,13 +11573,14 @@ void TradeManager::ensureFuturesContractMeta(Context &ctx, const QString &symbol
         }
 
         ctxPtr->futuresContractMeta.insert(sym, meta);
-        emit logMessage(QStringLiteral("%1 Futures meta %2: contractSize=%3 minVol=%4 volScale=%5 maxLev=%6")
+        emit logMessage(QStringLiteral("%1 Futures meta %2: contractSize=%3 minVol=%4 volScale=%5 maxLev=%6 tick=%7")
                             .arg(contextTag(ctxPtr->accountName))
                             .arg(sym)
                             .arg(meta.contractSize, 0, 'g', 10)
                             .arg(meta.minVol)
                             .arg(meta.volScale)
-                            .arg(meta.maxLeverage));
+                            .arg(meta.maxLeverage)
+                            .arg(meta.tickSize, 0, 'g', 10));
         // Update multiplier for any cached position of this symbol.
         auto posIt = ctxPtr->positions.find(sym);
         if (posIt != ctxPtr->positions.end() && posIt->hasPosition) {
@@ -9373,6 +11599,36 @@ void TradeManager::submitMexcFuturesOrder(Context &ctx,
                                          const PendingFuturesOrder &order,
                                          const FuturesContractMeta &meta)
 {
+    auto decimalsForStep = [](double step) -> int {
+        if (!(step > 0.0)) {
+            return 8;
+        }
+        QString s = QString::number(step, 'f', 12);
+        while (s.contains('.') && s.endsWith('0')) {
+            s.chop(1);
+        }
+        if (s.endsWith('.')) {
+            s.chop(1);
+        }
+        const int dot = s.indexOf('.');
+        return dot >= 0 ? (s.size() - dot - 1) : 0;
+    };
+    auto formatToDecimals = [](double value, int decimals) -> QString {
+        if (decimals < 0) {
+            decimals = 0;
+        }
+        QString out = QString::number(value, 'f', decimals);
+        if (decimals > 0) {
+            while (out.endsWith('0')) {
+                out.chop(1);
+            }
+            if (out.endsWith('.')) {
+                out.chop(1);
+            }
+        }
+        return out;
+    };
+
     const QString sym = normalizedSymbol(order.symbol);
     const double contractSize = meta.contractSize > 0.0 ? meta.contractSize : 1.0;
     const double contractsRaw = order.quantityBase / contractSize;
@@ -9394,10 +11650,26 @@ void TradeManager::submitMexcFuturesOrder(Context &ctx,
         return;
     }
 
+    const double tickSize = meta.tickSize;
+    const int priceDecimals = decimalsForStep(tickSize);
+    QString priceStr;
+    if (tickSize > 0.0) {
+        const qint64 ticks = qRound64(order.price / tickSize);
+        const double quantized = static_cast<double>(ticks) * tickSize;
+        priceStr = formatToDecimals(quantized, priceDecimals);
+    } else {
+        // Fallback: avoid float artifacts (0.14112000000000002) in JSON.
+        priceStr = formatToDecimals(order.price, 8);
+    }
+
     QJsonObject payload;
     payload.insert(QStringLiteral("symbol"), sym);
-    payload.insert(QStringLiteral("price"), order.price);
-    payload.insert(QStringLiteral("vol"), vol);
+    payload.insert(QStringLiteral("price"), priceStr);
+    if (volScale == 0) {
+        payload.insert(QStringLiteral("vol"), static_cast<qint64>(std::llround(vol)));
+    } else {
+        payload.insert(QStringLiteral("vol"), formatToDecimals(vol, volScale));
+    }
     payload.insert(QStringLiteral("side"), order.side == OrderSide::Buy ? 1 : 3);
     payload.insert(QStringLiteral("type"), 1); // limit order
     payload.insert(QStringLiteral("openType"), 1); // isolated margin (matches mexc-futures-sdk defaults)
@@ -9616,9 +11888,6 @@ void TradeManager::appendTradeHistory(const ExecutedTrade &trade)
 
 void TradeManager::pollMyTrades(Context &ctx)
 {
-    if (ctx.profile != ConnectionStore::Profile::MexcSpot) {
-        return;
-    }
     if (ctx.state != ConnectionState::Connected) {
         return;
     }
@@ -9626,6 +11895,9 @@ void TradeManager::pollMyTrades(Context &ctx)
         return;
     }
     if (ctx.watchedSymbols.isEmpty()) {
+        return;
+    }
+    if (ctx.profile != ConnectionStore::Profile::MexcSpot) {
         return;
     }
     for (const QString &sym : ctx.watchedSymbols) {
@@ -10556,6 +12828,175 @@ void TradeManager::fetchMyTrades(Context &ctx, const QString &symbolUpper)
     });
 }
 
+void TradeManager::fetchParadexMyTrades(Context &ctx, const QString &symbolUpper)
+{
+    if (ctx.profile != ConnectionStore::Profile::Paradex) {
+        return;
+    }
+    if (ctx.paradexTradesDisabled) {
+        return;
+    }
+    if (ctx.paradexJwt.trimmed().isEmpty()) {
+        return;
+    }
+    const QString sym = normalizedSymbol(symbolUpper);
+    if (sym.isEmpty()) {
+        return;
+    }
+    ctx.myTradesInFlight.insert(sym);
+
+    auto toDouble = [](const QJsonValue &v) -> double {
+        if (v.isDouble()) return v.toDouble();
+        if (v.isString()) return v.toString().toDouble();
+        return v.toVariant().toDouble();
+    };
+    auto toInt64 = [](const QJsonValue &v) -> qint64 {
+        if (v.isDouble()) return static_cast<qint64>(v.toDouble());
+        if (v.isString()) return v.toString().toLongLong();
+        return v.toVariant().toLongLong();
+    };
+    auto toString = [](const QJsonValue &v) -> QString {
+        if (v.isString()) return v.toString();
+        return v.toVariant().toString();
+    };
+
+    QUrl url(paradexHttpBase() + QStringLiteral("/trades"));
+    QUrlQuery q;
+    q.addQueryItem(QStringLiteral("market"), sym);
+    url.setQuery(q);
+
+    QNetworkRequest req(url);
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+    req.setRawHeader("authorization", QByteArray("Bearer ") + ctx.paradexJwt.trimmed().toUtf8());
+    auto *reply = ensureParadexNetwork(ctx)->get(req);
+    applyReplyTimeout(reply, 6500);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, ctxPtr = &ctx, sym, toDouble, toInt64, toString]() {
+        ctxPtr->myTradesInFlight.remove(sym);
+        const auto err = reply->error();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray raw = reply->readAll();
+        const QString errStr = reply->errorString();
+        reply->deleteLater();
+        if (err != QNetworkReply::NoError || status >= 400) {
+            emit logMessage(QStringLiteral("%1 Paradex trades fetch failed for %2: %3")
+                                .arg(contextTag(ctxPtr->accountName),
+                                     sym,
+                                     raw.isEmpty() ? errStr : QString::fromUtf8(raw)));
+            return;
+        }
+
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (!doc.isObject()) {
+            return;
+        }
+        const QJsonObject obj = doc.object();
+        const QJsonArray arr = obj.value(QStringLiteral("results")).toArray();
+        if (arr.isEmpty()) {
+            return;
+        }
+
+        // IMPORTANT: Some deployments return *public* market trades from `/trades` even with JWT.
+        // Those must NOT be treated as fills, otherwise we spam sounds and corrupt the position model.
+        const QJsonObject firstObj = arr.first().isObject() ? arr.first().toObject() : QJsonObject{};
+        const bool looksAccountScoped =
+            firstObj.contains(QStringLiteral("account")) || firstObj.contains(QStringLiteral("order_id"))
+            || firstObj.contains(QStringLiteral("orderId")) || firstObj.contains(QStringLiteral("client_id"))
+            || firstObj.contains(QStringLiteral("clientId")) || firstObj.contains(QStringLiteral("fee"))
+            || firstObj.contains(QStringLiteral("fee_currency")) || firstObj.contains(QStringLiteral("feeCurrency"));
+        if (!looksAccountScoped) {
+            ctxPtr->paradexTradesDisabled = true;
+            emit logMessage(QStringLiteral("%1 Paradex: /trades looks public; disabling REST fills to avoid spam")
+                                .arg(contextTag(ctxPtr->accountName)));
+            return;
+        }
+
+        struct Row {
+            qint64 ts{0};
+            QString id;
+            QJsonObject o;
+        };
+        QVector<Row> rows;
+        rows.reserve(arr.size());
+        for (const auto &v : arr) {
+            if (!v.isObject()) continue;
+            const QJsonObject o = v.toObject();
+            Row r;
+            r.o = o;
+            r.ts = toInt64(o.value(QStringLiteral("created_at")));
+            r.id = toString(o.value(QStringLiteral("id"))).trimmed();
+            rows.push_back(r);
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
+            if (a.ts != b.ts) return a.ts < b.ts;
+            return a.id < b.id;
+        });
+
+        qint64 lastTs = ctxPtr->paradexLastTradeTsBySymbol.value(sym, 0);
+        QString lastId = ctxPtr->paradexLastTradeIdBySymbol.value(sym);
+        qint64 maxTs = lastTs;
+        QString maxId = lastId;
+
+        for (const auto &r : rows) {
+            const qint64 ts = r.ts;
+            const QString id = r.id;
+            if (ts > 0 && ts < lastTs) continue;
+            if (ts == lastTs && !id.isEmpty() && !lastId.isEmpty() && id <= lastId) continue;
+
+            const QJsonObject o = r.o;
+            const QString account = toString(o.value(QStringLiteral("account"))).trimmed();
+            if (!account.isEmpty() && !ctxPtr->paradexAccount.trimmed().isEmpty()
+                && account.compare(ctxPtr->paradexAccount.trimmed(), Qt::CaseInsensitive) != 0) {
+                // Not our fill; still advance cursor below.
+            } else {
+            const QString market = normalizedSymbol(o.value(QStringLiteral("market")).toString());
+            if (!market.isEmpty() && market != sym) {
+                // still advance cursor below
+            } else {
+                const QString sideStr = toString(o.value(QStringLiteral("side"))).trimmed().toUpper();
+                const OrderSide side = (sideStr == QStringLiteral("SELL")) ? OrderSide::Sell : OrderSide::Buy;
+                const double price = toDouble(o.value(QStringLiteral("price")));
+                double qty = toDouble(o.value(QStringLiteral("size")));
+                if (!(qty > 0.0)) qty = toDouble(o.value(QStringLiteral("qty")));
+                if ((price > 0.0) && (qty > 0.0)) {
+                    double closedNotional = 0.0;
+                    const double realizedDelta = handleOrderFill(*ctxPtr, sym, side, price, qty, &closedNotional);
+
+                    ExecutedTrade trade;
+                    trade.accountName = ctxPtr->accountName;
+                    trade.symbol = sym;
+                    trade.side = side;
+                    trade.price = price;
+                    trade.quantity = qty;
+                    trade.feeAmount = toDouble(o.value(QStringLiteral("fee")));
+                    trade.feeCurrency = toString(o.value(QStringLiteral("fee_currency")));
+                    trade.realizedPnl = realizedDelta;
+                    trade.realizedPct = (closedNotional > 0.0) ? (realizedDelta / closedNotional) * 100.0 : 0.0;
+                    trade.timeMs = ts > 0 ? ts : QDateTime::currentMSecsSinceEpoch();
+                    this->applyExecutedTradeMeta(*ctxPtr, sym, trade);
+                    appendTradeHistory(trade);
+                    recordFinrezTrade(*ctxPtr, trade);
+                    emit tradeExecuted(trade);
+                }
+            }
+            }
+
+            if (ts > maxTs) {
+                maxTs = ts;
+                maxId = id;
+            } else if (ts == maxTs && !id.isEmpty() && !maxId.isEmpty() && id > maxId) {
+                maxId = id;
+            }
+        }
+
+        if (maxTs > 0) {
+            ctxPtr->paradexLastTradeTsBySymbol.insert(sym, maxTs);
+        }
+        if (!maxId.isEmpty()) {
+            ctxPtr->paradexLastTradeIdBySymbol.insert(sym, maxId);
+        }
+    });
+}
+
 TradeManager::Context *TradeManager::contextForProfile(ConnectionStore::Profile profile) const
 {
     return m_contexts.value(profile, nullptr);
@@ -10600,6 +13041,10 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
             ping.insert(QStringLiteral("ping"), ctx->lastPrivatePingSentMs);
             ctx->privateSocket.sendTextMessage(
                 QString::fromUtf8(QJsonDocument(ping).toJson(QJsonDocument::Compact)));
+        } else if (ctx->profile == ConnectionStore::Profile::Paradex) {
+            const int id = std::max(1, ctx->paradexNextRpcId++);
+            ctx->privateSocket.sendTextMessage(
+                QString::fromUtf8(QJsonDocument(paradexHeartbeatMsg(id)).toJson(QJsonDocument::Compact)));
         } else {
             ctx->privateSocket.ping();
         }
@@ -10673,6 +13118,19 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
     });
 
     self->connect(&ctx->privateSocket, &QWebSocket::connected, self, [self, ctx]() {
+        if (ctx->profile == ConnectionStore::Profile::Paradex) {
+            emit self->logMessage(QStringLiteral("%1 Paradex private WebSocket connected.")
+                                      .arg(contextTag(ctx->accountName)));
+            if (ctx->reconnectTimer.isActive()) {
+                ctx->reconnectTimer.stop();
+            }
+            if (!ctx->wsPingTimer.isActive()) {
+                ctx->wsPingTimer.start();
+            }
+            self->setState(*ctx, ConnectionState::Connecting, tr("Authenticating..."));
+            self->sendParadexWsAuth(*ctx);
+            return;
+        }
         if (ctx->profile == ConnectionStore::Profile::UzxSwap
             || ctx->profile == ConnectionStore::Profile::UzxSpot) {
             emit self->logMessage(QStringLiteral("%1 UZX private WebSocket connected.")
@@ -10792,12 +13250,166 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
                           emit self->logMessage(QStringLiteral("%1 WS text: %2")
                                               .arg(contextTag(ctx->accountName), message));
                           return;
-                      }
-                      const QJsonObject obj = doc.object();
-                      if (profile == ConnectionStore::Profile::MexcFutures) {
-                          const QString channel = obj.value(QStringLiteral("channel")).toString();
-                          if (channel.compare(QStringLiteral("pong"), Qt::CaseInsensitive) == 0) {
-                              if (ctx->lastPrivatePingSentMs > 0) {
+                       }
+                       const QJsonObject obj = doc.object();
+                       if (profile == ConnectionStore::Profile::Paradex) {
+                           const int id = obj.value(QStringLiteral("id")).toInt(0);
+                           if (id > 0 && id == ctx->paradexAuthMsgId) {
+                               const QJsonValue errVal = obj.value(QStringLiteral("error"));
+                               if (errVal.isObject()) {
+                                   const QJsonObject e = errVal.toObject();
+                                   const QString msg = e.value(QStringLiteral("message")).toString(tr("Auth failed"));
+                                   emit self->logMessage(QStringLiteral("%1 Paradex auth failed: %2")
+                                                             .arg(contextTag(ctx->accountName), msg));
+                                   self->setState(*ctx, ConnectionState::Error, msg);
+                                   self->scheduleReconnect(*ctx);
+                                } else {
+                                    ctx->paradexWsAuthed = true;
+                                    emit self->logMessage(QStringLiteral("%1 Paradex auth OK").arg(contextTag(ctx->accountName)));
+                                    self->setState(*ctx, ConnectionState::Connected, tr("Connected"));
+                                    self->subscribeParadexPrivate(*ctx);
+                                    if (!ctx->openOrdersTimer.isActive()) {
+                                        self->fetchOpenOrders(*ctx);
+                                        ctx->openOrdersTimer.start();
+                                    }
+                                }
+                                return;
+                            }
+
+                           const auto toDouble = [](const QJsonValue &v) -> double {
+                               if (v.isDouble()) return v.toDouble();
+                               if (v.isString()) return v.toString().toDouble();
+                               return v.toVariant().toDouble();
+                           };
+                           const auto toInt64 = [](const QJsonValue &v) -> qint64 {
+                               if (v.isDouble()) return static_cast<qint64>(v.toDouble());
+                               if (v.isString()) return v.toString().toLongLong();
+                               return v.toVariant().toLongLong();
+                           };
+                           const auto toString = [](const QJsonValue &v) -> QString {
+                               if (v.isString()) return v.toString();
+                               return v.toVariant().toString();
+                           };
+
+                           auto handleFill = [&](const QJsonObject &fill) {
+                               const bool looksAccountScoped =
+                                   fill.contains(QStringLiteral("account"))
+                                   || fill.contains(QStringLiteral("order_id"))
+                                   || fill.contains(QStringLiteral("orderId"))
+                                   || fill.contains(QStringLiteral("client_id"))
+                                   || fill.contains(QStringLiteral("clientId"))
+                                   || fill.contains(QStringLiteral("fee"))
+                                   || fill.contains(QStringLiteral("fee_currency"))
+                                   || fill.contains(QStringLiteral("feeCurrency"));
+                               if (!looksAccountScoped) {
+                                   return;
+                               }
+
+                               const QString market =
+                                   normalizedSymbol(fill.value(QStringLiteral("market")).toString(
+                                       fill.value(QStringLiteral("symbol")).toString()));
+                               if (market.isEmpty()) {
+                                   return;
+                               }
+                               const QString acct = toString(fill.value(QStringLiteral("account"))).trimmed();
+                               if (!acct.isEmpty() && !ctx->paradexAccount.trimmed().isEmpty()
+                                   && acct.compare(ctx->paradexAccount.trimmed(), Qt::CaseInsensitive) != 0) {
+                                   return;
+                               }
+                               const qint64 ts = toInt64(fill.value(QStringLiteral("created_at")));
+                               const QString fillId = toString(fill.value(QStringLiteral("id"))).trimmed();
+
+                               const qint64 lastTs = ctx->paradexLastTradeTsBySymbol.value(market, 0);
+                               const QString lastId = ctx->paradexLastTradeIdBySymbol.value(market);
+                               if (ts > 0 && ts < lastTs) return;
+                               if (ts == lastTs && !fillId.isEmpty() && !lastId.isEmpty() && fillId <= lastId) return;
+
+                               const QString sideStr = toString(fill.value(QStringLiteral("side"))).trimmed().toUpper();
+                               const OrderSide side =
+                                   (sideStr == QStringLiteral("SELL")) ? OrderSide::Sell : OrderSide::Buy;
+                               const double price = toDouble(fill.value(QStringLiteral("price")));
+                               double qty = toDouble(fill.value(QStringLiteral("size")));
+                               if (!(qty > 0.0)) qty = toDouble(fill.value(QStringLiteral("qty")));
+                               if (!(price > 0.0) || !(qty > 0.0)) {
+                                   return;
+                               }
+
+                               double closedNotional = 0.0;
+                               const double realizedDelta = self->handleOrderFill(*ctx, market, side, price, qty, &closedNotional);
+
+                               ExecutedTrade trade;
+                               trade.accountName = ctx->accountName;
+                               trade.symbol = market;
+                               trade.side = side;
+                               trade.price = price;
+                               trade.quantity = qty;
+                               trade.feeAmount = toDouble(fill.value(QStringLiteral("fee")));
+                               trade.feeCurrency = toString(fill.value(QStringLiteral("fee_currency")));
+                               trade.realizedPnl = realizedDelta;
+                               trade.realizedPct = (closedNotional > 0.0) ? (realizedDelta / closedNotional) * 100.0 : 0.0;
+                               trade.timeMs = ts > 0 ? ts : QDateTime::currentMSecsSinceEpoch();
+                               self->applyExecutedTradeMeta(*ctx, market, trade);
+                               self->appendTradeHistory(trade);
+                               self->recordFinrezTrade(*ctx, trade);
+                               emit self->tradeExecuted(trade);
+
+                               if (ts > 0) {
+                                   ctx->paradexLastTradeTsBySymbol.insert(market, std::max(lastTs, ts));
+                               }
+                               if (!fillId.isEmpty()) {
+                                   ctx->paradexLastTradeIdBySymbol.insert(market, fillId);
+                               }
+                           };
+
+                           const QString method = obj.value(QStringLiteral("method")).toString();
+                           if (method == QStringLiteral("subscription")) {
+                               const QJsonObject params = obj.value(QStringLiteral("params")).toObject();
+                               const QString channel = params.value(QStringLiteral("channel")).toString();
+                               const QJsonValue dataVal =
+                                   params.contains(QStringLiteral("data")) ? params.value(QStringLiteral("data"))
+                                                                           : params.value(QStringLiteral("result"));
+                               if (channel.contains(QStringLiteral("fills"), Qt::CaseInsensitive)) {
+                                   if (dataVal.isArray()) {
+                                       const QJsonArray fills = dataVal.toArray();
+                                       for (const auto &v : fills) {
+                                           if (v.isObject()) handleFill(v.toObject());
+                                       }
+                                   } else if (dataVal.isObject()) {
+                                       const QJsonObject o = dataVal.toObject();
+                                       if (o.value(QStringLiteral("fills")).isArray()) {
+                                           const QJsonArray fills = o.value(QStringLiteral("fills")).toArray();
+                                           for (const auto &v : fills) {
+                                               if (v.isObject()) handleFill(v.toObject());
+                                           }
+                                       } else {
+                                           handleFill(o);
+                                       }
+                                   }
+                               }
+                               return;
+                           }
+
+                           // Some servers deliver channel payloads without `method=subscription`.
+                           if (obj.value(QStringLiteral("params")).isObject()) {
+                               const QJsonObject params = obj.value(QStringLiteral("params")).toObject();
+                               const QString channel = params.value(QStringLiteral("channel")).toString();
+                               if (channel.contains(QStringLiteral("fills"), Qt::CaseInsensitive)) {
+                                   const QJsonValue dataVal = params.value(QStringLiteral("data"));
+                                   if (dataVal.isArray()) {
+                                       for (const auto &v : dataVal.toArray()) {
+                                           if (v.isObject()) handleFill(v.toObject());
+                                       }
+                                   } else if (dataVal.isObject()) {
+                                       handleFill(dataVal.toObject());
+                                   }
+                               }
+                           }
+                           return;
+                       }
+                       if (profile == ConnectionStore::Profile::MexcFutures) {
+                           const QString channel = obj.value(QStringLiteral("channel")).toString();
+                           if (channel.compare(QStringLiteral("pong"), Qt::CaseInsensitive) == 0) {
+                               if (ctx->lastPrivatePingSentMs > 0) {
                                   const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
                                   const qint64 delta = std::max<qint64>(0, nowMs - ctx->lastPrivatePingSentMs);
                                   ctx->lastPrivatePingMs = static_cast<int>(delta);
@@ -10870,17 +13482,7 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
                                   emit self->logMessage(QStringLiteral(
                                                             "%1 Subscribed to futures private channels.")
                                                             .arg(contextTag(ctx->accountName)));
-                                  self->setState(*ctx,
-                                                 ConnectionState::Connected,
-                                                 tr("Connected to MEXC futures"));
-                                  self->fetchOpenOrders(*ctx);
-                                  self->fetchFuturesPositions(*ctx);
-                                  if (!ctx->openOrdersTimer.isActive()) {
-                                      ctx->openOrdersTimer.start();
-                                  }
-                                  if (!ctx->futuresDealsTimer.isActive() && !ctx->watchedSymbols.isEmpty()) {
-                                      ctx->futuresDealsTimer.start();
-                                  }
+                                  self->verifyMexcFuturesRestAuth(*ctx);
                               }
                               return;
                           }
@@ -10895,6 +13497,9 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
                                   || channel == QStringLiteral("push.personal.stop.order")
                                   || channel == QStringLiteral("push.personal.stop.planorder")) {
                                   self->fetchOpenOrders(*ctx);
+                                  if (ctx->profile == ConnectionStore::Profile::MexcFutures) {
+                                      self->fetchMexcFuturesPlanOrders(*ctx);
+                                  }
                               }
                               if (channel == QStringLiteral("push.personal.position")
                                   || channel == QStringLiteral("push.personal.asset")
@@ -11461,6 +14066,8 @@ TradeManager::Context &TradeManager::ensureContext(ConnectionStore::Profile prof
 QString TradeManager::defaultAccountName(ConnectionStore::Profile profile) const
 {
     switch (profile) {
+    case ConnectionStore::Profile::Paradex:
+        return QStringLiteral("Paradex");
     case ConnectionStore::Profile::BinanceSpot:
         return QStringLiteral("Binance Spot");
     case ConnectionStore::Profile::BinanceFutures:
@@ -11482,6 +14089,8 @@ QString TradeManager::defaultAccountName(ConnectionStore::Profile profile) const
 QString TradeManager::profileKey(ConnectionStore::Profile profile) const
 {
     switch (profile) {
+    case ConnectionStore::Profile::Paradex:
+        return QStringLiteral("paradex");
     case ConnectionStore::Profile::BinanceSpot:
         return QStringLiteral("binanceSpot");
     case ConnectionStore::Profile::BinanceFutures:

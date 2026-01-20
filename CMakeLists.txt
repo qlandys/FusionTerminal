@@ -113,11 +113,24 @@ if (Qt6_FOUND)
             -DLOGO_BINANCE="${CMAKE_SOURCE_DIR}/assets/img/icons/logos/binance.png"
             -DLOGO_MEXC="${CMAKE_SOURCE_DIR}/assets/img/icons/logos/mexc.png"
             -DLOGO_UZX="${CMAKE_SOURCE_DIR}/assets/img/icons/logos/UZX.png"
+            -DLOGO_PARADEX="${CMAKE_SOURCE_DIR}/assets/img/icons/logos/paradex.png"
             -DSTAMP_FILE="${_plasma_logo_stamp}"
             -P "${CMAKE_SOURCE_DIR}/cmake/RefreshLogoTimestamps.cmake"
         VERBATIM
     )
     add_dependencies(FusionTerminal plasma_refresh_logos)
+
+    find_program(GO_EXE go)
+    if (GO_EXE)
+        add_custom_command(TARGET FusionTerminal POST_BUILD
+            COMMAND "${GO_EXE}" build -trimpath -o "$<TARGET_FILE_DIR:FusionTerminal>/paradex_auth$<$<PLATFORM_ID:Windows>:.exe>"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/tools/paradex_auth"
+            COMMENT "Building Paradex auth helper"
+            VERBATIM
+        )
+    else ()
+        message(STATUS "Go not found; Paradex private auth helper will not be built.")
+    endif ()
 
     if (WIN32)
         find_package(Python3 COMPONENTS Interpreter QUIET)

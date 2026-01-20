@@ -40,6 +40,7 @@ public:
     explicit PrintsWidget(QWidget *parent = nullptr);
 
     void setPrints(const QVector<PrintItem> &items);
+    void injectPrint(double price, double qtyQuote, bool buy, qint64 timeMs = 0);
     void setLadderPrices(const QVector<double> &prices,
                          const QVector<qint64> &rowTicks,
                          int rowHeight,
@@ -118,6 +119,9 @@ private:
     void publishClustersModel();
     void scheduleNextClusterBoundary();
     int resolvedRowForItem(const PrintItem &item, int *outRowIdx = nullptr) const;
+
+    QVector<PrintItem> m_injectedItems;
+    quint64 m_injectedSeq = 0;
 
     QVector<PrintItem> m_items;
     QVector<double> m_prices;

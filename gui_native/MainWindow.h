@@ -457,13 +457,10 @@ private:
     void pruneExpiredPending(MarkerBucket &bucket, bool allowRemoval) const;
     void cancelDelayedMarkers(const QString &symbolUpper, const QString &accountKey = QString());
     void removeMarkerDelayTimer(const QString &timerKey, QTimer *timer);
-    enum class SymbolSource { Mexc, MexcFutures, UzxSpot, UzxSwap, BinanceSpot, BinanceFutures, Lighter };
+    enum class SymbolSource { Mexc, MexcFutures, UzxSpot, UzxSwap, BinanceSpot, BinanceFutures, Lighter, Paradex };
     void fetchSymbolLibrary();
     void fetchSymbolLibrary(SymbolSource source, SymbolPickerDialog *dlg = nullptr);
     void fetchMexcFuturesSymbols();
-    void requestDefaultSymbolAllowList(QStringList symbols,
-                                       QSet<QString> apiOff,
-                                       int fetchedCount);
     void finalizeSymbolFetch(QStringList symbols, QSet<QString> apiOff, int fetchedCount);
     void broadcastSymbolsToPickers(SymbolSource source);
     void setPickersRefreshState(SymbolSource source, bool refreshing);
@@ -537,6 +534,7 @@ private:
     QHash<QString, int> m_mexcFuturesMaxLeverageBySymbol; // SYMBOL -> maxLeverage
     QHash<QString, QList<int>> m_mexcFuturesLeverageTagsBySymbol; // SYMBOL -> suggested leverages
     QHash<QString, int> m_lighterMaxLeverageBySymbol; // SYMBOL -> maxLeverage (perps only)
+    QHash<QString, int> m_paradexMaxLeverageBySymbol; // SYMBOL -> maxLeverage (perps)
     QHash<QString, int> m_uzxSwapMaxLeverageBySymbol; // SYMBOL -> maxLeverage
     QHash<QString, double> m_uzxSwapContractValueBySymbol; // SYMBOL -> swap_value
     QHash<QString, double> m_uzxSwapPriceUnitBySymbol; // SYMBOL -> price_unit
@@ -546,9 +544,11 @@ private:
     QStringList m_binanceSpotSymbols;
     QStringList m_binanceFuturesSymbols;
     QStringList m_lighterSymbols;
+    QStringList m_paradexSymbols;
     QSet<QString> m_uzxSpotApiOff;
     QSet<QString> m_uzxSwapApiOff;
     QSet<QString> m_apiOffSymbols;
+    QSet<QString> m_mexcSpotStSymbols;
     QSet<QString> m_mexcFuturesApiOff;
     QSet<QString> m_lighterApiOff;
     QHash<ConnectionStore::Profile, TradeManager::ConnectionState> m_lastConnStateByProfile;
@@ -564,6 +564,7 @@ private:
     bool m_binanceSpotRequestInFlight = false;
     bool m_binanceFuturesRequestInFlight = false;
     bool m_lighterRequestInFlight = false;
+    bool m_paradexRequestInFlight = false;
     QSet<QString> m_lighterLeverageInFlight;
 
     QTabBar *m_workspaceTabs;
@@ -660,6 +661,8 @@ private:
     QHash<QString, int> m_futuresLeverageBySymbol; // key: SYMBOL (upper), value: leverage
     QHash<QString, std::array<double, 5>> m_notionalPresetsByKey; // key: account|symbol, value: quick size presets
     QHash<QString, int> m_clusterWindowMsByKey; // key: account|symbol, value: cluster bucket window (ms)
+    QHash<QString, double> m_mexcSpotSltpSlByKey; // key: account|symbol, value: SL trigger price
+    QHash<QString, double> m_mexcSpotSltpTpByKey; // key: account|symbol, value: TP trigger price
     bool m_notionalEditActive = false;
 
     QTimer *m_timeTimer;

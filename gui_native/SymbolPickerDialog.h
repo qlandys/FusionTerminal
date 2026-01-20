@@ -5,6 +5,7 @@
 #include <QIcon>
 #include <QMap>
 #include <QPair>
+#include <QPoint>
 #include <QRegularExpression>
 #include <QSortFilterProxyModel>
 #include <QSet>
@@ -19,6 +20,7 @@ class SymbolFilterProxy;
 class QModelIndex;
 class QSortFilterProxyModel;
 class QToolButton;
+class QFrame;
 
 constexpr int kGroupRole = Qt::UserRole + 1;
 
@@ -91,6 +93,9 @@ public:
     explicit SymbolPickerDialog(QWidget *parent = nullptr);
 
     void setSymbols(const QStringList &symbols, const QSet<QString> &apiOff);
+    void setSymbols(const QStringList &symbols,
+                    const QSet<QString> &apiOff,
+                    const QSet<QString> &stSymbols);
     void setAccounts(const QVector<QPair<QString, QColor>> &accounts);
     void setCurrentSymbol(const QString &symbol);
     void setCurrentAccount(const QString &account);
@@ -133,9 +138,15 @@ private:
     QString m_selected;
     QString m_selectedAccount;
     QSet<QString> m_apiOff;
+    QSet<QString> m_stSymbols;
     QIcon m_venueIcon;
     bool m_venueIsFutures{false};
     bool m_venueIsLighter{false};
     int m_hoverRow{-1};
     bool m_refreshInProgress{false};
+
+    QFrame *m_titleBar{nullptr};
+    bool m_dragging{false};
+    QPoint m_dragStartGlobal;
+    QPoint m_dragStartWindowPos;
 };

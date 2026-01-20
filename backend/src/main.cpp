@@ -232,6 +232,12 @@ namespace
         int mexcSpotPollMs{250};        // MEXC spot REST polling interval (fallback)
         std::string mexcSpotMode{"pbws"}; // pbws | rest
 
+        // Paradex (Starknet) public market data
+        std::string paradexEnv{"prod"};            // prod | testnet
+        std::string paradexFeedType{"snapshot"};   // snapshot | deltas | interactive
+        std::string paradexRefreshRate{"100ms"};   // 50ms | 100ms
+        std::string paradexPriceTick{""};          // optional, production only (e.g. 0_1)
+
         std::wstring winProxy; // WinHTTP proxy string; empty means no proxy
         std::wstring proxyUser;
         std::wstring proxyPass;
@@ -539,6 +545,22 @@ namespace
             {
                 cfg.mexcSpotMode = toLowerAscii(value("--mexc-spot-mode"));
             }
+            else if (arg == "--paradex-env")
+            {
+                cfg.paradexEnv = toLowerAscii(value("--paradex-env"));
+            }
+            else if (arg == "--paradex-feed")
+            {
+                cfg.paradexFeedType = toLowerAscii(value("--paradex-feed"));
+            }
+            else if (arg == "--paradex-refresh")
+            {
+                cfg.paradexRefreshRate = toLowerAscii(value("--paradex-refresh"));
+            }
+            else if (arg == "--paradex-price-tick")
+            {
+                cfg.paradexPriceTick = value("--paradex-price-tick");
+            }
             else if (arg == "--no-proxy")
             {
                 cfg.forceNoProxy = true;
@@ -609,6 +631,30 @@ namespace
             if (cfg.mexcSpotMode != "pbws" && cfg.mexcSpotMode != "rest")
             {
                 cfg.mexcSpotMode = "pbws";
+            }
+        }
+
+        if (cfg.exchange == "paradex")
+        {
+            if (cfg.symbol == "BIOUSDT")
+            {
+                cfg.symbol = "ETH-USD-PERP";
+            }
+            if (cfg.paradexEnv != "prod" && cfg.paradexEnv != "testnet")
+            {
+                cfg.paradexEnv = "prod";
+            }
+            if (cfg.paradexFeedType != "snapshot" && cfg.paradexFeedType != "deltas" && cfg.paradexFeedType != "interactive")
+            {
+                cfg.paradexFeedType = "snapshot";
+            }
+            if (cfg.paradexRefreshRate != "50ms" && cfg.paradexRefreshRate != "100ms")
+            {
+                cfg.paradexRefreshRate = "100ms";
+            }
+            if (cfg.snapshotDepth == 0)
+            {
+                cfg.snapshotDepth = 15;
             }
         }
         return cfg;
@@ -687,6 +733,119 @@ namespace
 
         parseSide(j["bids"], bids);
         parseSide(j["asks"], asks);
+        return true;
+    }
+
+    bool fetchParadexMarketInfo(const Config& cfg, double& tickSizeOut)
+    {
+        tickSizeOut = 0.0;
+        const std::string env = toLowerAscii(cfg.paradexEnv);
+        const std::string host = (env == "testnet") ? "api.testnet.paradex.trade" : "api.prod.paradex.trade";
+        auto body = httpGet(cfg, host, "/v1/markets", true);
+        if (!body)
+        {
+            std::cerr << "[backend] paradex markets fetch failed\n";
+            return false;
+        }
+
+        json j;
+        try
+        {
+            j = json::parse(*body);
+        }
+        catch (const std::exception& ex)
+        {
+            std::cerr << "[backend] paradex markets JSON parse error: " << ex.what() << "\n";
+            return false;
+        }
+
+        const json results = j.contains("results") ? j["results"] : json::array();
+        if (!results.is_array())
+        {
+            return false;
+        }
+        for (const auto& m : results)
+        {
+            if (!m.is_object()) continue;
+            const std::string symbol = m.value("symbol", std::string());
+            if (symbol != cfg.symbol) continue;
+            const std::string tickStr = m.value("price_tick_size", std::string());
+            try
+            {
+                tickSizeOut = std::stod(tickStr);
+            }
+            catch (...)
+            {
+                tickSizeOut = 0.0;
+            }
+            return tickSizeOut > 0.0;
+        }
+
+        std::cerr << "[backend] paradex: market not found: " << cfg.symbol << "\n";
+        return false;
+    }
+
+    bool fetchParadexOrderBookSnapshot(const Config& cfg,
+                                       double tickSize,
+                                       std::vector<std::pair<dom::OrderBook::Tick, double>>& bids,
+                                       std::vector<std::pair<dom::OrderBook::Tick, double>>& asks)
+    {
+        bids.clear();
+        asks.clear();
+        if (!(tickSize > 0.0))
+        {
+            return false;
+        }
+        const std::string env = toLowerAscii(cfg.paradexEnv);
+        const std::string host = (env == "testnet") ? "api.testnet.paradex.trade" : "api.prod.paradex.trade";
+
+        const std::size_t depth = std::max<std::size_t>(1, std::min<std::size_t>(cfg.snapshotDepth, 500u));
+        std::ostringstream path;
+        path << "/v1/orderbook/" << cfg.symbol << "?depth=" << depth;
+        auto body = httpGet(cfg, host, path.str(), true);
+        if (!body)
+        {
+            std::cerr << "[backend] paradex orderbook snapshot fetch failed\n";
+            return false;
+        }
+        json j;
+        try
+        {
+            j = json::parse(*body);
+        }
+        catch (const std::exception& ex)
+        {
+            std::cerr << "[backend] paradex orderbook snapshot JSON parse error: " << ex.what() << "\n";
+            return false;
+        }
+
+        auto parseSide = [&](const json& arr,
+                             std::vector<std::pair<dom::OrderBook::Tick, double>>& out) {
+            out.clear();
+            if (!arr.is_array()) return;
+            for (const auto& e : arr)
+            {
+                if (!e.is_array() || e.size() < 2) continue;
+                double price = 0.0;
+                double qty = 0.0;
+                try
+                {
+                    if (e[0].is_string()) price = std::stod(e[0].get<std::string>());
+                    else price = jsonToDouble(e[0]);
+                    if (e[1].is_string()) qty = std::stod(e[1].get<std::string>());
+                    else qty = jsonToDouble(e[1]);
+                }
+                catch (...)
+                {
+                    continue;
+                }
+                if (!(price > 0.0) || !(qty > 0.0)) continue;
+                out.emplace_back(tickFromPrice(price, tickSize), qty);
+            }
+        };
+
+        parseSide(j.value("bids", json::array()), bids);
+        parseSide(j.value("asks", json::array()), asks);
         return true;
     }
 
@@ -4918,6 +5077,452 @@ bool runUzxWebSocket(const Config& config, dom::OrderBook& book, double tickSize
     return true;
 }
 
+#if defined(ORDERBOOK_BACKEND_QT)
+bool runParadexWebSocketQt(const Config& config, dom::OrderBook& book)
+{
+    if (!shouldUseQtSocks5(config))
+    {
+        return false;
+    }
+
+    bool proxyOk = false;
+    const QNetworkProxy proxy = toQtProxy(config, proxyOk);
+    if (!proxyOk)
+    {
+        return false;
+    }
+
+    const std::string env = toLowerAscii(config.paradexEnv);
+    const QString urlStr = QString::fromStdString(
+        std::string("wss://ws.api.") + ((env == "testnet") ? "testnet" : "prod") + ".paradex.trade/v1");
+    const QUrl url(urlStr);
+
+    // Paradex order book channels support a maximum depth of 15 levels.
+    // Avoid probing other depths (200/100/...) to reduce connect spam and latency.
+    static constexpr std::size_t kParadexBookDepth = 15;
+    auto makeBookChannel = [&](std::size_t depth) {
+        std::string ch =
+            "order_book." + config.symbol + "." + config.paradexFeedType + "@" + std::to_string(depth) + "@" +
+            config.paradexRefreshRate;
+        if (!config.paradexPriceTick.empty())
+        {
+            ch += "@" + config.paradexPriceTick;
+        }
+        return ch;
+    };
+    std::string bookChannel = makeBookChannel(kParadexBookDepth);
+    const std::string tradesChannel = "trades." + config.symbol;
+
+    QWebSocket ws;
+    ws.setProxy(proxy);
+
+    QEventLoop loop;
+    QTimer watchdog;
+    watchdog.setSingleShot(true);
+    QObject::connect(&watchdog, &QTimer::timeout, &loop, [&]() {
+        std::cerr << "[backend] paradex ws watchdog timeout\n";
+        ws.close();
+        loop.quit();
+    });
+
+    QObject::connect(&ws, &QWebSocket::connected, &loop, [&]() {
+        watchdog.start(20000);
+        auto sendSub = [&](const std::string& ch, int id) {
+            json sub = {{"id", id}, {"jsonrpc", "2.0"}, {"method", "subscribe"}, {"params", {{"channel", ch}}}};
+            ws.sendTextMessage(QString::fromStdString(sub.dump()));
+        };
+        sendSub(bookChannel, 1);
+        sendSub(tradesChannel, 2);
+        std::cerr << "[backend] paradex subscribed (Qt): " << bookChannel << " | " << tradesChannel << "\n";
+    });
+
+    QObject::connect(&ws, &QWebSocket::disconnected, &loop, [&]() {
+        loop.quit();
+    });
+
+    QObject::connect(&ws, &QWebSocket::errorOccurred, &loop, [&](QAbstractSocket::SocketError) {
+        std::cerr << "[backend] paradex ws error (Qt): " << ws.errorString().toStdString() << "\n";
+    });
+
+    auto emitTrade = [&](double price, double qty, bool isBuy, std::int64_t ts) {
+        json t;
+        t["type"] = "trade";
+        t["symbol"] = config.symbol;
+        t["price"] = price;
+        t["qty"] = qty;
+        t["side"] = isBuy ? "buy" : "sell";
+        t["timestamp"] = ts;
+        tradeBatcher().add(config.symbol, std::move(t));
+    };
+
+    auto lastEmit = std::chrono::steady_clock::now();
+
+    QObject::connect(&ws, &QWebSocket::textMessageReceived, &loop, [&](const QString& msg) {
+        watchdog.start(20000);
+        json j;
+        try
+        {
+            j = json::parse(msg.toStdString());
+        }
+        catch (...)
+        {
+            return;
+        }
+        if (!(j.contains("method") && j["method"].is_string() && j["method"].get<std::string>() == "subscription"))
+        {
+            return;
+        }
+
+        const json params = j.value("params", json::object());
+        const std::string channel = params.value("channel", std::string());
+        const json data = params.value("data", json::object());
+        if (!data.is_object())
+        {
+            return;
+        }
+
+        if (channel.rfind("order_book.", 0) == 0)
+        {
+            const json arr = data.value("inserts", json::array());
+            if (!arr.is_array())
+            {
+                return;
+            }
+            std::vector<std::pair<dom::OrderBook::Tick, double>> bids;
+            std::vector<std::pair<dom::OrderBook::Tick, double>> asks;
+            bids.reserve(arr.size());
+            asks.reserve(arr.size());
+            const double tickSize = book.tickSize();
+            for (const auto& e : arr)
+            {
+                if (!e.is_object()) continue;
+                const std::string side = e.value("side", std::string());
+                const std::string p = e.value("price", std::string());
+                const std::string s = e.value("size", std::string());
+                double price = 0.0;
+                double qty = 0.0;
+                try
+                {
+                    price = std::stod(p);
+                    qty = std::stod(s);
+                }
+                catch (...)
+                {
+                    continue;
+                }
+                if (!(price > 0.0) || !(qty >= 0.0)) continue;
+                const auto tick = tickFromPrice(price, tickSize);
+                if (side == "BUY") bids.emplace_back(tick, qty);
+                else if (side == "SELL") asks.emplace_back(tick, qty);
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(g_bookMutex);
+            book.loadSnapshot(bids, asks);
+            if (now - lastEmit >= config.throttle)
+            {
+                lastEmit = now;
+                std::int64_t ts = data.value("last_updated_at", 0LL);
+                if (ts <= 0)
+                {
+                    ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+                }
+                emitLadder(config, book, book.bestBid(), book.bestAsk(), ts);
+            }
+            return;
+        }
+
+        if (channel.rfind("trades.", 0) == 0)
+        {
+            const double price = data.contains("price") ? jsonToDouble(data["price"]) : 0.0;
+            const double qty = data.contains("size") ? jsonToDouble(data["size"]) : 0.0;
+            if (!(price > 0.0) || !(qty > 0.0))
+            {
+                return;
+            }
+            const std::string side = data.value("side", std::string());
+            const bool isBuy = (side == "BUY");
+            std::int64_t ts = data.value("created_at", 0LL);
+            if (ts <= 0)
+            {
+                ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+            }
+            emitTrade(price, qty, isBuy, ts);
+        }
+    });
+
+    std::cerr << "[backend] paradex: using Qt WebSocket (proxy)\n";
+    ws.open(url);
+    loop.exec();
+    return true;
+}
+#endif
+
+[[noreturn]] void runParadexWebSocket(const Config& config, dom::OrderBook& book)
+{
+#if defined(ORDERBOOK_BACKEND_QT)
+    if (runParadexWebSocketQt(config, book))
+    {
+        throw std::runtime_error("paradex ws exited (qt)");
+    }
+#endif
+    const std::string env = toLowerAscii(config.paradexEnv);
+    const std::wstring host =
+        toWide(std::string("ws.api.") + ((env == "testnet") ? "testnet" : "prod") + ".paradex.trade");
+    const std::wstring path = L"/v1";
+
+    WinHttpHandle session = openSession(config);
+    if (!session.valid())
+    {
+        throw std::runtime_error(winhttpError("WinHttpOpen"));
+    }
+
+    WinHttpHandle connection(
+        WinHttpConnect(session.get(), host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
+    if (!connection.valid())
+    {
+        throw std::runtime_error(winhttpError("WinHttpConnect"));
+    }
+
+    WinHttpHandle request(WinHttpOpenRequest(connection.get(),
+                                             L"GET",
+                                             path.c_str(),
+                                             nullptr,
+                                             WINHTTP_NO_REFERER,
+                                             WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                             WINHTTP_FLAG_SECURE));
+    if (!request.valid())
+    {
+        throw std::runtime_error(winhttpError("WinHttpOpenRequest"));
+    }
+
+    applyProxyCredentials(config, request.get());
+    if (!WinHttpSetOption(request.get(), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0))
+    {
+        throw std::runtime_error(winhttpError("WinHttpSetOption"));
+    }
+
+    if (!WinHttpSendRequest(request.get(),
+                            WINHTTP_NO_ADDITIONAL_HEADERS,
+                            0,
+                            WINHTTP_NO_REQUEST_DATA,
+                            0,
+                            0,
+                            0))
+    {
+        throw std::runtime_error(winhttpError("WinHttpSendRequest"));
+    }
+
+    if (!WinHttpReceiveResponse(request.get(), nullptr))
+    {
+        throw std::runtime_error(winhttpError("WinHttpReceiveResponse"));
+    }
+
+    HINTERNET rawSocket = WinHttpWebSocketCompleteUpgrade(request.get(), 0);
+    if (!rawSocket)
+    {
+        throw std::runtime_error(winhttpError("WinHttpWebSocketCompleteUpgrade"));
+    }
+    request.reset();
+
+    // Paradex order book channels support a maximum depth of 15 levels.
+    static constexpr std::size_t kParadexBookDepth = 15;
+    auto makeBookChannel = [&](std::size_t depth) {
+        std::string ch =
+            "order_book." + config.symbol + "." + config.paradexFeedType + "@" + std::to_string(depth) + "@" +
+            config.paradexRefreshRate;
+        if (!config.paradexPriceTick.empty())
+        {
+            ch += "@" + config.paradexPriceTick;
+        }
+        return ch;
+    };
+    std::string bookChannel = makeBookChannel(kParadexBookDepth);
+    const std::string tradesChannel = "trades." + config.symbol;
+
+    auto sendSub = [&](const std::string& ch, int id) {
+        json sub = {{"id", id}, {"jsonrpc", "2.0"}, {"method", "subscribe"}, {"params", {{"channel", ch}}}};
+        const std::string subStr = sub.dump();
+        WinHttpWebSocketSend(rawSocket,
+                             WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                             (void*)subStr.data(),
+                             static_cast<DWORD>(subStr.size()));
+    };
+    sendSub(bookChannel, 1);
+    sendSub(tradesChannel, 2);
+    std::cerr << "[backend] paradex subscribed: " << bookChannel << " | " << tradesChannel << "\n";
+
+    std::vector<unsigned char> buffer(256 * 1024);
+    std::string textBuffer;
+    textBuffer.reserve(16 * 1024);
+    auto lastEmit = std::chrono::steady_clock::now();
+
+    auto emitTrade = [&](double price, double qty, bool isBuy, std::int64_t ts) {
+        json t;
+        t["type"] = "trade";
+        t["symbol"] = config.symbol;
+        t["price"] = price;
+        t["qty"] = qty;
+        t["side"] = isBuy ? "buy" : "sell";
+        t["timestamp"] = ts;
+        tradeBatcher().add(config.symbol, std::move(t));
+    };
+
+    for (;;)
+    {
+        DWORD received = 0;
+        WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
+        HRESULT hr =
+            WinHttpWebSocketReceive(rawSocket, buffer.data(), static_cast<DWORD>(buffer.size()), &received, &type);
+        if (FAILED(hr))
+        {
+            std::cerr << "[backend] paradex ws receive failed: " << std::hex << hr << std::dec << "\n";
+            break;
+        }
+        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE)
+        {
+            std::cerr << "[backend] paradex ws closed by server\n";
+            break;
+        }
+        if (received == 0)
+        {
+            continue;
+        }
+
+        if (type != WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE &&
+            type != WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
+        {
+            continue;
+        }
+
+        if (type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
+        {
+            textBuffer.append(reinterpret_cast<const char*>(buffer.data()), received);
+            if (textBuffer.size() > 1024 * 1024)
+            {
+                std::cerr << "[backend] paradex ws text fragment buffer too large, dropping\n";
+                textBuffer.clear();
+            }
+            continue;
+        }
+
+        std::string text;
+        if (!textBuffer.empty())
+        {
+            textBuffer.append(reinterpret_cast<const char*>(buffer.data()), received);
+            text.swap(textBuffer);
+            textBuffer.clear();
+        }
+        else
+        {
+            text.assign(reinterpret_cast<const char*>(buffer.data()), received);
+        }
+
+        json j;
+        try
+        {
+            j = json::parse(text);
+        }
+        catch (...)
+        {
+            continue;
+        }
+
+        if (!(j.contains("method") && j["method"].is_string() && j["method"].get<std::string>() == "subscription"))
+        {
+            continue;
+        }
+
+        const json params = j.value("params", json::object());
+        const std::string channel = params.value("channel", std::string());
+        const json data = params.value("data", json::object());
+        if (!data.is_object())
+        {
+            continue;
+        }
+
+        if (channel.rfind("order_book.", 0) == 0)
+        {
+            const json arr = data.value("inserts", json::array());
+            if (!arr.is_array())
+            {
+                continue;
+            }
+            std::vector<std::pair<dom::OrderBook::Tick, double>> bids;
+            std::vector<std::pair<dom::OrderBook::Tick, double>> asks;
+            bids.reserve(arr.size());
+            asks.reserve(arr.size());
+            const double tickSize = book.tickSize();
+            for (const auto& e : arr)
+            {
+                if (!e.is_object()) continue;
+                const std::string side = e.value("side", std::string());
+                const std::string p = e.value("price", std::string());
+                const std::string s = e.value("size", std::string());
+                double price = 0.0;
+                double qty = 0.0;
+                try
+                {
+                    price = std::stod(p);
+                    qty = std::stod(s);
+                }
+                catch (...)
+                {
+                    continue;
+                }
+                if (!(price > 0.0) || !(qty >= 0.0)) continue;
+                const auto tick = tickFromPrice(price, tickSize);
+                if (side == "BUY") bids.emplace_back(tick, qty);
+                else if (side == "SELL") asks.emplace_back(tick, qty);
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(g_bookMutex);
+            book.loadSnapshot(bids, asks);
+            if (now - lastEmit >= config.throttle)
+            {
+                lastEmit = now;
+                std::int64_t ts = data.value("last_updated_at", 0LL);
+                if (ts <= 0)
+                {
+                    ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+                }
+                emitLadder(config, book, book.bestBid(), book.bestAsk(), ts);
+            }
+            continue;
+        }
+
+        if (channel.rfind("trades.", 0) == 0)
+        {
+            const double price = data.contains("price") ? jsonToDouble(data["price"]) : 0.0;
+            const double qty = data.contains("size") ? jsonToDouble(data["size"]) : 0.0;
+            if (!(price > 0.0) || !(qty > 0.0))
+            {
+                continue;
+            }
+            const std::string side = data.value("side", std::string());
+            const bool isBuy = (side == "BUY");
+            std::int64_t ts = data.value("created_at", 0LL);
+            if (ts <= 0)
+            {
+                ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+            }
+            emitTrade(price, qty, isBuy, ts);
+        }
+    }
+
+    WinHttpCloseHandle(rawSocket);
+    throw std::runtime_error("paradex ws closed");
+}
+
 int main(int argc, char** argv)
 {
 #if defined(ORDERBOOK_BACKEND_QT)
@@ -5075,6 +5680,42 @@ int main(int argc, char** argv)
             }
             g_bookReady.store(true);
             runLighterWebSocket(cfg, book, marketId);
+        }
+        else if (cfg.exchange == "paradex")
+        {
+            std::cerr << "[backend] starting Paradex depth for " << cfg.symbol << std::endl;
+            double tickSize = 0.0;
+            if (!fetchParadexMarketInfo(cfg, tickSize))
+            {
+                std::cerr << "[backend] paradex: failed to determine tick size, exiting\n";
+                return 1;
+            }
+            book.setTickSize(tickSize);
+
+            std::vector<std::pair<dom::OrderBook::Tick, double>> bids;
+            std::vector<std::pair<dom::OrderBook::Tick, double>> asks;
+            if (fetchParadexOrderBookSnapshot(cfg, tickSize, bids, asks))
+            {
+                book.loadSnapshot(bids, asks);
+            }
+            else
+            {
+                std::cerr << "[backend] paradex snapshot failed, continuing with empty book\n";
+            }
+            if (book.tickSize() > 0.0 && book.bestBid() > 0.0 && book.bestAsk() > 0.0)
+            {
+                const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                emitLadder(cfg, book, book.bestBid(), book.bestAsk(), nowMs);
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_bookMutex);
+                g_bookPtr = &book;
+                g_activeConfig = cfg;
+            }
+            g_bookReady.store(true);
+            runParadexWebSocket(cfg, book);
         }
         else
         {

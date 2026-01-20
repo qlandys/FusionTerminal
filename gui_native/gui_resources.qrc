@@ -9,6 +9,7 @@
         <file alias="icons/logos/binance.png">../assets/img/icons/logos/binance.png</file>
         <file alias="icons/logos/lighter.png">../assets/img/icons/logos/lighter.png</file>
         <file alias="icons/logos/mexc.png">../assets/img/icons/logos/mexc.png</file>
+        <file alias="icons/logos/paradex.png">../assets/img/icons/logos/paradex.png</file>
         <file alias="icons/logos/UZX.png">../assets/img/icons/logos/UZX.png</file>
         <!-- audio (embedded to avoid external file dependency) -->
         <file alias="sounds/notification.wav">../assets/sounds/notification.wav</file>

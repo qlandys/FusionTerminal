@@ -312,6 +312,64 @@ void PrintsWidget::setPrints(const QVector<PrintItem> &items)
     updateClustersQml();
 }
 
+void PrintsWidget::injectPrint(double price, double qtyQuote, bool buy, qint64 timeMs)
+{
+    if (!(price > 0.0) || !(qtyQuote > 0.0)) {
+        return;
+    }
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (timeMs <= 0) {
+        timeMs = nowMs;
+    }
+
+    // Keep injected prints short-lived: just enough to show "fill happened" feedback.
+    static constexpr qint64 kMaxAgeMs = 12 * 1000;
+    static constexpr int kMaxItems = 40;
+
+    PrintItem item;
+    item.price = price;
+    item.qty = qtyQuote;
+    item.buy = buy;
+    item.rowHint = -1;
+    item.tick = tickForPrice(price);
+    item.timeMs = timeMs;
+    item.seq = (static_cast<quint64>(1) << 63) + (++m_injectedSeq);
+
+    m_injectedItems.push_back(item);
+    if (m_injectedItems.size() > kMaxItems) {
+        m_injectedItems.erase(m_injectedItems.begin(),
+                              m_injectedItems.begin() + (m_injectedItems.size() - kMaxItems));
+    }
+    while (!m_injectedItems.isEmpty()
+           && m_injectedItems.first().timeMs > 0
+           && (nowMs - m_injectedItems.first().timeMs) > kMaxAgeMs) {
+        m_injectedItems.removeFirst();
+    }
+
+    ClusterTrade t;
+    t.price = item.price;
+    t.tick = item.tick;
+    t.qty = item.qty;
+    t.buy = item.buy;
+    t.timeMs = item.timeMs;
+    t.seq = item.seq;
+    m_clusterTrades.push_back(t);
+    ingestClusterTrade(t, nowMs);
+
+    if (!m_disableAnimations) {
+        const QString key = makeKey(item);
+        if (!m_spawnProgress.contains(key)) {
+            m_spawnProgress.insert(key, 0.0);
+        }
+        if (!m_animTimer.isActive()) {
+            m_animTimer.start(16, this);
+        }
+    }
+
+    updatePrintsQml();
+    updateClustersQml();
+}
+
 void PrintsWidget::setLadderPrices(const QVector<double> &prices,
                                    const QVector<qint64> &rowTicks,
                                    int rowHeight,
@@ -881,7 +939,13 @@ void PrintsWidget::updatePrintsQml()
     ThemeManager *theme = ThemeManager::instance();
     QVector<PrintCirclesModel::Entry> entries;
     const int rowCount = m_prices.size();
-    const int count = m_items.size();
+    QVector<PrintItem> combined;
+    if (!m_items.isEmpty() || !m_injectedItems.isEmpty()) {
+        combined.reserve(m_items.size() + m_injectedItems.size());
+        combined += m_items;
+        combined += m_injectedItems;
+    }
+    const int count = combined.size();
     if (rowCount > 0 && count > 0) {
         const int widgetWidth = std::max(1, width());
         const int slotCount = std::max(6, widgetWidth / 24);
@@ -889,7 +953,7 @@ void PrintsWidget::updatePrintsQml()
         const int startIdx = count > visibleSlots ? (count - visibleSlots) : 0;
         entries.reserve(count - startIdx);
         for (int i = startIdx; i < count; ++i) {
-            const PrintItem &item = m_items[i];
+            const PrintItem &item = combined[i];
             const QString key = makeKey(item);
             const double spawn = std::clamp(m_spawnProgress.value(key, 1.0), 0.0, 1.0);
             const double eased = 1.0 - std::pow(1.0 - spawn, 3.0);

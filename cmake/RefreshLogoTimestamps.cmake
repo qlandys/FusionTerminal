@@ -1,5 +1,5 @@
 set(LOGO_FILES "")
-foreach(var IN ITEMS LOGO_BINANCE LOGO_MEXC LOGO_UZX)
+foreach(var IN ITEMS LOGO_BINANCE LOGO_MEXC LOGO_UZX LOGO_PARADEX)
   if(DEFINED ${var} AND NOT "${${var}}" STREQUAL "")
     list(APPEND LOGO_FILES "${${var}}")
   endif()

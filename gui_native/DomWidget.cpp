@@ -1611,6 +1611,26 @@ void DomWidget::updateQuickSnapshot()
                 bidQty = 0.0;
                 askQty = 0.0;
             }
+
+            // Paradex order book WS depth is limited; show our own resting orders as synthetic liquidity
+            // when the exchange doesn't provide that price level in the current snapshot.
+            if (lvl.tick != 0 && lvl.price > 0.0 && !m_cachedMarkersByTick.isEmpty()) {
+                const auto it = m_cachedMarkersByTick.constFind(lvl.tick);
+                if (it != m_cachedMarkersByTick.constEnd() && it->notional > 0.0) {
+                    const double baseQty = it->notional / std::abs(lvl.price);
+                    if (baseQty > 0.0) {
+                        if (it->buy) {
+                            if (!(bidQty > 0.0)) {
+                                bidQty = baseQty;
+                            }
+                        } else {
+                            if (!(askQty > 0.0)) {
+                                askQty = baseQty;
+                            }
+                        }
+                    }
+                }
+            }
             const bool hasBid = bidQty > 0.0;
             const bool hasAsk = askQty > 0.0;
             // In GPU mode we rely on incremental bucket updates. During volatility a top-of-book

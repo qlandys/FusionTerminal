@@ -377,6 +377,8 @@ QString statusColor(TradeManager::ConnectionState state)
 QString exchangeTitle(ConnectionStore::Profile profile)
 {
     switch (profile) {
+    case ConnectionStore::Profile::Paradex:
+        return QObject::tr("Paradex");
     case ConnectionStore::Profile::MexcFutures:
         return QObject::tr("MEXC Futures");
     case ConnectionStore::Profile::Lighter:
@@ -398,6 +400,8 @@ QString exchangeTitle(ConnectionStore::Profile profile)
 QString exchangeIconRelative(ConnectionStore::Profile profile)
 {
     switch (profile) {
+    case ConnectionStore::Profile::Paradex:
+        return QStringLiteral("icons/logos/paradex.png");
     case ConnectionStore::Profile::BinanceSpot:
     case ConnectionStore::Profile::BinanceFutures:
         return QStringLiteral("icons/logos/binance.png");
@@ -706,6 +710,8 @@ static bool savedProxyNameExists(const QString &name)
 QString idFromProfile(ConnectionStore::Profile profile)
 {
     switch (profile) {
+    case ConnectionStore::Profile::Paradex:
+        return QStringLiteral("paradex");
     case ConnectionStore::Profile::MexcFutures:
         return QStringLiteral("mexcFutures");
     case ConnectionStore::Profile::Lighter:
@@ -727,6 +733,8 @@ QString idFromProfile(ConnectionStore::Profile profile)
 QString defaultColorForProfile(ConnectionStore::Profile profile)
 {
     switch (profile) {
+    case ConnectionStore::Profile::Paradex:
+        return QStringLiteral("#7c3aed");
     case ConnectionStore::Profile::MexcFutures:
         return QStringLiteral("#f5b642");
     case ConnectionStore::Profile::Lighter:
@@ -904,6 +912,7 @@ ConnectionsWindow::ConnectionsWindow(ConnectionStore *store, TradeManager *manag
     menu->addAction(tr("Lighter"), this, [addProfile]() { addProfile(ConnectionStore::Profile::Lighter); });
     menu->addAction(tr("Binance Spot"), this, [addProfile]() { addProfile(ConnectionStore::Profile::BinanceSpot); });
     menu->addAction(tr("Binance Futures"), this, [addProfile]() { addProfile(ConnectionStore::Profile::BinanceFutures); });
+    menu->addAction(tr("Paradex"), this, [addProfile]() { addProfile(ConnectionStore::Profile::Paradex); });
     menu->addAction(tr("UZX Swap"), this, [addProfile]() { addProfile(ConnectionStore::Profile::UzxSwap); });
     menu->addAction(tr("UZX Spot"), this, [addProfile]() { addProfile(ConnectionStore::Profile::UzxSpot); });
     addButton->setMenu(menu);
@@ -1041,6 +1050,7 @@ ConnectionsWindow::CardWidgets *ConnectionsWindow::createCard(const QString &pro
     card->type = type;
     card->color = QColor(defaultColorForProfile(type));
     const bool isLighter = (type == ConnectionStore::Profile::Lighter);
+    const bool isParadex = (type == ConnectionStore::Profile::Paradex);
 
     auto *frame = new QFrame(this);
     card->frame = frame;
@@ -1297,10 +1307,14 @@ ConnectionsWindow::CardWidgets *ConnectionsWindow::createCard(const QString &pro
         bodyLayout->addWidget(cfgRow);
     }
 
-    card->apiKeyEdit = new QLineEdit(card->body);
-    card->apiKeyEdit->setPlaceholderText(tr("API key"));
+    if (!isParadex) {
+        card->apiKeyEdit = new QLineEdit(card->body);
+        card->apiKeyEdit->setPlaceholderText(tr("API key"));
+    } else {
+        card->apiKeyEdit = nullptr;
+    }
     card->secretEdit = new QLineEdit(card->body);
-    card->secretEdit->setPlaceholderText(tr("API secret"));
+    card->secretEdit->setPlaceholderText(isParadex ? tr("Paradex private key (0x...)") : tr("API secret"));
     card->secretEdit->setEchoMode(QLineEdit::Password);
     card->passphraseEdit = new QLineEdit(card->body);
     card->passphraseEdit->setPlaceholderText(tr("Passphrase (UZX)"));
@@ -1351,7 +1365,9 @@ ConnectionsWindow::CardWidgets *ConnectionsWindow::createCard(const QString &pro
     // Seed phrase entry is handled only via the Lighter setup dialog (Create API).
     card->seedPhraseEdit = nullptr;
 
-    bodyLayout->addWidget(card->apiKeyEdit);
+    if (card->apiKeyEdit) {
+        bodyLayout->addWidget(card->apiKeyEdit);
+    }
     bodyLayout->addWidget(card->secretEdit);
     bodyLayout->addWidget(card->passphraseEdit);
     bodyLayout->addWidget(card->uidEdit);
@@ -2359,7 +2375,9 @@ ConnectionsWindow::CardWidgets *ConnectionsWindow::createCard(const QString &pro
             card->proxyCheckButton->setVisible(true);
         }
         card->uidEdit->setVisible(false);
-        card->apiKeyEdit->setVisible(false);
+        if (card->apiKeyEdit) {
+            card->apiKeyEdit->setVisible(false);
+        }
         card->accountIndexEdit->setVisible(false);
         card->apiKeyIndexEdit->setVisible(false);
         card->baseUrlEdit->setVisible(false);
@@ -2370,6 +2388,9 @@ ConnectionsWindow::CardWidgets *ConnectionsWindow::createCard(const QString &pro
         card->baseUrlEdit->setVisible(false);
         card->accountIndexEdit->setVisible(false);
         card->apiKeyIndexEdit->setVisible(false);
+        if (card->apiKeyEdit) {
+            card->apiKeyEdit->setVisible(!isParadex);
+        }
         if (card->seedPhraseEdit) {
             card->seedPhraseEdit->setVisible(false);
         }
@@ -2730,6 +2751,7 @@ void ConnectionsWindow::rebuildCardsFromStore()
     } else {
         createCard(QStringLiteral("mexcSpot:default"), ConnectionStore::Profile::MexcSpot);
         createCard(QStringLiteral("mexcFutures:default"), ConnectionStore::Profile::MexcFutures);
+        createCard(QStringLiteral("paradex:default"), ConnectionStore::Profile::Paradex);
         createCard(QStringLiteral("lighter:default"), ConnectionStore::Profile::Lighter);
         createCard(QStringLiteral("binanceSpot:default"), ConnectionStore::Profile::BinanceSpot);
         createCard(QStringLiteral("binanceFutures:default"), ConnectionStore::Profile::BinanceFutures);
@@ -2893,7 +2915,9 @@ void ConnectionsWindow::refreshUi()
                 card->lighterConfigPathEdit->setVisible(true);
                 card->lighterConfigPathEdit->setText(tr("Lighter vault (encrypted)"));
             }
-            card->apiKeyEdit->setVisible(false);
+            if (card->apiKeyEdit) {
+                card->apiKeyEdit->setVisible(false);
+            }
             card->accountIndexEdit->setVisible(false);
             card->apiKeyIndexEdit->setVisible(false);
             card->baseUrlEdit->setVisible(false);
@@ -2907,7 +2931,10 @@ void ConnectionsWindow::refreshUi()
             if (card->lighterTestnetButton) {
                 card->lighterTestnetButton->setVisible(false);
             }
-            card->apiKeyEdit->setVisible(true);
+            const bool isParadexCard = (card->type == ConnectionStore::Profile::Paradex);
+            if (card->apiKeyEdit) {
+                card->apiKeyEdit->setVisible(!isParadexCard);
+            }
             card->baseUrlEdit->setVisible(false);
             card->accountIndexEdit->setVisible(false);
             card->apiKeyIndexEdit->setVisible(false);
@@ -3010,6 +3037,7 @@ void ConnectionsWindow::refreshUi()
     };
     applyProfileState(ConnectionStore::Profile::MexcSpot);
     applyProfileState(ConnectionStore::Profile::MexcFutures);
+    applyProfileState(ConnectionStore::Profile::Paradex);
     applyProfileState(ConnectionStore::Profile::UzxSwap);
     applyProfileState(ConnectionStore::Profile::UzxSpot);
     applyProfileState(ConnectionStore::Profile::Lighter);
@@ -3084,6 +3112,24 @@ void ConnectionsWindow::handleConnectClicked(const QString &profileId)
     }
     MexcCredentials creds = collectCredentials(*card);
     const auto profile = card->type;
+
+    if (false && profile == ConnectionStore::Profile::Paradex) {
+        if (m_store) {
+            m_store->setActiveProfileId(profile, profileId);
+            ConnectionStore::StoredProfile p;
+            p.id = profileId;
+            p.type = profile;
+            p.creds = creds;
+            stripSecretsForStorage(profile, p.creds);
+            m_store->saveProfile(p);
+        }
+        if (m_manager) {
+            m_manager->setCredentials(profile, creds);
+        }
+        appendLogMessage(tr("Paradex: public market data. Private login/trading is not implemented yet."));
+        applyState(profile, TradeManager::ConnectionState::Disconnected, QString());
+        return;
+    }
 
     if (profile == ConnectionStore::Profile::Lighter) {
         saveLighterProxyToVaultIfPossible(creds, false);
@@ -3263,9 +3309,15 @@ void ConnectionsWindow::applyState(ConnectionStore::Profile profile,
         if (card->connectButton) {
             const bool disconnectMode =
                 (state == TradeManager::ConnectionState::Connected || state == TradeManager::ConnectionState::Connecting);
-            card->connectButton->setText(disconnectMode ? tr("Отключить") : tr("Подключить"));
-            card->connectButton->setEnabled(true);
-            card->connectButton->setToolTip(QString());
+            if (false && card->type == ConnectionStore::Profile::Paradex) {
+                card->connectButton->setText(tr("Market data"));
+                card->connectButton->setEnabled(false);
+                card->connectButton->setToolTip(tr("Paradex market data is public; no private login implemented yet."));
+            } else {
+                card->connectButton->setText(disconnectMode ? tr("Отключить") : tr("Подключить"));
+                card->connectButton->setEnabled(true);
+                card->connectButton->setToolTip(QString());
+            }
         }
         if (card->disconnectButton) {
             card->disconnectButton->setEnabled(false);

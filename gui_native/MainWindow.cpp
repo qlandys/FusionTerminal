@@ -1754,8 +1754,25 @@ MainWindow::MainWindow(const QString &backendPath,
                     if (symUpper.isEmpty()) {
                         return;
                     }
-                    if (symbolSourceForAccount(accountName) != SymbolSource::Lighter) {
+                    const SymbolSource src = symbolSourceForAccount(accountName);
+                    if (src != SymbolSource::Lighter && src != SymbolSource::MexcFutures
+                        && src != SymbolSource::Mexc) {
                         return;
+                    }
+                    if (src == SymbolSource::Mexc) {
+                        const QString key =
+                            normalizedAccountKey(accountName) + QLatin1Char('|') + symUpper;
+                        if (hasSl && slTriggerPrice > 0.0) {
+                            m_mexcSpotSltpSlByKey.insert(key, slTriggerPrice);
+                        } else {
+                            m_mexcSpotSltpSlByKey.remove(key);
+                        }
+                        if (hasTp && tpTriggerPrice > 0.0) {
+                            m_mexcSpotSltpTpByKey.insert(key, tpTriggerPrice);
+                        } else {
+                            m_mexcSpotSltpTpByKey.remove(key);
+                        }
+                        saveUserSettings();
                     }
                     const QString accountLower = accountName.trimmed().toLower();
                     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
@@ -1881,6 +1898,7 @@ MainWindow::MainWindow(const QString &backendPath,
             const bool uzxProfile = (profile == ConnectionStore::Profile::UzxSpot
                                      || profile == ConnectionStore::Profile::UzxSwap);
             const bool isLighter = (profile == ConnectionStore::Profile::Lighter);
+            const bool isParadex = (profile == ConnectionStore::Profile::Paradex);
             bool canAuto = false;
             if (isLighter) {
                 const QString baseDir =
@@ -1889,6 +1907,9 @@ MainWindow::MainWindow(const QString &backendPath,
                 const QString vaultPath = baseDir + QDir::separator() + QStringLiteral("lighter_vault.dat");
                 const bool hasVault = QFile::exists(vaultPath);
                 canAuto = creds.autoConnect && (hasVault || (hasKey && !creds.baseUrl.trimmed().isEmpty()));
+            } else if (isParadex) {
+                // Paradex private WS auth requires only the private key (stored in secretKey field).
+                canAuto = creds.autoConnect && hasSecret;
             } else {
                 canAuto = creds.autoConnect && hasKey && hasSecret;
             }
@@ -1905,6 +1926,7 @@ MainWindow::MainWindow(const QString &backendPath,
         };
         initProfile(ConnectionStore::Profile::MexcSpot);
         initProfile(ConnectionStore::Profile::MexcFutures);
+        initProfile(ConnectionStore::Profile::Paradex);
         initProfile(ConnectionStore::Profile::UzxSwap);
         initProfile(ConnectionStore::Profile::UzxSpot);
         initProfile(ConnectionStore::Profile::Lighter);
@@ -3541,7 +3563,9 @@ MainWindow::WorkspaceTab MainWindow::createWorkspaceTab(const QVector<SavedColum
 
         const auto src = symbolSourceForAccount(account);
         const bool lighterPerp = (src == SymbolSource::Lighter) && !symbol.contains(QLatin1Char('/'));
-        if ((src == SymbolSource::MexcFutures || lighterPerp) && spec.leverage > 0) {
+        if ((src == SymbolSource::MexcFutures || src == SymbolSource::UzxSwap
+             || src == SymbolSource::Paradex || lighterPerp)
+            && spec.leverage > 0) {
             m_futuresLeverageBySymbol.insert(symbol, spec.leverage);
         }
 
@@ -3857,6 +3881,29 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
             prints->setClusterWindowMs(ms);
         }
     }
+    {
+        // Restore per-ticker SL/TP for MEXC Spot (local triggers).
+        const SymbolSource src = symbolSourceForAccount(result.accountName);
+        if (src == SymbolSource::Mexc) {
+            const QString key =
+                normalizedAccountKey(result.accountName) + QLatin1Char('|') + normalizedSymbolKey(result.symbol);
+            const double sl = m_mexcSpotSltpSlByKey.value(key, 0.0);
+            const double tp = m_mexcSpotSltpTpByKey.value(key, 0.0);
+            const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+            if (sl > 0.0) {
+                result.sltpHasSl = true;
+                result.sltpSlPrice = sl;
+                result.sltpSlCreatedMs = nowMs;
+                result.sltpSlMissCount = 0;
+            }
+            if (tp > 0.0) {
+                result.sltpHasTp = true;
+                result.sltpTpPrice = tp;
+                result.sltpTpCreatedMs = nowMs;
+                result.sltpTpMissCount = 0;
+            }
+        }
+    }
     connect(prints, &PrintsWidget::clusterLabelChanged, this, &MainWindow::handlePrintsClusterLabelChanged);
 
     auto *printsWrap = new QWidget(column);
@@ -4039,16 +4086,20 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
     const auto sourceForLeverage = symbolSourceForAccount(result.accountName);
     const bool lighterPerp =
         (sourceForLeverage == SymbolSource::Lighter) && !result.symbol.contains(QLatin1Char('/'));
+    const bool paradexPerp = (sourceForLeverage == SymbolSource::Paradex);
     const bool hasLeverage = (sourceForLeverage == SymbolSource::MexcFutures)
                              || (sourceForLeverage == SymbolSource::UzxSwap)
-                             || lighterPerp;
+                             || lighterPerp
+                             || paradexPerp;
     const QString levSym = result.symbol.toUpper();
     const int maxLev = (sourceForLeverage == SymbolSource::MexcFutures)
                            ? std::max(1, m_mexcFuturesMaxLeverageBySymbol.value(levSym, 200))
                            : (sourceForLeverage == SymbolSource::UzxSwap)
                                ? std::max(1, m_uzxSwapMaxLeverageBySymbol.value(levSym, 125))
-                               : (lighterPerp ? std::max(1, m_lighterMaxLeverageBySymbol.value(levSym, 10)) : 200);
-    result.leverage = std::clamp(m_futuresLeverageBySymbol.value(levSym, 20), 1, maxLev);
+                               : (lighterPerp ? std::max(1, m_lighterMaxLeverageBySymbol.value(levSym, 10))
+                                              : (paradexPerp ? std::max(1, m_paradexMaxLeverageBySymbol.value(levSym, 10))
+                                                            : 200));
+    result.leverage = std::clamp(m_futuresLeverageBySymbol.value(levSym, 1), 1, maxLev);
     auto *levBtn = new QToolButton(notionalOverlay);
     levBtn->setText(QStringLiteral("%1x").arg(result.leverage));
     levBtn->setFixedSize(52, 21);
@@ -4088,11 +4139,15 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
         const auto src = symbolSourceForAccount(col->accountName);
         const bool isLighterPerp =
             (src == SymbolSource::Lighter) && !col->symbol.contains(QLatin1Char('/'));
-        if (src != SymbolSource::MexcFutures && src != SymbolSource::UzxSwap && !isLighterPerp) {
+        if (src != SymbolSource::MexcFutures && src != SymbolSource::UzxSwap
+            && src != SymbolSource::Paradex && !isLighterPerp) {
             return;
         }
 
         const QString sym = col->symbol.toUpper();
+        if (src == SymbolSource::Paradex && !m_paradexMaxLeverageBySymbol.contains(sym) && m_paradexSymbols.isEmpty()) {
+            fetchSymbolLibrary(SymbolSource::Paradex, nullptr);
+        }
         if (src == SymbolSource::UzxSwap && !m_uzxSwapMaxLeverageBySymbol.contains(sym) && m_uzxSwapSymbols.isEmpty()) {
             fetchSymbolLibrary(SymbolSource::UzxSwap, nullptr);
         }
@@ -4106,7 +4161,9 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
                                ? std::max(1, m_mexcFuturesMaxLeverageBySymbol.value(sym, 200))
                                : (src == SymbolSource::UzxSwap)
                                    ? std::max(1, m_uzxSwapMaxLeverageBySymbol.value(sym, 125))
-                                   : (isLighterPerp ? std::max(1, m_lighterMaxLeverageBySymbol.value(sym, 10)) : 200);
+                                   : (src == SymbolSource::Paradex)
+                                       ? std::max(1, m_paradexMaxLeverageBySymbol.value(sym, 10))
+                                       : (isLighterPerp ? std::max(1, m_lighterMaxLeverageBySymbol.value(sym, 10)) : 200);
 
         QList<int> presets;
         if (src == SymbolSource::MexcFutures) {
@@ -4118,6 +4175,8 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
             }
         } else if (src == SymbolSource::UzxSwap) {
             presets = {1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125};
+        } else if (src == SymbolSource::Paradex) {
+            presets = {1, 2, 3, 5, 10, 15, 20, 25, 30, 50, 75, 100};
         } else {
             presets = {1, 2, 3, 5, 10, 20, 50, 100, 200};
         }
@@ -4156,7 +4215,8 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
             const auto src = symbolSourceForAccount(col->accountName);
             const bool isLighterPerp =
                 (src == SymbolSource::Lighter) && !col->symbol.contains(QLatin1Char('/'));
-            if (src != SymbolSource::MexcFutures && src != SymbolSource::UzxSwap && !isLighterPerp) {
+            if (src != SymbolSource::MexcFutures && src != SymbolSource::UzxSwap
+                && src != SymbolSource::Paradex && !isLighterPerp) {
                 return;
             }
             const QString sym = col->symbol.toUpper();
@@ -4164,12 +4224,14 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
                                    ? std::max(1, m_mexcFuturesMaxLeverageBySymbol.value(sym, 200))
                                    : (src == SymbolSource::UzxSwap)
                                        ? std::max(1, m_uzxSwapMaxLeverageBySymbol.value(sym, 125))
-                                       : std::max(1, m_lighterMaxLeverageBySymbol.value(sym, 10));
+                                       : (src == SymbolSource::Paradex)
+                                           ? std::max(1, m_paradexMaxLeverageBySymbol.value(sym, 10))
+                                           : std::max(1, m_lighterMaxLeverageBySymbol.value(sym, 10));
             bool ok = false;
             const int v = QInputDialog::getInt(this,
                                                tr("Leverage"),
                                                tr("Set leverage (x):"),
-                                               col->leverage > 0 ? col->leverage : 20,
+                                               col->leverage > 0 ? col->leverage : 1,
                                                1,
                                                maxLev,
                                                1,
@@ -4397,6 +4459,8 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
         exchangeArg = QStringLiteral("binance_futures");
     } else if (source == SymbolSource::Lighter) {
         exchangeArg = QStringLiteral("lighter");
+    } else if (source == SymbolSource::Paradex) {
+        exchangeArg = QStringLiteral("paradex");
     }
     const int effectiveLevels = effectiveLevelsForColumn(result);
 
@@ -4407,6 +4471,9 @@ MainWindow::DomColumn MainWindow::createDomColumn(const QString &symbol,
         switch (source) {
         case SymbolSource::MexcFutures:
             prof = ConnectionStore::Profile::MexcFutures;
+            break;
+        case SymbolSource::Paradex:
+            prof = ConnectionStore::Profile::Paradex;
             break;
         case SymbolSource::UzxSpot:
             prof = ConnectionStore::Profile::UzxSpot;
@@ -5146,16 +5213,17 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
     const bool lighterPerp = (src == SymbolSource::Lighter) && !column->symbol.contains(QLatin1Char('/'));
     const bool uzxAccount = (src == SymbolSource::UzxSwap || src == SymbolSource::UzxSpot);
     if (m_sltpPlaceHeld) {
-        if (!lighterPerp && !uzxAccount) {
-            statusBar()->showMessage(tr("SL/TP placement is available for Lighter Perp and UZX"), 2200);
+        if (!lighterPerp && !uzxAccount && src != SymbolSource::MexcFutures && src != SymbolSource::Mexc) {
+            statusBar()->showMessage(tr("SL/TP placement is available for Lighter Perp, UZX, MEXC Futures, and MEXC Spot"), 2200);
             return;
         }
         if (price <= 0.0) {
             return;
         }
         const TradePosition pos = m_tradeManager->positionForSymbol(column->symbol, column->accountName);
-        const bool hasPosition =
-            pos.hasPosition && pos.quantity > 0.0 && pos.averagePrice > 0.0;
+        const bool hasPosition = (src == SymbolSource::Mexc)
+                                     ? (pos.hasPosition && pos.quantity > 0.0)
+                                     : (pos.hasPosition && pos.quantity > 0.0 && pos.averagePrice > 0.0);
         if (!hasPosition) {
             statusBar()->showMessage(tr("No active position for SL/TP"), 1800);
             return;
@@ -5172,13 +5240,18 @@ void MainWindow::handleDomRowClicked(Qt::MouseButton button,
         }
         const bool hasSpread = (bestBid > 0.0 && bestAsk > 0.0 && bestAsk >= bestBid);
         const bool inSpread = hasSpread && (price > bestBid) && (price < bestAsk);
-        const double entry = pos.averagePrice;
+        const double entry = (pos.averagePrice > 0.0 ? pos.averagePrice : 0.0);
         const double triggerSide =
             (pos.side == OrderSide::Buy) ? bestAsk : bestBid; // long->ask, short->bid
         const bool isSl = [&]() -> bool {
             if (pos.side == OrderSide::Buy) {
                 if (inSpread) {
-                    return price < entry;
+                    if (entry > 0.0) {
+                        return price < entry;
+                    }
+                    const double mid =
+                        (bestBid > 0.0 && bestAsk > 0.0) ? ((bestBid + bestAsk) * 0.5) : triggerSide;
+                    return price < mid;
                 }
                 if (triggerSide > 0.0) {
                     return price < triggerSide;
@@ -5667,7 +5740,7 @@ void MainWindow::handlePrintsMoveBeginRequested(const QString &orderId)
     {
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
         const qint64 createdMsByKey = m_recentMarkerCreatedMsByKey.value(cacheKey, 0);
-        if (createdMsByKey > 0 && nowMs - createdMsByKey < 1200) {
+        if (createdMsByKey > 0 && nowMs - createdMsByKey < 200) {
             return;
         }
         for (const auto &m : column->localOrders) {
@@ -5676,7 +5749,7 @@ void MainWindow::handlePrintsMoveBeginRequested(const QString &orderId)
                 if (createdMs > 0 && createdMs < 1000000000000LL) {
                     createdMs *= 1000;
                 }
-                if (createdMs > 0 && nowMs - createdMs < 450) {
+                if (createdMs > 0 && nowMs - createdMs < 150) {
                     return;
                 }
                 break;
@@ -5692,6 +5765,18 @@ void MainWindow::handlePrintsMoveBeginRequested(const QString &orderId)
             break;
         }
     }
+
+    // Hide marker optimistically while cancel is in-flight (avoid UI lag on high ping).
+    for (int i = 0; i < column->localOrders.size(); ++i) {
+        if (column->localOrders[i].orderId == id) {
+            column->localOrders.removeAt(i);
+            break;
+        }
+    }
+    if (column->dom) {
+        column->dom->setLocalOrders(column->localOrders);
+    }
+    refreshColumnsForSymbol(normalizedSymbolKey(sym));
 
     // Cancel immediately (drag ghost keeps UI visible).
     m_tradeManager->cancelOrder(sym, account, id);
@@ -5916,13 +6001,14 @@ void MainWindow::handlePrintsSltpMoveCommitRequested(const QString &kind, double
 
     const SymbolSource src = symbolSourceForAccount(column->accountName);
     const bool lighterPerp = (src == SymbolSource::Lighter) && !column->symbol.contains(QLatin1Char('/'));
-    if (!lighterPerp) {
-        statusBar()->showMessage(tr("SL/TP move is available for Lighter Perp only"), 2200);
+    if (!lighterPerp && src != SymbolSource::MexcFutures && src != SymbolSource::Mexc) {
+        statusBar()->showMessage(tr("SL/TP move is available for Lighter Perp, MEXC Futures, and MEXC Spot"), 2200);
         return;
     }
     const TradePosition pos = m_tradeManager->positionForSymbol(column->symbol, column->accountName);
-    const bool hasPosition =
-        pos.hasPosition && pos.quantity > 0.0 && pos.averagePrice > 0.0;
+    const bool hasPosition = (src == SymbolSource::Mexc)
+                                 ? (pos.hasPosition && pos.quantity > 0.0)
+                                 : (pos.hasPosition && pos.quantity > 0.0 && pos.averagePrice > 0.0);
     if (!hasPosition) {
         statusBar()->showMessage(tr("No active position for SL/TP"), 1800);
         return;
@@ -6381,7 +6467,8 @@ void MainWindow::applyLeverageForColumn(QWidget *columnContainer, int leverage)
     }
     const auto src = symbolSourceForAccount(col->accountName);
     const bool lighterPerp = (src == SymbolSource::Lighter) && !col->symbol.contains(QLatin1Char('/'));
-    if (src != SymbolSource::MexcFutures && src != SymbolSource::UzxSwap && !lighterPerp) {
+    if (src != SymbolSource::MexcFutures && src != SymbolSource::UzxSwap
+        && src != SymbolSource::Paradex && !lighterPerp) {
         return;
     }
     const QString sym = col->symbol.toUpper();
@@ -6389,6 +6476,10 @@ void MainWindow::applyLeverageForColumn(QWidget *columnContainer, int leverage)
         requestLighterLeverageLimit(sym);
         statusBar()->showMessage(tr("Loading Lighter leverage limits..."), 1200);
         return;
+    }
+    if (src == SymbolSource::Paradex && !m_paradexMaxLeverageBySymbol.contains(sym) && m_paradexSymbols.isEmpty()) {
+        fetchSymbolLibrary(SymbolSource::Paradex, nullptr);
+        statusBar()->showMessage(tr("Loading Paradex leverage limits..."), 1200);
     }
     if (src == SymbolSource::UzxSwap && !m_uzxSwapMaxLeverageBySymbol.contains(sym) && m_uzxSwapSymbols.isEmpty()) {
         fetchSymbolLibrary(SymbolSource::UzxSwap, nullptr);
@@ -6398,7 +6489,9 @@ void MainWindow::applyLeverageForColumn(QWidget *columnContainer, int leverage)
                            ? std::max(1, m_mexcFuturesMaxLeverageBySymbol.value(sym, 200))
                            : (src == SymbolSource::UzxSwap)
                                ? std::max(1, m_uzxSwapMaxLeverageBySymbol.value(sym, 125))
-                               : std::max(1, m_lighterMaxLeverageBySymbol.value(sym, 10));
+                               : (src == SymbolSource::Paradex)
+                                   ? std::max(1, m_paradexMaxLeverageBySymbol.value(sym, 10))
+                                   : std::max(1, m_lighterMaxLeverageBySymbol.value(sym, 10));
     const int clamped = std::clamp(leverage, 1, maxLev);
     col->leverage = clamped;
     m_futuresLeverageBySymbol.insert(sym, clamped);
@@ -7031,6 +7124,8 @@ void MainWindow::handleConnectionStateChanged(ConnectionStore::Profile profile,
 {
     auto profileLabel = [profile]() {
         switch (profile) {
+        case ConnectionStore::Profile::Paradex:
+            return QStringLiteral("Paradex");
         case ConnectionStore::Profile::BinanceSpot:
             return QStringLiteral("Binance Spot");
         case ConnectionStore::Profile::BinanceFutures:
@@ -7077,6 +7172,8 @@ void MainWindow::handleConnectionStateChanged(ConnectionStore::Profile profile,
     };
     auto isSourceOnline = [&](SymbolSource src) {
         switch (src) {
+        case SymbolSource::Paradex:
+            return isProfileOnline(ConnectionStore::Profile::Paradex);
         case SymbolSource::Mexc:
             return isProfileOnline(ConnectionStore::Profile::MexcSpot);
         case SymbolSource::MexcFutures:
@@ -8840,6 +8937,10 @@ QString MainWindow::chatKeyForColumn(const DomColumn &col) const
     case SymbolSource::Lighter:
         exchange = QStringLiteral("LIGHTER");
         market = lighterPerp ? QStringLiteral("PERP") : QStringLiteral("SPOT");
+        break;
+    case SymbolSource::Paradex:
+        exchange = QStringLiteral("PARADEX");
+        market = QStringLiteral("PERP");
         break;
     }
     return QStringLiteral("%1:%2:%3")
@@ -11790,6 +11891,38 @@ void MainWindow::loadUserSettings()
     }
     s.endGroup();
 
+    m_mexcSpotSltpSlByKey.clear();
+    m_mexcSpotSltpTpByKey.clear();
+    s.beginGroup(QStringLiteral("mexcSpotSltp"));
+    const QStringList sltpKeys = s.childKeys();
+    for (const QString &encodedKey : sltpKeys) {
+        const QString rawKey = decodeSettingsKey(encodedKey);
+        if (rawKey.isEmpty()) {
+            continue;
+        }
+        QStringList parts = s.value(encodedKey).toStringList();
+        if (parts.size() == 1 && parts.front().contains(QLatin1Char(','))) {
+            parts = parts.front().split(QLatin1Char(','), Qt::SkipEmptyParts);
+        }
+        if (parts.size() < 2) {
+            continue;
+        }
+        bool okSl = false;
+        bool okTp = false;
+        const double sl = parts.value(0).trimmed().toDouble(&okSl);
+        const double tp = parts.value(1).trimmed().toDouble(&okTp);
+        const QStringList keyParts = rawKey.split(QLatin1Char('|'));
+        const QString normalized =
+            (keyParts.size() == 2) ? makeNotionalPresetKey(keyParts[0], keyParts[1]) : rawKey;
+        if (okSl && sl > 0.0) {
+            m_mexcSpotSltpSlByKey.insert(normalized, sl);
+        }
+        if (okTp && tp > 0.0) {
+            m_mexcSpotSltpTpByKey.insert(normalized, tp);
+        }
+    }
+    s.endGroup();
+
     s.beginGroup(QStringLiteral("symbols"));
     const QStringList savedSymbols = s.value(QStringLiteral("list")).toStringList();
     if (!savedSymbols.isEmpty()) {
@@ -11996,6 +12129,32 @@ void MainWindow::saveUserSettings() const
             continue;
         }
         s.setValue(encodedKey, std::clamp(it.value(), 100, 86400000));
+    }
+    s.endGroup();
+
+    s.beginGroup(QStringLiteral("mexcSpotSltp"));
+    s.remove(QString());
+    QSet<QString> sltpAllKeys;
+    sltpAllKeys.reserve(m_mexcSpotSltpSlByKey.size() + m_mexcSpotSltpTpByKey.size());
+    for (auto it = m_mexcSpotSltpSlByKey.constBegin(); it != m_mexcSpotSltpSlByKey.constEnd(); ++it) {
+        sltpAllKeys.insert(it.key());
+    }
+    for (auto it = m_mexcSpotSltpTpByKey.constBegin(); it != m_mexcSpotSltpTpByKey.constEnd(); ++it) {
+        sltpAllKeys.insert(it.key());
+    }
+    for (const QString &key : sltpAllKeys) {
+        const QString rawKey = makeNotionalPresetKey(key.section(QLatin1Char('|'), 0, 0),
+                                                     key.section(QLatin1Char('|'), 1));
+        const QString encodedKey = encodeSettingsKey(rawKey);
+        if (encodedKey.isEmpty()) {
+            continue;
+        }
+        const double sl = m_mexcSpotSltpSlByKey.value(key, 0.0);
+        const double tp = m_mexcSpotSltpTpByKey.value(key, 0.0);
+        if (!(sl > 0.0) && !(tp > 0.0)) {
+            continue;
+        }
+        s.setValue(encodedKey, QStringList{QString::number(sl, 'g', 12), QString::number(tp, 'g', 12)});
     }
     s.endGroup();
 
@@ -12355,13 +12514,14 @@ void MainWindow::maybeTriggerSltpForColumn(DomColumn &col, const DomSnapshot &sn
 
     const SymbolSource src = symbolSourceForAccount(col.accountName);
     const bool lighterPerp = (src == SymbolSource::Lighter) && !symbolUpper.contains(QLatin1Char('/'));
-    if (!lighterPerp) {
+    const bool mexcSpot = (src == SymbolSource::Mexc);
+    if (!lighterPerp && !mexcSpot) {
         return;
     }
 
     const TradePosition pos = m_tradeManager->positionForSymbol(symbolUpper, col.accountName);
     const bool hasPosition =
-        pos.hasPosition && pos.quantity > 0.0 && pos.averagePrice > 0.0;
+        mexcSpot ? (pos.hasPosition && pos.quantity > 0.0) : (pos.hasPosition && pos.quantity > 0.0 && pos.averagePrice > 0.0);
     if (!hasPosition) {
         return;
     }
@@ -13149,19 +13309,25 @@ void MainWindow::restartColumnClient(DomColumn &col)
     case SymbolSource::Lighter:
         exch = QStringLiteral("lighter");
         break;
+    case SymbolSource::Paradex:
+        exch = QStringLiteral("paradex");
+        break;
     }
 
     // Always refresh backend proxy settings from the current connection profile before restart.
     if (m_connectionStore) {
         ConnectionStore::Profile prof = ConnectionStore::Profile::MexcSpot;
-        switch (src) {
-        case SymbolSource::MexcFutures:
-            prof = ConnectionStore::Profile::MexcFutures;
-            break;
-        case SymbolSource::UzxSpot:
-            prof = ConnectionStore::Profile::UzxSpot;
-            break;
-        case SymbolSource::UzxSwap:
+    switch (src) {
+    case SymbolSource::MexcFutures:
+        prof = ConnectionStore::Profile::MexcFutures;
+        break;
+    case SymbolSource::Paradex:
+        prof = ConnectionStore::Profile::Paradex;
+        break;
+    case SymbolSource::UzxSpot:
+        prof = ConnectionStore::Profile::UzxSpot;
+        break;
+    case SymbolSource::UzxSwap:
             prof = ConnectionStore::Profile::UzxSwap;
             break;
         case SymbolSource::BinanceSpot:
@@ -13629,6 +13795,13 @@ void MainWindow::clearSltpMarkers(DomColumn &col)
     col.sltpTpPrice = 0.0;
     col.sltpTpCreatedMs = 0;
     col.sltpTpMissCount = 0;
+    if (symbolSourceForAccount(col.accountName) == SymbolSource::Mexc) {
+        const QString key =
+            normalizedAccountKey(col.accountName) + QLatin1Char('|') + normalizedSymbolKey(col.symbol);
+        m_mexcSpotSltpSlByKey.remove(key);
+        m_mexcSpotSltpTpByKey.remove(key);
+        saveUserSettings();
+    }
     if (col.dom) {
         col.dom->setPriceTextMarkers(QVector<DomWidget::PriceTextMarker>());
         col.dragPreviewActive = false;
@@ -13950,6 +14123,7 @@ void MainWindow::fetchSymbolLibrary()
         const QJsonArray arr = doc.object().value(QStringLiteral("symbols")).toArray();
         QStringList fetched;
         QSet<QString> apiOff;
+        QSet<QString> stSymbols;
         fetched.reserve(arr.size());
         for (const auto &v : arr) {
             const QJsonObject obj = v.toObject();
@@ -13959,6 +14133,14 @@ void MainWindow::fetchSymbolLibrary()
             }
             const QString statusRaw = obj.value(QStringLiteral("status")).toString().trimmed();
             const QString statusUpper = statusRaw.toUpper();
+            bool hasSpotPermission = false;
+            const QJsonArray perms = obj.value(QStringLiteral("permissions")).toArray();
+            for (const auto &pv : perms) {
+                if (pv.toString().trimmed().toUpper() == QStringLiteral("SPOT")) {
+                    hasSpotPermission = true;
+                    break;
+                }
+            }
             const bool spotAllowed = obj.value(QStringLiteral("isSpotTradingAllowed")).toBool(true);
             // MEXC returns numeric statuses for symbols (1 = enabled, 2 = disabled), while UZX
             // sticks to strings such as "TRADING". Treat any explicit "off" flag as disabled and
@@ -13982,7 +14164,10 @@ void MainWindow::fetchSymbolLibrary()
                 || statusRaw == QStringLiteral("0")
                 || statusRaw == QStringLiteral("2");
             fetched.push_back(sym);
-            if (explicitBlock || !spotAllowed) {
+            if (obj.value(QStringLiteral("st")).toBool(false)) {
+                stSymbols.insert(sym);
+            }
+            if (explicitBlock || !spotAllowed || !hasSpotPermission) {
                 apiOff.insert(sym);
             }
         }
@@ -13994,52 +14179,9 @@ void MainWindow::fetchSymbolLibrary()
             setPickersRefreshState(SymbolSource::Mexc, false);
             return;
         }
-        requestDefaultSymbolAllowList(std::move(fetched), std::move(apiOff), fetched.size());
+        m_mexcSpotStSymbols = stSymbols;
+        finalizeSymbolFetch(std::move(fetched), std::move(apiOff), fetched.size());
     });
-}
-
-void MainWindow::requestDefaultSymbolAllowList(QStringList symbols,
-                                               QSet<QString> apiOff,
-                                               int fetchedCount)
-{
-    const QUrl defaultsUrl(QStringLiteral("https://api.mexc.com/api/v3/defaultSymbols"));
-    QNetworkRequest req(defaultsUrl);
-    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
-    auto *reply = m_symbolFetcher.get(req);
-    connect(reply,
-            &QNetworkReply::finished,
-            this,
-            [this, reply, symbols = std::move(symbols), apiOff = std::move(apiOff), fetchedCount]() mutable {
-                const auto err = reply->error();
-                const QByteArray raw = reply->readAll();
-                reply->deleteLater();
-                if (err == QNetworkReply::NoError) {
-                    const QJsonDocument doc = QJsonDocument::fromJson(raw);
-                    if (doc.isObject()) {
-                        const QJsonArray arr = doc.object().value(QStringLiteral("data")).toArray();
-                        if (!arr.isEmpty()) {
-                            QSet<QString> allowed;
-                            allowed.reserve(arr.size());
-                            for (const auto &val : arr) {
-                                const QString sym = val.toString().trimmed().toUpper();
-                                if (!sym.isEmpty()) {
-                                    allowed.insert(sym);
-                                }
-                            }
-                            if (!allowed.isEmpty()) {
-                                for (const QString &sym : symbols) {
-                                    if (!allowed.contains(sym)) {
-                                        apiOff.insert(sym);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    qWarning() << "[symbols] defaultSymbols fetch failed:" << err;
-                }
-                finalizeSymbolFetch(std::move(symbols), std::move(apiOff), fetchedCount);
-            });
 }
 
 void MainWindow::finalizeSymbolFetch(QStringList symbols, QSet<QString> apiOff, int fetchedCount)
@@ -14163,26 +14305,34 @@ void MainWindow::broadcastSymbolsToPickers(SymbolSource source)
             continue;
         }
         switch (source) {
-        case SymbolSource::Mexc:
-            dlg->setSymbols(m_symbolLibrary, m_apiOffSymbols);
+        case SymbolSource::Paradex:
+            dlg->setSymbols(m_paradexSymbols, QSet<QString>(), QSet<QString>());
             break;
+        case SymbolSource::Mexc:
+        {
+            const bool apiOffLooksSuspicious =
+                !m_apiOffSymbols.isEmpty() && m_apiOffSymbols.size() >= (m_symbolLibrary.size() * 8) / 10;
+            const QSet<QString> apiOff = apiOffLooksSuspicious ? QSet<QString>() : m_apiOffSymbols;
+            dlg->setSymbols(m_symbolLibrary, apiOff, m_mexcSpotStSymbols);
+            break;
+        }
         case SymbolSource::MexcFutures:
             dlg->setSymbols(m_mexcFuturesSymbols, m_mexcFuturesApiOff);
             break;
         case SymbolSource::BinanceSpot:
-            dlg->setSymbols(m_binanceSpotSymbols, QSet<QString>());
+            dlg->setSymbols(m_binanceSpotSymbols, QSet<QString>(), QSet<QString>());
             break;
         case SymbolSource::BinanceFutures:
             dlg->setSymbols(m_binanceFuturesSymbols, QSet<QString>());
             break;
         case SymbolSource::UzxSpot:
-            dlg->setSymbols(m_uzxSpotSymbols, m_uzxSpotApiOff);
+            dlg->setSymbols(m_uzxSpotSymbols, m_uzxSpotApiOff, QSet<QString>());
             break;
         case SymbolSource::UzxSwap:
             dlg->setSymbols(m_uzxSwapSymbols, m_uzxSwapApiOff);
             break;
         case SymbolSource::Lighter:
-            dlg->setSymbols(m_lighterSymbols, m_lighterApiOff);
+            dlg->setSymbols(m_lighterSymbols, m_lighterApiOff, QSet<QString>());
             break;
         }
         dlg->setRefreshInProgress(false);
@@ -14230,6 +14380,9 @@ MainWindow::SymbolSource MainWindow::symbolSourceForAccount(const QString &accou
         return srcIt.value();
     }
     const QString lower = accountName.toLower();
+    if (lower.contains(QStringLiteral("paradex"))) {
+        return SymbolSource::Paradex;
+    }
     if (lower.contains(QStringLiteral("lighter"))) {
         return SymbolSource::Lighter;
     }
@@ -14263,6 +14416,8 @@ void MainWindow::applyVenueAppearance(SymbolPickerDialog *dlg,
     if (!dlg) {
         return;
     }
+    const QString lowerAccount = accountName.trimmed().toLower();
+    const bool isParadex = lowerAccount.contains(QStringLiteral("paradex"));
     QString iconPath;
     switch (source) {
     case SymbolSource::Mexc:
@@ -14281,9 +14436,14 @@ void MainWindow::applyVenueAppearance(SymbolPickerDialog *dlg,
         iconPath = resolveAssetPath(QStringLiteral("icons/logos/lighter.png"));
         break;
     }
+    if (isParadex) {
+        iconPath = resolveAssetPath(QStringLiteral("icons/logos/paradex.png"));
+    }
     bool futures = source == SymbolSource::MexcFutures || source == SymbolSource::BinanceFutures;
-    const QString lower = accountName.trimmed().toLower();
+    const QString &lower = lowerAccount;
     if (source == SymbolSource::UzxSwap) {
+        futures = true;
+    } else if (isParadex) {
         futures = true;
     } else if (!futures
                && (lower.contains(QStringLiteral("future"))
@@ -14297,9 +14457,94 @@ void MainWindow::applyVenueAppearance(SymbolPickerDialog *dlg,
 
 void MainWindow::fetchSymbolLibrary(SymbolSource source, SymbolPickerDialog *dlg)
 {
+    if (source == SymbolSource::Paradex) {
+        if (dlg) {
+            applyVenueAppearance(dlg, source, dlg->selectedAccount());
+            dlg->setSymbols(m_paradexSymbols, QSet<QString>(), QSet<QString>());
+            dlg->setRefreshInProgress(m_paradexRequestInFlight);
+        }
+        if (m_paradexRequestInFlight) {
+            setPickersRefreshState(SymbolSource::Paradex, true);
+            return;
+        }
+        if (!m_paradexSymbols.isEmpty()) {
+            return;
+        }
+        m_paradexRequestInFlight = true;
+        setPickersRefreshState(SymbolSource::Paradex, true);
+
+        const QUrl url(QStringLiteral("https://api.prod.paradex.trade/v1/markets"));
+        auto *reply = m_symbolFetcher.get(QNetworkRequest(url));
+        connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+            m_paradexRequestInFlight = false;
+            const auto err = reply->error();
+            const QByteArray raw = reply->readAll();
+            reply->deleteLater();
+            if (err != QNetworkReply::NoError) {
+                qWarning() << "[symbols] paradex fetch failed:" << err;
+                setPickersRefreshState(SymbolSource::Paradex, false);
+                return;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(raw);
+            if (!doc.isObject()) {
+                qWarning() << "[symbols] paradex JSON parse failed";
+                setPickersRefreshState(SymbolSource::Paradex, false);
+                return;
+            }
+            const QJsonArray arr = doc.object().value(QStringLiteral("results")).toArray();
+            QStringList list;
+            list.reserve(arr.size());
+            QHash<QString, int> maxLevBySymbol;
+            maxLevBySymbol.reserve(arr.size());
+            const auto toDouble = [](const QJsonValue &v) -> double {
+                if (v.isDouble()) return v.toDouble();
+                if (v.isString()) return v.toString().toDouble();
+                return v.toVariant().toDouble();
+            };
+            for (const auto &v : arr) {
+                const QJsonObject obj = v.toObject();
+                const QString sym = obj.value(QStringLiteral("symbol")).toString().trimmed().toUpper();
+                if (sym.isEmpty()) continue;
+                if (!list.contains(sym, Qt::CaseInsensitive)) {
+                    list.push_back(sym);
+                }
+
+                int maxLev = 0;
+                const int explicitMaxLev = obj.value(QStringLiteral("max_leverage")).toInt(0);
+                if (explicitMaxLev > 0) {
+                    maxLev = explicitMaxLev;
+                } else {
+                    const QJsonObject delta = obj.value(QStringLiteral("delta1_cross_margin_params")).toObject();
+                    const double imfBase = toDouble(delta.value(QStringLiteral("imf_base")));
+                    if (imfBase > 0.0) {
+                        maxLev = static_cast<int>(std::floor((1.0 / imfBase) + 1e-9));
+                    }
+                }
+                if (maxLev > 0) {
+                    maxLevBySymbol.insert(sym, std::clamp(maxLev, 1, 500));
+                }
+            }
+            std::sort(list.begin(), list.end(), [](const QString &a, const QString &b) {
+                return a.toUpper() < b.toUpper();
+            });
+            m_paradexSymbols = list;
+            m_paradexMaxLeverageBySymbol = std::move(maxLevBySymbol);
+            broadcastSymbolsToPickers(SymbolSource::Paradex);
+            setPickersRefreshState(SymbolSource::Paradex, false);
+        });
+        if (dlg) {
+            dlg->setRefreshInProgress(true);
+        }
+        return;
+    }
     if (source == SymbolSource::Mexc) {
         if (dlg) {
-            dlg->setSymbols(m_symbolLibrary, m_apiOffSymbols);
+            const bool apiOffLooksSuspicious =
+                !m_apiOffSymbols.isEmpty() && m_apiOffSymbols.size() >= (m_symbolLibrary.size() * 8) / 10;
+            const QSet<QString> apiOff = apiOffLooksSuspicious ? QSet<QString>() : m_apiOffSymbols;
+            dlg->setSymbols(m_symbolLibrary,
+                            apiOff,
+                            m_mexcSpotStSymbols);
             dlg->setRefreshInProgress(m_symbolRequestInFlight);
         }
         fetchSymbolLibrary();
@@ -15198,6 +15443,8 @@ SymbolPickerDialog *MainWindow::createSymbolPicker(const QString &title,
     };
     auto isSourceOnline = [&](SymbolSource s) {
         switch (s) {
+        case SymbolSource::Paradex:
+            return isProfileOnline(ConnectionStore::Profile::Paradex);
         case SymbolSource::Mexc:
             return isProfileOnline(ConnectionStore::Profile::MexcSpot);
         case SymbolSource::MexcFutures:
@@ -15250,23 +15497,25 @@ SymbolPickerDialog *MainWindow::createSymbolPicker(const QString &title,
     } else {
         applyVenueAppearance(dlg, src, initialAccount);
         if (src == SymbolSource::Mexc) {
-            dlg->setSymbols(m_symbolLibrary, apiOff);
+            dlg->setSymbols(m_symbolLibrary,
+                            apiOff,
+                            m_mexcSpotStSymbols);
         } else if (src == SymbolSource::MexcFutures && !m_mexcFuturesSymbols.isEmpty()) {
             dlg->setSymbols(m_mexcFuturesSymbols, m_mexcFuturesApiOff);
             dlg->setRefreshInProgress(m_mexcFuturesRequestInFlight);
         } else if (src == SymbolSource::BinanceSpot && !m_binanceSpotSymbols.isEmpty()) {
-            dlg->setSymbols(m_binanceSpotSymbols, QSet<QString>());
+            dlg->setSymbols(m_binanceSpotSymbols, QSet<QString>(), QSet<QString>());
             dlg->setRefreshInProgress(m_binanceSpotRequestInFlight);
         } else if (src == SymbolSource::BinanceFutures && !m_binanceFuturesSymbols.isEmpty()) {
             dlg->setSymbols(m_binanceFuturesSymbols, QSet<QString>());
             dlg->setRefreshInProgress(m_binanceFuturesRequestInFlight);
         } else if (src == SymbolSource::Lighter && !m_lighterSymbols.isEmpty()) {
-            dlg->setSymbols(m_lighterSymbols, m_lighterApiOff);
+            dlg->setSymbols(m_lighterSymbols, m_lighterApiOff, QSet<QString>());
             dlg->setRefreshInProgress(m_lighterRequestInFlight);
         } else if (src == SymbolSource::UzxSwap && !m_uzxSwapSymbols.isEmpty()) {
             dlg->setSymbols(m_uzxSwapSymbols, m_uzxSwapApiOff);
         } else if (src == SymbolSource::UzxSpot && !m_uzxSpotSymbols.isEmpty()) {
-            dlg->setSymbols(m_uzxSpotSymbols, m_uzxSpotApiOff);
+            dlg->setSymbols(m_uzxSpotSymbols, m_uzxSpotApiOff, QSet<QString>());
         } else {
             fetchSymbolLibrary(src, dlg);
         }
@@ -15300,24 +15549,32 @@ SymbolPickerDialog *MainWindow::createSymbolPicker(const QString &title,
                 const SymbolSource src = symbolSourceForAccount(account);
                 applyVenueAppearance(dlg, src, account);
                 if (src == SymbolSource::Mexc) {
-                    dlg->setSymbols(m_symbolLibrary, m_apiOffSymbols);
+                    const bool apiOffLooksSuspicious =
+                        !m_apiOffSymbols.isEmpty() && m_apiOffSymbols.size() >= (m_symbolLibrary.size() * 8) / 10;
+                    const QSet<QString> apiOff = apiOffLooksSuspicious ? QSet<QString>() : m_apiOffSymbols;
+                    dlg->setSymbols(m_symbolLibrary,
+                                    apiOff,
+                                    m_mexcSpotStSymbols);
                     dlg->setRefreshInProgress(m_symbolRequestInFlight);
                 } else if (src == SymbolSource::MexcFutures && !m_mexcFuturesSymbols.isEmpty()) {
                     dlg->setSymbols(m_mexcFuturesSymbols, m_mexcFuturesApiOff);
                     dlg->setRefreshInProgress(m_mexcFuturesRequestInFlight);
                 } else if (src == SymbolSource::BinanceSpot && !m_binanceSpotSymbols.isEmpty()) {
-                    dlg->setSymbols(m_binanceSpotSymbols, QSet<QString>());
+                    dlg->setSymbols(m_binanceSpotSymbols, QSet<QString>(), QSet<QString>());
                     dlg->setRefreshInProgress(m_binanceSpotRequestInFlight);
                 } else if (src == SymbolSource::BinanceFutures && !m_binanceFuturesSymbols.isEmpty()) {
                     dlg->setSymbols(m_binanceFuturesSymbols, QSet<QString>());
                     dlg->setRefreshInProgress(m_binanceFuturesRequestInFlight);
+                } else if (src == SymbolSource::Paradex && !m_paradexSymbols.isEmpty()) {
+                    dlg->setSymbols(m_paradexSymbols, QSet<QString>(), QSet<QString>());
+                    dlg->setRefreshInProgress(m_paradexRequestInFlight);
                 } else if (src == SymbolSource::Lighter && !m_lighterSymbols.isEmpty()) {
-                    dlg->setSymbols(m_lighterSymbols, m_lighterApiOff);
+                    dlg->setSymbols(m_lighterSymbols, m_lighterApiOff, QSet<QString>());
                     dlg->setRefreshInProgress(m_lighterRequestInFlight);
                 } else if (src == SymbolSource::UzxSwap && !m_uzxSwapSymbols.isEmpty()) {
                     dlg->setSymbols(m_uzxSwapSymbols, m_uzxSwapApiOff);
                 } else if (src == SymbolSource::UzxSpot && !m_uzxSpotSymbols.isEmpty()) {
-                    dlg->setSymbols(m_uzxSpotSymbols, m_uzxSpotApiOff);
+                    dlg->setSymbols(m_uzxSpotSymbols, m_uzxSpotApiOff, QSet<QString>());
                 } else {
                     fetchSymbolLibrary(src, dlg);
                 }
@@ -15471,24 +15728,31 @@ void MainWindow::applySymbolToColumn(DomColumn &col,
     const bool lighterPerp = (src == SymbolSource::Lighter) && !col.symbol.contains(QLatin1Char('/'));
     if (src == SymbolSource::MexcFutures) {
         const int maxLev = std::max(1, m_mexcFuturesMaxLeverageBySymbol.value(sym, 200));
-        col.leverage = std::clamp(m_futuresLeverageBySymbol.value(sym, 20), 1, maxLev);
+        col.leverage = std::clamp(m_futuresLeverageBySymbol.value(sym, 1), 1, maxLev);
+    } else if (src == SymbolSource::Paradex) {
+        if (!m_paradexMaxLeverageBySymbol.contains(sym) && m_paradexSymbols.isEmpty()) {
+            fetchSymbolLibrary(SymbolSource::Paradex, nullptr);
+        }
+        const int maxLev = std::max(1, m_paradexMaxLeverageBySymbol.value(sym, 10));
+        col.leverage = std::clamp(m_futuresLeverageBySymbol.value(sym, 1), 1, maxLev);
     } else if (src == SymbolSource::UzxSwap) {
         if (!m_uzxSwapMaxLeverageBySymbol.contains(sym) && m_uzxSwapSymbols.isEmpty()) {
             fetchSymbolLibrary(SymbolSource::UzxSwap, nullptr);
         }
         const int maxLev = std::max(1, m_uzxSwapMaxLeverageBySymbol.value(sym, 125));
-        col.leverage = std::clamp(m_futuresLeverageBySymbol.value(sym, 20), 1, maxLev);
+        col.leverage = std::clamp(m_futuresLeverageBySymbol.value(sym, 1), 1, maxLev);
     } else if (lighterPerp) {
         if (!m_lighterMaxLeverageBySymbol.contains(sym) && m_lighterSymbols.isEmpty()) {
             fetchSymbolLibrary(SymbolSource::Lighter, nullptr);
         }
         const int maxLev = std::max(1, m_lighterMaxLeverageBySymbol.value(sym, 10));
-        col.leverage = std::clamp(m_futuresLeverageBySymbol.value(sym, 20), 1, maxLev);
+        col.leverage = std::clamp(m_futuresLeverageBySymbol.value(sym, 1), 1, maxLev);
     } else {
-        col.leverage = 20;
+        col.leverage = 1;
     }
     if (col.leverageButton) {
         col.leverageButton->setVisible(src == SymbolSource::MexcFutures
+                                       || src == SymbolSource::Paradex
                                        || src == SymbolSource::UzxSwap
                                        || lighterPerp);
         col.leverageButton->setText(QStringLiteral("%1x").arg(col.leverage));
@@ -15663,6 +15927,10 @@ void MainWindow::refreshAccountColors()
                   SymbolSource::UzxSpot,
                   QStringLiteral("UZX Spot"),
                   QStringLiteral("#8bc34a"));
+    insertProfile(ConnectionStore::Profile::Paradex,
+                  SymbolSource::Paradex,
+                  QStringLiteral("Paradex"),
+                  QStringLiteral("#4f46e5"));
     insertProfile(ConnectionStore::Profile::Lighter,
                   SymbolSource::Lighter,
                   QStringLiteral("Lighter"),
@@ -15793,6 +16061,8 @@ void MainWindow::applyHeaderAccent(DomColumn &col)
 
     // Update venue icon + market type label based on account.
     const SymbolSource source = symbolSourceForAccount(col.accountName);
+    const QString lowerAccount = col.accountName.trimmed().toLower();
+    const bool isParadex = lowerAccount.contains(QStringLiteral("paradex"));
     QString iconPath;
     switch (source) {
     case SymbolSource::Mexc:
@@ -15811,6 +16081,9 @@ void MainWindow::applyHeaderAccent(DomColumn &col)
         iconPath = resolveAssetPath(QStringLiteral("icons/logos/lighter.png"));
         break;
     }
+    if (isParadex) {
+        iconPath = resolveAssetPath(QStringLiteral("icons/logos/paradex.png"));
+    }
     if (col.venueIconLabel) {
         QPixmap pix(iconPath);
         if (!pix.isNull()) {
@@ -15823,7 +16096,9 @@ void MainWindow::applyHeaderAccent(DomColumn &col)
             col.venueIconLabel->setText(QString());
         } else {
             col.venueIconLabel->setPixmap(QPixmap());
-            col.venueIconLabel->setText(source == SymbolSource::Mexc || source == SymbolSource::MexcFutures
+            col.venueIconLabel->setText(isParadex
+                                            ? QStringLiteral("P")
+                                        : (source == SymbolSource::Mexc || source == SymbolSource::MexcFutures)
                                             ? QStringLiteral("M")
                                         : (source == SymbolSource::BinanceSpot
                                                || source == SymbolSource::BinanceFutures)
@@ -15838,7 +16113,8 @@ void MainWindow::applyHeaderAccent(DomColumn &col)
     if (col.marketTypeLabel) {
         const bool lighterPerp = (source == SymbolSource::Lighter) && !col.symbol.contains(QLatin1Char('/'));
         const bool futures = (source == SymbolSource::MexcFutures) || (source == SymbolSource::UzxSwap)
-                             || (source == SymbolSource::BinanceFutures) || lighterPerp;
+                             || (source == SymbolSource::BinanceFutures) || (source == SymbolSource::Paradex)
+                             || lighterPerp;
         col.marketTypeLabel->setText(futures ? QStringLiteral("F") : QStringLiteral("S"));
     }
     if (col.readOnlyLabel) {

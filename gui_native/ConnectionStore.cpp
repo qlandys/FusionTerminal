@@ -218,6 +218,8 @@ QString dpapiUnprotectFromBase64(const QString &b64)
 QString defaultColorForProfile(ConnectionStore::Profile profile)
 {
     switch (profile) {
+    case ConnectionStore::Profile::Paradex:
+        return QStringLiteral("#7c3aed");
     case ConnectionStore::Profile::MexcFutures:
         return QStringLiteral("#f5b642");
     case ConnectionStore::Profile::BinanceSpot:
@@ -262,6 +264,9 @@ ConnectionStore::Profile profileFromKeyString(const QString &key, bool *okOut = 
     if (key == QStringLiteral("lighter")) {
         return ConnectionStore::Profile::Lighter;
     }
+    if (key == QStringLiteral("paradex")) {
+        return ConnectionStore::Profile::Paradex;
+    }
     if (okOut) {
         *okOut = false;
     }
@@ -277,7 +282,8 @@ QStringList profileKeyStrings()
         QStringLiteral("uzxSwap"),
         QStringLiteral("binanceSpot"),
         QStringLiteral("binanceFutures"),
-        QStringLiteral("lighter")
+        QStringLiteral("lighter"),
+        QStringLiteral("paradex")
     };
 }
 
@@ -574,6 +580,8 @@ QString ConnectionStore::profileKey(Profile profile) const
         return QStringLiteral("binanceFutures");
     case Profile::Lighter:
         return QStringLiteral("lighter");
+    case Profile::Paradex:
+        return QStringLiteral("paradex");
     case Profile::UzxSpot:
         return QStringLiteral("uzxSpot");
     case Profile::UzxSwap:
@@ -624,6 +632,7 @@ void ConnectionStore::ensureProfilesSchema()
     const QVector<Profile> types = {
         Profile::MexcSpot,
         Profile::MexcFutures,
+        Profile::Paradex,
         Profile::Lighter,
         Profile::BinanceSpot,
         Profile::BinanceFutures,
@@ -639,6 +648,7 @@ void ConnectionStore::ensureProfilesSchema()
             MexcCredentials blank;
             blank.colorHex = defaultColorForProfile(t);
             blank.label = typeKey;
+            // Safe to default-enable: Paradex only auto-connects when the private key is present.
             blank.autoConnect = true;
             legacyObj = jsonObjectFromCreds(blank, t);
         }
@@ -1008,6 +1018,9 @@ ConnectionStore::StoredProfile ConnectionStore::createProfile(Profile type,
     MexcCredentials creds = initial;
     if (creds.colorHex.isEmpty()) {
         creds.colorHex = defaultColorForProfile(type);
+    }
+    if (type == Profile::Paradex) {
+        creds.autoConnect = false;
     }
     if (!label.trimmed().isEmpty()) {
         creds.label = label.trimmed();

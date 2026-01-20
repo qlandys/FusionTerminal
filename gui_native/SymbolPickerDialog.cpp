@@ -6,7 +6,7 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
-#include <QGridLayout>
+#include <QFrame>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -34,6 +34,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QStyledItemDelegate>
+#include <QSplitter>
 #include <algorithm>
 
 namespace {
@@ -70,6 +71,38 @@ QString resolveAssetPath(const QString &relative)
     return QString();
 }
 
+QString resolveAssetPathAny(const QStringList &candidates)
+{
+    for (const QString &candidate : candidates) {
+        const QString resolved = resolveAssetPath(candidate);
+        if (!resolved.isEmpty()) {
+            return resolved;
+        }
+    }
+    return QString();
+}
+
+QIcon loadTintedSvgIcon(const QString &path, const QColor &color, const QSize &size)
+{
+    if (path.isEmpty() || size.isEmpty()) {
+        return QIcon();
+    }
+    const QIcon base(path);
+    if (base.isNull()) {
+        return QIcon();
+    }
+    QPixmap px = base.pixmap(size);
+    if (px.isNull()) {
+        return base;
+    }
+    {
+        QPainter painter(&px);
+        painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        painter.fillRect(px.rect(), color);
+    }
+    return QIcon(px);
+}
+
 class HoverHighlightDelegate : public QStyledItemDelegate {
 public:
     HoverHighlightDelegate(const int *hoverRow, QObject *parent = nullptr)
@@ -85,6 +118,13 @@ public:
             && !(opt.state & QStyle::State_Selected)) {
             opt.state |= QStyle::State_MouseOver;
             opt.state |= QStyle::State_Selected;
+        }
+        if (index.column() == 2) {
+            opt.decorationAlignment = Qt::AlignCenter;
+            opt.displayAlignment = Qt::AlignCenter;
+            opt.decorationSize = QSize(18, 18);
+        } else if (index.column() == 3) {
+            opt.displayAlignment = Qt::AlignCenter;
         }
         QStyledItemDelegate::paint(painter, opt, index);
     }
@@ -107,51 +147,159 @@ SymbolPickerDialog::SymbolPickerDialog(QWidget *parent)
     setWindowTitle(tr("Select symbol"));
     setModal(false);
     setWindowModality(Qt::NonModal);
-    setMinimumSize(560, 440);
+    setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    // Avoid translucent top-level window surfaces (ClearType gets disabled on Windows).
+    setAttribute(Qt::WA_DeleteOnClose, true);
+    setMinimumWidth(920);
+    setMinimumHeight(620);
+    resize(1040, 760);
 
-    auto *grid = new QGridLayout(this);
-    grid->setContentsMargins(12, 12, 12, 12);
-    grid->setHorizontalSpacing(12);
-    grid->setVerticalSpacing(12);
+    setStyleSheet(QStringLiteral(
+        "QDialog { background: transparent; }"
+        "#SymbolPickerPanel {"
+        "  background: rgba(33,35,39,230);"
+        "  border: 1px solid #2f3338;"
+        "  border-radius: 0px;"
+        "}"
+        "#SymbolPickerTitleBar {"
+        "  background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+        "    stop:0 rgba(40,42,46,240), stop:1 rgba(34,36,40,235));"
+        "  border-bottom: 1px solid #2f3338;"
+        "}"
+        "#SymbolPickerTitle { color:#e6e6e6; font-weight: 650; }"
+        "QToolButton#WindowCloseButton {"
+        "  background: rgba(255,255,255,0.04);"
+        "  border: 1px solid rgba(255,255,255,0.10);"
+        "  border-radius: 6px;"
+        "  padding: 0px;"
+        "}"
+        "QToolButton#WindowCloseButton:hover { background: rgba(255,255,255,0.10); }"
+        "QToolButton#WindowCloseButton:pressed { background: rgba(255,255,255,0.16); }"
+        "QToolButton { color:#e0e0e0; }"
+        "QLabel { color:#cfcfcf; }"
+        "QLineEdit {"
+        "  background:#1f2125;"
+        "  border:1px solid #34383d;"
+        "  border-radius:0px;"
+        "  padding:4px 6px;"
+        "  color:#e0e0e0;"
+        "}"
+        "QListWidget {"
+        "  background:#1f2125;"
+        "  border:1px solid #2f3338;"
+        "  border-radius:0px;"
+        "  color:#e6e6e6;"
+        "}"
+        "QTableView {"
+        "  background:#1f2125;"
+        "  border:1px solid #2f3338;"
+        "  border-radius:0px;"
+        "  color:#e6e6e6;"
+        "}"
+    ));
 
-    auto *leftPanel = new QVBoxLayout();
+    auto *root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    auto *panel = new QWidget(this);
+    panel->setObjectName(QStringLiteral("SymbolPickerPanel"));
+    root->addWidget(panel);
+
+    auto *panelLayout = new QVBoxLayout(panel);
+    panelLayout->setContentsMargins(10, 10, 10, 10);
+    panelLayout->setSpacing(10);
+
+    auto *titleBar = new QFrame(panel);
+    titleBar->setObjectName(QStringLiteral("SymbolPickerTitleBar"));
+    titleBar->setFixedHeight(40);
+    m_titleBar = titleBar;
+    m_titleBar->installEventFilter(this);
+
+    auto *titleRow = new QHBoxLayout(titleBar);
+    titleRow->setContentsMargins(12, 0, 10, 0);
+    titleRow->setSpacing(10);
+
+    auto *titleLabel = new QLabel(windowTitle(), titleBar);
+    titleLabel->setObjectName(QStringLiteral("SymbolPickerTitle"));
+    QFont titleFont = titleLabel->font();
+    titleFont.setPointSizeF(titleFont.pointSizeF() + 1.2);
+    titleFont.setBold(true);
+    titleLabel->setFont(titleFont);
+    titleRow->addWidget(titleLabel);
+    connect(this, &QWidget::windowTitleChanged, titleLabel, &QLabel::setText);
+
+    titleRow->addStretch(1);
+
+    auto *closeBtn = new QToolButton(titleBar);
+    closeBtn->setObjectName(QStringLiteral("WindowCloseButton"));
+    closeBtn->setCursor(Qt::PointingHandCursor);
+    closeBtn->setToolTip(tr("Close"));
+    closeBtn->setFixedSize(28, 24);
+    const QString closePath = resolveAssetPathAny(
+        {QStringLiteral("icons/outline/x.svg"), QStringLiteral("x.svg"), QStringLiteral("outline/x.svg")});
+    if (!closePath.isEmpty()) {
+        closeBtn->setIcon(loadTintedSvgIcon(closePath, QColor(QStringLiteral("#e6e6e6")), QSize(14, 14)));
+        closeBtn->setIconSize(QSize(14, 14));
+    } else {
+        closeBtn->setText(QStringLiteral("x"));
+    }
+    connect(closeBtn, &QToolButton::clicked, this, &QDialog::reject);
+    titleRow->addWidget(closeBtn);
+
+    panelLayout->addWidget(titleBar, 0);
+
+    auto *content = new QSplitter(Qt::Horizontal, panel);
+    content->setChildrenCollapsible(false);
+    panelLayout->addWidget(content, 1);
+
+    auto *leftWidget = new QWidget(content);
+    auto *leftPanel = new QVBoxLayout(leftWidget);
     leftPanel->setContentsMargins(0, 0, 0, 0);
-    leftPanel->setSpacing(12);
-    auto *connectionsLabel = new QLabel(tr("Connections"), this);
+    leftPanel->setSpacing(10);
+
+    auto *connectionsLabel = new QLabel(tr("Connections"), leftWidget);
     leftPanel->addWidget(connectionsLabel);
     m_connectionsList->setSelectionMode(QAbstractItemView::SingleSelection);
     m_connectionsList->setUniformItemSizes(true);
-    m_connectionsList->setMinimumWidth(190);
-    leftPanel->addWidget(m_connectionsList, 1);
+    m_connectionsList->setMinimumWidth(260);
+    leftPanel->addWidget(m_connectionsList, 3);
 
-    auto *groupsLabel = new QLabel(tr("Instrument groups"), this);
+    auto *groupsLabel = new QLabel(tr("Instrument groups"), leftWidget);
     leftPanel->addWidget(groupsLabel);
     m_groupList->setSelectionMode(QAbstractItemView::SingleSelection);
     m_groupList->setUniformItemSizes(true);
-    m_groupList->setMinimumWidth(190);
-    leftPanel->addWidget(m_groupList, 2);
+    m_groupList->setMinimumWidth(260);
+    leftPanel->addWidget(m_groupList, 1);
 
-    grid->addLayout(leftPanel, 0, 0, 2, 1);
+    auto *rightWidget = new QWidget(content);
+    auto *rightPanel = new QVBoxLayout(rightWidget);
+    rightPanel->setContentsMargins(0, 0, 0, 0);
+    rightPanel->setSpacing(10);
 
     auto *searchRow = new QHBoxLayout();
     m_filterEdit->setPlaceholderText(tr("Search by name..."));
     searchRow->addWidget(m_filterEdit, 1);
 
-    auto *refreshButton = new QToolButton(this);
+    auto *refreshButton = new QToolButton(rightWidget);
     refreshButton->setAutoRaise(true);
     refreshButton->setToolTip(tr("Refresh symbols list from exchange"));
     refreshButton->setCursor(Qt::PointingHandCursor);
-    const QString refreshPath = resolveAssetPath(QStringLiteral("icons/outline/refresh.svg"));
+    const QString refreshPath = resolveAssetPathAny({QStringLiteral("icons/outline/refresh.svg"),
+                                                     QStringLiteral("refresh.svg"),
+                                                     QStringLiteral("outline/refresh.svg")});
     if (!refreshPath.isEmpty()) {
-        refreshButton->setIcon(QIcon(refreshPath));
+        refreshButton->setIcon(loadTintedSvgIcon(refreshPath, QColor(QStringLiteral("#e6e6e6")), QSize(16, 16)));
         refreshButton->setIconSize(QSize(16, 16));
     } else {
         refreshButton->setText(QStringLiteral("↻"));
     }
     m_refreshButton = refreshButton;
     searchRow->addWidget(refreshButton);
+    rightPanel->addLayout(searchRow);
 
-    grid->addLayout(searchRow, 0, 1);
+    m_model->setColumnCount(4);
+    m_model->setHorizontalHeaderLabels({tr("Venue"), tr("Symbol"), tr("API"), tr("ST")});
 
     m_proxy->setSourceModel(m_model);
     m_proxy->setSortCaseSensitivity(Qt::CaseInsensitive);
@@ -161,7 +309,7 @@ SymbolPickerDialog::SymbolPickerDialog(QWidget *parent)
     m_tableView->setModel(m_proxy);
     m_tableView->setSelectionMode(QAbstractItemView::SingleSelection);
     m_tableView->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_tableView->setIconSize(QSize(16, 16));
+    m_tableView->setIconSize(QSize(18, 18));
     m_tableView->setWordWrap(false);
     m_tableView->setShowGrid(true);
     m_tableView->setGridStyle(Qt::SolidLine);
@@ -177,6 +325,7 @@ SymbolPickerDialog::SymbolPickerDialog(QWidget *parent)
     header->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     header->setSectionResizeMode(1, QHeaderView::Stretch);
     header->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(3, QHeaderView::ResizeToContents);
     header->setMinimumSectionSize(40);
     m_tableView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_tableView->setMouseTracking(true);
@@ -185,16 +334,16 @@ SymbolPickerDialog::SymbolPickerDialog(QWidget *parent)
     m_tableView->viewport()->installEventFilter(this);
     m_tableView->installEventFilter(this);
     m_tableView->setItemDelegate(new HoverHighlightDelegate(&m_hoverRow, m_tableView));
-    grid->addWidget(m_tableView, 1, 1);
+    rightPanel->addWidget(m_tableView, 1);
 
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    grid->addWidget(buttons, 2, 0, 1, 2);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, rightWidget);
+    rightPanel->addWidget(buttons, 0);
 
-    grid->setRowStretch(0, 0);
-    grid->setRowStretch(1, 1);
-    grid->setRowStretch(2, 0);
-    grid->setColumnStretch(0, 0);
-    grid->setColumnStretch(1, 1);
+    content->addWidget(leftWidget);
+    content->addWidget(rightWidget);
+    content->setStretchFactor(0, 0);
+    content->setStretchFactor(1, 1);
+    content->setSizes({300, 740});
 
     connect(buttons, &QDialogButtonBox::accepted, this, &SymbolPickerDialog::acceptSelection);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -255,7 +404,39 @@ SymbolPickerDialog::SymbolPickerDialog(QWidget *parent)
 
 bool SymbolPickerDialog::eventFilter(QObject *obj, QEvent *event)
 {
-    if (obj == m_tableView->viewport()) {
+    if (obj == m_titleBar) {
+        switch (event->type()) {
+        case QEvent::MouseButtonPress: {
+            auto *me = static_cast<QMouseEvent *>(event);
+            if (me->button() == Qt::LeftButton) {
+                m_dragging = true;
+                m_dragStartGlobal = me->globalPosition().toPoint();
+                m_dragStartWindowPos = frameGeometry().topLeft();
+                return true;
+            }
+            break;
+        }
+        case QEvent::MouseMove: {
+            if (!m_dragging) {
+                break;
+            }
+            auto *me = static_cast<QMouseEvent *>(event);
+            const QPoint delta = me->globalPosition().toPoint() - m_dragStartGlobal;
+            move(m_dragStartWindowPos + delta);
+            return true;
+        }
+        case QEvent::MouseButtonRelease: {
+            auto *me = static_cast<QMouseEvent *>(event);
+            if (me->button() == Qt::LeftButton) {
+                m_dragging = false;
+                return true;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    } else if (obj == m_tableView->viewport()) {
         auto updateHover = [this](int row) {
             if (row == m_hoverRow) {
                 return;
@@ -278,7 +459,15 @@ bool SymbolPickerDialog::eventFilter(QObject *obj, QEvent *event)
 
 void SymbolPickerDialog::setSymbols(const QStringList &symbols, const QSet<QString> &apiOff)
 {
+    setSymbols(symbols, apiOff, QSet<QString>{});
+}
+
+void SymbolPickerDialog::setSymbols(const QStringList &symbols,
+                                   const QSet<QString> &apiOff,
+                                   const QSet<QString> &stSymbols)
+{
     m_apiOff = apiOff;
+    m_stSymbols = stSymbols;
     m_hoverRow = -1;
     QStringList cleaned;
     cleaned.reserve(symbols.size());
@@ -294,11 +483,15 @@ void SymbolPickerDialog::setSymbols(const QStringList &symbols, const QSet<QStri
     });
     m_allSymbols = cleaned;
     m_model->clear();
-    m_model->setColumnCount(3);
-    m_model->setHorizontalHeaderLabels({tr("Venue"), tr("Symbol"), QString()});
+    m_model->setColumnCount(4);
+    m_model->setHorizontalHeaderLabels({tr("Venue"), tr("Symbol"), tr("API"), tr("ST")});
     QMap<QString, int> counts;
-    const QString apiOffPath = resolveAssetPath(QStringLiteral("icons/outline/api-off.svg"));
-    const QIcon apiOffIcon = apiOffPath.isEmpty() ? QIcon() : QIcon(apiOffPath);
+    const QString apiOffPath = resolveAssetPathAny({QStringLiteral("icons/outline/api-off.svg"),
+                                                    QStringLiteral("api-off.svg"),
+                                                    QStringLiteral("outline/api-off.svg")});
+    const QIcon apiOffIcon = apiOffPath.isEmpty()
+        ? QIcon()
+        : loadTintedSvgIcon(apiOffPath, QColor(QStringLiteral("#e6e6e6")), QSize(18, 18));
     const bool isLighterVenue =
         m_venueIsLighter || m_selectedAccount.trimmed().toLower().contains(QStringLiteral("lighter"));
     for (const QString &sym : cleaned) {
@@ -333,7 +526,19 @@ void SymbolPickerDialog::setSymbols(const QStringList &symbols, const QSet<QStri
             statusItem->setToolTip(tr("Symbol not supported for API trading"));
         }
 
-        m_model->appendRow(QList<QStandardItem *>{iconItem, symbolItem, statusItem});
+        auto *stItem = new QStandardItem(QString());
+        stItem->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled);
+        stItem->setTextAlignment(Qt::AlignCenter);
+        if (m_stSymbols.contains(sym)) {
+            stItem->setText(QStringLiteral("ST"));
+            QFont f = stItem->font();
+            f.setBold(true);
+            stItem->setFont(f);
+            stItem->setForeground(QColor(QStringLiteral("#f2b94b")));
+            stItem->setToolTip(tr("Special treatment / in assessment"));
+        }
+
+        m_model->appendRow(QList<QStandardItem *>{iconItem, symbolItem, statusItem, stItem});
     }
     m_groupCounts = counts;
     rebuildGroupList();
@@ -592,6 +797,16 @@ QString SymbolPickerDialog::groupForSymbol(const QString &symbol) const
     if (sym.isEmpty()) {
         return QStringLiteral("Other");
     }
+    // Paradex style: BASE-USD-PERP
+    if (sym.endsWith(QStringLiteral("-PERP")) && sym.contains(QLatin1Char('-'))) {
+        const QStringList parts = sym.split(QLatin1Char('-'), Qt::SkipEmptyParts);
+        if (parts.size() >= 3 && parts.last() == QStringLiteral("PERP")) {
+            const QString quote = parts.at(parts.size() - 2).trimmed().toUpper();
+            if (!quote.isEmpty()) {
+                return quote;
+            }
+        }
+    }
     const int sep = sym.lastIndexOf(QLatin1Char('_'));
     if (sep >= 0 && sep + 1 < sym.size()) {
         return sym.mid(sep + 1);
@@ -627,8 +842,10 @@ void SymbolPickerDialog::updateTableColumnWidths()
     };
     m_tableView->resizeColumnToContents(0);
     m_tableView->resizeColumnToContents(2);
+    m_tableView->resizeColumnToContents(3);
     applyMinWidth(0, 70);
     applyMinWidth(2, 28);
+    applyMinWidth(3, 34);
     const QScrollBar *scrollBar = m_tableView->verticalScrollBar();
     const int scrollWidth =
         (scrollBar && scrollBar->isVisible()) ? scrollBar->sizeHint().width() : 0;
@@ -638,11 +855,12 @@ void SymbolPickerDialog::updateTableColumnWidths()
         return;
     }
     const int frame = m_tableView->style()->pixelMetric(QStyle::PM_DefaultFrameWidth) * 2;
-    int used = m_tableView->columnWidth(0) + m_tableView->columnWidth(2) + scrollWidth + frame;
+    int used = m_tableView->columnWidth(0) + m_tableView->columnWidth(2) + m_tableView->columnWidth(3)
+        + scrollWidth + frame;
     int available = totalWidth - used;
-    if (available < 120) {
-        const int deficit = 120 - available;
-        available = 120;
+    if (available < 160) {
+        const int deficit = 160 - available;
+        available = 160;
         int adjust = deficit / 2;
         int newVenueWidth = std::max(60, m_tableView->columnWidth(0) - adjust);
         int newStatusWidth = std::max(24, m_tableView->columnWidth(2) - (deficit - adjust));

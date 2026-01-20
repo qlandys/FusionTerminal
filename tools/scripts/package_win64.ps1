@@ -24,11 +24,17 @@ Assert-LastExitCode "CMake build"
 Write-Host "[3/4] Copy EXEs..." -ForegroundColor Cyan
 $fusionExe = Join-Path $buildDir "Release/FusionTerminal.exe"
 $backendExe = Join-Path $buildDir "Release/orderbook_backend.exe"
+$paradexHelperExe = Join-Path $buildDir "Release/paradex_auth.exe"
 if (-not (Test-Path $fusionExe)) { throw "Build did not produce $fusionExe" }
 if (-not (Test-Path $backendExe)) { throw "Build did not produce $backendExe" }
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 Copy-Item -Force $fusionExe "$releaseDir/FusionTerminal.exe"
 Copy-Item -Force $backendExe "$releaseDir/orderbook_backend.exe"
+if (Test-Path $paradexHelperExe) {
+  Copy-Item -Force $paradexHelperExe "$releaseDir/paradex_auth.exe"
+} else {
+  Write-Host "WARN: paradex_auth.exe not found; rebuild FusionTerminal to generate it." -ForegroundColor Yellow
+}
 if (Test-Path "$buildDir/Release/FusionUpdater.exe") {
   Copy-Item -Force "$buildDir/Release/FusionUpdater.exe" "$releaseDir/FusionUpdater.exe"
 }

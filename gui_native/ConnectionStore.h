@@ -16,7 +16,8 @@ public:
         UzxSwap,
         BinanceSpot,
         BinanceFutures,
-        Lighter
+        Lighter,
+        Paradex
     };
 
     struct StoredProfile {

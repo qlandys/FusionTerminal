@@ -16,6 +16,8 @@
 #include <QWebSocket>
 #include <functional>
 
+class QProcess;
+
 class TradeManager : public QObject {
     Q_OBJECT
 
@@ -134,6 +136,7 @@ private:
         int minVol = 1;            // minimum vol in contracts
         int minLeverage = 1;
         int maxLeverage = 200;
+        double tickSize = 0.0; // price tick size (best-effort; some endpoints may omit)
         bool valid() const { return contractSize > 0.0 && minVol > 0 && volScale >= 0; }
     };
 
@@ -159,6 +162,22 @@ private:
         double quantityBase = 0.0; // base asset qty from UI
         OrderSide side = OrderSide::Buy;
     };
+
+    struct ParadexMarketMeta {
+        double orderSizeIncrement = 0.0;
+        double priceTickSize = 0.0;
+        int sizeDecimals = 0;
+        int priceDecimals = 0;
+        bool valid() const { return orderSizeIncrement > 0.0 && priceTickSize > 0.0; }
+    };
+
+    struct PendingParadexOrder {
+        QString symbol;
+        double price = 0.0;
+        double quantityBase = 0.0; // base asset qty from UI
+        OrderSide side = OrderSide::Buy;
+        int leverage = 0;
+    };
     struct Context {
         enum class LighterStopKind : quint8 {
             Unknown = 0,
@@ -178,6 +197,7 @@ private:
         QNetworkAccessManager *mexcNetwork{nullptr};
         QNetworkAccessManager *lighterNetwork{nullptr};
         QNetworkAccessManager *uzxNetwork{nullptr};
+        QNetworkAccessManager *paradexNetwork{nullptr};
         QWebSocket privateSocket;
         QWebSocket lighterStreamSocket;
         QString proxyStatusLog;
@@ -206,6 +226,14 @@ private:
         int lighterBurstRemaining{0};
         QString listenKey;
         QString lighterAuthToken;
+        QString paradexJwt;
+        QString paradexAccount;
+        qint64 paradexJwtExpiresAt{0};
+        bool paradexWsAuthed{false};
+        bool paradexAuthInFlight{false};
+        quint64 paradexAuthToken{0};
+        int paradexAuthMsgId{0};
+        int paradexNextRpcId{1};
         bool closingSocket{false};
         bool hasSubscribed{false};
         bool openOrdersPending{false};
@@ -220,6 +248,7 @@ private:
         QSet<QString> watchedSymbols;
         QHash<QString, TradePosition> positions;
         QHash<QString, qint64> positionUpdatedMsBySymbol;
+        QHash<QString, qint64> paradexMissingEntryLogMsBySymbol;
         QHash<QString, OrderRecord> activeOrders;
         // Lighter: cached reduce-only trigger orders (SL/TP) per symbol, best-effort.
         QHash<QString, QStringList> lighterSlStopOrderIdsBySymbol;
@@ -227,12 +256,22 @@ private:
         // Lighter: stable stop kind per order id to avoid SL/TP label flapping when some fields are missing in WS/REST.
         QHash<QString, LighterStopKindInfo> lighterStopKindByOrderId;
         QSet<QString> pendingCancelSymbols;
+        QSet<QString> paradexPendingCancelOrderIds;
         QSet<QString> myTradesInFlight;
         QHash<QString, qint64> lastTradeIdBySymbol;
+        QHash<QString, qint64> paradexLastTradeTsBySymbol;
+        QHash<QString, QString> paradexLastTradeIdBySymbol;
+        QSet<QString> pendingParadexCloseSymbols;
+        QHash<QString, qint64> paradexCloseInFlightMsBySymbol;
+        QSet<QString> paradexSubscribedChannels;
+        bool paradexTradesDisabled{false};
         QSet<QString> futuresDealsInFlight;
         QHash<QString, qint64> lastFuturesDealTsBySymbol;
         bool futuresPositionsPending{false};
         bool futuresLoggedIn{false};
+        bool futuresAuthPending{false};
+        bool futuresRestAuthed{false};
+        quint64 futuresAuthToken{0};
         QHash<QString, FuturesContractMeta> futuresContractMeta; // symbol -> meta
         QSet<QString> futuresContractMetaInFlight;
         QHash<QString, QVector<PendingFuturesOrder>> pendingFuturesOrders; // symbol -> queued orders until meta fetched
@@ -240,6 +279,10 @@ private:
         QHash<QString, SpotSymbolMeta> spotSymbolMeta; // symbol -> meta
         QSet<QString> spotSymbolMetaInFlight;
         QHash<QString, QVector<PendingSpotOrder>> pendingSpotOrders; // symbol -> queued orders until meta fetched
+
+        QHash<QString, ParadexMarketMeta> paradexMarketMeta; // symbol -> meta
+        QSet<QString> paradexMarketMetaInFlight;
+        QHash<QString, QVector<PendingParadexOrder>> pendingParadexOrders; // symbol -> queued orders until meta fetched
 
         QHash<QString, BalanceState> balances; // asset -> available/locked
         QHash<QString, double> realizedPnl; // asset -> pnl sum (realized)
@@ -263,6 +306,18 @@ private:
         // Lighter: best-effort local cache of per-market leverage we last set (market_id -> leverage x).
         QHash<int, int> lighterLeverageByMarketId;
 
+        // MEXC futures: cached stop plan orders (SL/TP) per symbol (best-effort).
+        QHash<QString, QString> mexcFuturesSlPlanOrderIdBySymbol;
+        QHash<QString, QString> mexcFuturesTpPlanOrderIdBySymbol;
+        QHash<QString, double> mexcFuturesSlTriggerBySymbol;
+        QHash<QString, double> mexcFuturesTpTriggerBySymbol;
+
+        // MEXC spot: cached trigger orders (SL/TP) per symbol (best-effort).
+        QHash<QString, QString> mexcSpotSlOrderIdBySymbol;
+        QHash<QString, QString> mexcSpotTpOrderIdBySymbol;
+        QHash<QString, double> mexcSpotSlTriggerBySymbol;
+        QHash<QString, double> mexcSpotTpTriggerBySymbol;
+
         // Lighter: cache next expected nonce to avoid an extra round-trip per order.
         // Only valid if this app is the only tx sender for the account.
         qint64 lighterNextNonce{0};
@@ -284,15 +339,41 @@ private:
             std::function<void(QString txHash, QString err)> cb;
         };
         QHash<QString, LighterWsTxWaiter> lighterWsTxWaiters;
+
+        // Paradex: keep a signer helper process running to avoid per-order spawn latency.
+        struct ParadexSignWaiter {
+            QString symbol;
+            std::function<void(QString signature, qint64 signatureTsMs, QString err)> cb;
+        };
+        QProcess *paradexSignerProc{nullptr};
+        QByteArray paradexSignerStdoutBuf;
+        qint64 paradexSignerNextId{1};
+        QHash<qint64, ParadexSignWaiter> paradexSignWaiters;
     };
 
     static qint64 nextLighterClientOrderIndex(Context &ctx);
+
+    void verifyMexcFuturesRestAuth(Context &ctx);
+    void finishMexcFuturesConnect(Context &ctx);
+    void fetchMexcFuturesPlanOrders(Context &ctx, const QString &symbol = QString());
+    void ensureParadexMarketMeta(Context &ctx, const QString &symbolUpper);
+    void subscribeParadexPrivate(Context &ctx);
+    void fetchParadexMyTrades(Context &ctx, const QString &symbolUpper);
+    void placeMexcFuturesStopPlanOrder(Context &ctx,
+                                       const QString &symbol,
+                                       double triggerPrice,
+                                       bool isStopLoss);
+    void cancelMexcFuturesStopPlanOrder(Context &ctx,
+                                        const QString &symbol,
+                                        bool isStopLoss,
+                                        std::function<void(bool ok)> after = {});
     void sendLighterTx(Context &ctx,
                        int txType,
                        const QString &txInfo,
                        std::function<void(QString txHash, QString err)> cb);
     QNetworkAccessManager *ensureMexcNetwork(Context &ctx);
     QNetworkAccessManager *ensureUzxNetwork(Context &ctx);
+    QNetworkAccessManager *ensureParadexNetwork(Context &ctx);
     void ensureLighterStreamWired(Context &ctx);
     void ensureLighterStreamOpen(Context &ctx);
     void subscribeLighterPrivateWs(Context &ctx);
@@ -333,13 +414,26 @@ private:
     void initializeWebSocket(Context &ctx, const QString &listenKey);
     void initializeFuturesWebSocket(Context &ctx);
     void initializeUzxWebSocket(Context &ctx);
+    void initializeParadexWebSocket(Context &ctx);
     void closeWebSocket(Context &ctx);
     void subscribePrivateChannels(Context &ctx);
     void subscribeUzxPrivate(Context &ctx);
+    void sendParadexWsAuth(Context &ctx);
     void sendListenKeyKeepAlive(Context &ctx);
     void resetConnection(Context &ctx, const QString &reason);
     void scheduleReconnect(Context &ctx);
     void fetchOpenOrders(Context &ctx);
+    void fetchParadexOpenOrders(Context &ctx);
+    void fetchParadexPositions(Context &ctx);
+    bool ensureParadexSigner(Context &ctx, QString &errOut);
+    void requestParadexOrderSignature(Context &ctx,
+                                      const QString &symbol,
+                                      const QString &market,
+                                      const QString &side,
+                                      const QString &orderType,
+                                      const QString &size,
+                                      const QString &price,
+                                      std::function<void(QString signature, qint64 signatureTsMs, QString err)> cb);
     void fetchFuturesOpenOrders(Context &ctx);
     void fetchFuturesPositions(Context &ctx);
     void fetchLighterAccount(Context &ctx);
